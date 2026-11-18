@@ -16,7 +16,7 @@ set -euo pipefail
 # =============================================================================
 # Constants
 # =============================================================================
-TEMPLATE_REPO="${ORCHESTRA_TEMPLATE_REPO:-https://github.com/DeL-TaiseiOzaki/claude-code-orchestra.git}"
+TEMPLATE_REPO="${ORCHESTRA_TEMPLATE_REPO:-https://github.com/ToRainu256/claude-code-orchestra.git}"
 LOCAL_VERSION_FILE=".claude/orchestra-version"
 TEMPLATE_BOUNDARY="@orchestra:template-boundary"
 REPO_BOUNDARY="@orchestra:repo-boundary"
@@ -107,6 +107,25 @@ info()    { echo "${GREEN}[INFO]${RESET} $*"; }
 warn()    { echo "${YELLOW}[WARN]${RESET} $*"; }
 error()   { echo "${RED}[ERROR]${RESET} $*" >&2; }
 header()  { echo ""; echo "${BOLD}━━━ $* ━━━${RESET}"; }
+
+# Portable equivalent of GNU `realpath -m`: resolve every symlink in the
+# components that exist and keep a missing tail as-is. BSD/macOS realpath has
+# no -m, so the escape check would abort there. python3 is already required by
+# the hooks this script updates, and a missing interpreter fails closed.
+# Where available, ALLOW_MISSING makes a symlink loop or an unreadable
+# component an error, as with GNU realpath -m, instead of an unresolved path.
+canonical_path() {
+    if ! command -v python3 &>/dev/null; then
+        error "python3 is required to validate managed paths."
+        return 1
+    fi
+    python3 -c 'import os, sys
+path = sys.argv[1]
+if hasattr(os.path, "ALLOW_MISSING"):
+    print(os.path.realpath(path, strict=os.path.ALLOW_MISSING))
+else:
+    print(os.path.realpath(path))' "$1"
+}
 
 TMPDIR_UPDATE=""
 UPDATED_FILES=()
@@ -318,7 +337,7 @@ cleanup_deprecated_paths() {
         # Escape check: resolve symlinks in parent components and ensure
         # the final target is still strictly inside PROJECT_ROOT.
         local resolved
-        resolved="$(realpath -m -- "${target}")"
+        resolved="$(canonical_path "${target}")"
         if [[ "${resolved}" != "${project_root_abs}/"* ]]; then
             error "Refusing to remove '${path}': resolves outside PROJECT_ROOT (${resolved})."
             continue
@@ -337,6 +356,37 @@ cleanup_deprecated_paths() {
         fi
         UPDATED_FILES+=("REMOVED: ${path}")
     done
+}
+
+# Recursively copy SRC's contents into DST without replacing anything DST
+# already has, preserving attributes and copying symlinks as symlinks. This is
+# what `cp -an SRC/. DST/` means, but that spelling is not portable: BSD/macOS
+# cp exits 1 whenever -n skips a file, which aborted the merge under `set -e`.
+# A destination that is a symlink or a non-directory is never written through;
+# the matching source subtree is skipped (the caller has backed it up first).
+merge_no_clobber() {
+    local src="$1" dst="$2"
+    local path rel target skip_prefix=""
+    while IFS= read -r -d '' path; do
+        rel="${path#"${src}/"}"
+        # find walks depth-first, so a skipped subtree is contiguous.
+        if [[ -n "${skip_prefix}" && "${rel}" == "${skip_prefix}"* ]]; then
+            continue
+        fi
+        target="${dst}/${rel}"
+        if [[ -d "${path}" && ! -L "${path}" ]]; then
+            if [[ -L "${target}" ]] || [[ -e "${target}" && ! -d "${target}" ]]; then
+                skip_prefix="${rel}/"
+            elif [[ ! -e "${target}" ]]; then
+                cp -a -- "${path}" "${target}"
+                skip_prefix="${rel}/"
+            fi
+            continue
+        fi
+        if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+            cp -a -- "${path}" "${target}"
+        fi
+    done < <(find "${src}" -mindepth 1 -print0)
 }
 
 migrate_legacy_native_data() {
@@ -364,7 +414,7 @@ migrate_legacy_native_data() {
         fi
         mkdir -p "${backup_root}/.agents" "${canonical}"
         cp -a -- "${legacy}" "${backup_root}/.agents/${name}"
-        cp -an -- "${legacy}/." "${canonical}/"
+        merge_no_clobber "${legacy}" "${canonical}"
         rm -rf -- "${legacy}"
         UPDATED_FILES+=(".claude/${name} (merged from .agents/${name})")
     done
@@ -672,8 +722,14 @@ migrate_native_settings_paths() {
         return 0
     fi
 
-    sed -i -e 's#\.agents/hooks/#.claude/hooks/#g' \
-        -e 's#\.agents/logs/#.claude/logs/#g' "${settings}"
+    # Write through a temporary file: in-place `sed -i` takes a mandatory
+    # suffix argument on BSD/macOS and an optional one on GNU, so no single
+    # spelling of it works on both. `cp -p` first so the replacement keeps the
+    # original file mode, then the rename keeps the swap atomic.
+    cp -p "${settings}" "${settings}.tmp.$$"
+    sed -e 's#\.agents/hooks/#.claude/hooks/#g' \
+        -e 's#\.agents/logs/#.claude/logs/#g' "${settings}" > "${settings}.tmp.$$"
+    mv -f "${settings}.tmp.$$" "${settings}"
     UPDATED_FILES+=(".claude/settings.json (migrated hook and log paths)")
     info "Migrated legacy .agents paths in settings to .claude paths."
 }

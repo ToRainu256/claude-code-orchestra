@@ -4,6 +4,10 @@
 
 Multi-Agent AI Development Environment
 
+> This repository is a fork of
+> [DeL-TaiseiOzaki/claude-code-orchestra](https://github.com/DeL-TaiseiOzaki/claude-code-orchestra).
+> The install and update commands below pull from this fork.
+
 ```
 Claude Code (Orchestrator) ─┬─ Sonnet Subagents (Routine Implementation)
                              ├─ Opus Subagents (Research, Analysis, Difficult Implementation)
@@ -35,7 +39,7 @@ Run this from the root of an existing Git repository:
 
 ```bash
 template_dir="$(mktemp -d)"
-git clone --depth 1 https://github.com/DeL-TaiseiOzaki/claude-code-orchestra.git "$template_dir"
+git clone --depth 1 https://github.com/ToRainu256/claude-code-orchestra.git "$template_dir"
 bash "$template_dir/scripts/install.sh" . && rm -rf "$template_dir"
 ```
 
@@ -63,7 +67,9 @@ claude
 The [`claude-only`](https://github.com/DeL-TaiseiOzaki/claude-code-orchestra/tree/claude-only)
 branch is a variant that does not use Codex CLI or Antigravity: Codex's planning,
 design, review, and debugging roles are handled by Claude Opus subagents, so only
-`claude` needs to be installed. Install it into an existing Git repository with:
+`claude` needs to be installed. This edition lives in the upstream repository and
+is not maintained in this fork, so the command below installs it from upstream.
+Install it into an existing Git repository with:
 
 ```bash
 template_dir="$(mktemp -d)" && git clone --depth 1 --branch claude-only https://github.com/DeL-TaiseiOzaki/claude-code-orchestra.git "$template_dir" && bash "$template_dir/scripts/install.sh" . && rm -rf "$template_dir"
@@ -458,7 +464,7 @@ writing its template version to a project-owned root `VERSION`:
 
 ```bash
 template_dir="$(mktemp -d)"
-git clone --depth 1 https://github.com/DeL-TaiseiOzaki/claude-code-orchestra.git "$template_dir"
+git clone --depth 1 https://github.com/ToRainu256/claude-code-orchestra.git "$template_dir"
 cp "$template_dir/scripts/install.sh" "$template_dir/scripts/update.sh" scripts/
 chmod +x scripts/install.sh scripts/update.sh
 rm -rf "$template_dir"

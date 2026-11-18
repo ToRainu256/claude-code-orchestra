@@ -22,6 +22,66 @@ check() {
     fi
 }
 
+# Portability: every check must run on both GNU (Linux) and BSD (macOS)
+# userland and on bash 3.2. No `sed`/`grep` `\s` (use [[:space:]]), no
+# `find -printf`, no `realpath -m`, no `sed -i`.
+
+# grep, except that "no match" (status 1) is an empty result rather than an
+# error. A real failure (status >= 2: unreadable path, bad pattern) still
+# propagates, so a check never mistakes a broken scan for a clean one.
+grep_or_empty() {
+    local status=0
+    grep "$@" || status=$?
+    ((status <= 1)) || return "${status}"
+}
+
+# Print the names of DIR's direct entries, dotfiles included, one per line.
+# Portable replacement for GNU `find DIR -mindepth 1 -maxdepth 1 -printf '%f\n'`.
+list_entries() {
+    local dir="$1"
+    [[ -d "${dir}" && -r "${dir}" ]] || return 1
+    (
+        shopt -s nullglob dotglob
+        local entry
+        for entry in "${dir}"/*; do
+            printf '%s\n' "${entry##*/}"
+        done
+    ) | LC_ALL=C sort
+}
+
+# Fail on any direct entry of DIR that is not in the allow-list given as the
+# remaining arguments. An unreadable or empty directory fails as well: an
+# empty listing must never read as "nothing unexpected".
+check_allowed_entries() {
+    local dir="$1"
+    shift
+    local rel="${dir#"${ROOT}/"}"
+    local listing
+    if ! listing="$(list_entries "${dir}")" || [[ -z "${listing}" ]]; then
+        echo "  Could not list any entries in ${rel}/"
+        return 1
+    fi
+    local ok=true
+    local entry allowed found
+    while IFS= read -r entry; do
+        found=false
+        for allowed in "$@"; do
+            if [[ "${entry}" == "${allowed}" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "${found}" == false ]]; then
+            echo "  Unexpected ${rel} entry: ${entry}"
+            ok=false
+        fi
+    done <<< "${listing}" || {
+        echo "  Could not read the ${rel}/ listing"
+        return 1
+    }
+    ${ok}
+}
+
 # --------------------------------------------------------------------------
 # 1) Every relative markdown link / canonical-file path in INDEX.md exists
 # --------------------------------------------------------------------------
@@ -34,12 +94,21 @@ check_index_links() {
     local ok=true
     # Extract paths that look like relative refs: backtick-wrapped or link targets
     # Matches: `path/to/file` and (path/to/file) patterns
-    local paths
-    paths=$(grep -oE '`\.[^`]+`' "${index}" | tr -d '`' || true)
-    paths+=$'\n'
-    paths+=$(grep -oE '\(\.[^)]+\)' "${index}" | tr -d '()' || true)
+    local paths backticked linked
+    if ! backticked=$(grep_or_empty -oE '`\.[^`]+`' "${index}" | tr -d '`') ||
+        ! linked=$(grep_or_empty -oE '\(\.[^)]+\)' "${index}" | tr -d '()'); then
+        echo "  Could not scan INDEX.md"
+        return 1
+    fi
     # Deduplicate and filter
-    paths=$(echo "${paths}" | sort -u | grep -v '^$' || true)
+    if ! paths=$(printf '%s\n%s\n' "${backticked}" "${linked}" | sort -u | grep_or_empty -v '^$'); then
+        echo "  Could not deduplicate the INDEX.md path list"
+        return 1
+    fi
+    if [[ -z "${paths}" ]]; then
+        echo "  No relative paths found in INDEX.md"
+        return 1
+    fi
     while IFS= read -r p; do
         [[ -z "${p}" ]] && continue
         local target="${ROOT}/${p}"
@@ -47,7 +116,10 @@ check_index_links() {
             echo "  Missing: ${p}"
             ok=false
         fi
-    done <<< "${paths}"
+    done <<< "${paths}" || {
+        echo "  Could not read the INDEX.md path list"
+        return 1
+    }
     ${ok}
 }
 check "INDEX.md links resolve" check_index_links
@@ -98,7 +170,8 @@ print(d.get('env', {}).get('CODEX_MODEL', ''))
 
     # Extract model from config.toml (simple grep; avoids toml parser dep)
     local config_model
-    config_model=$(grep -E '^model\s*=' "${config}" | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+    config_model=$(grep -E '^model[[:space:]]*=' "${config}" | head -1 \
+        | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
 
     if [[ -z "${config_model}" ]]; then
         echo "  Could not read model from ${config}"
@@ -112,11 +185,20 @@ print(d.get('env', {}).get('CODEX_MODEL', ''))
     fi
 
     # Extract distinct fallback values from ${CODEX_MODEL:-...} patterns
+    # Generated content (run logs, checkpoints, research and review notes) can
+    # quote the pattern in prose and is not configuration, so it is excluded
+    # the same way the skill-scripts check below excludes it.
     local fallbacks
-    fallbacks=$(grep -rhoE '\$\{CODEX_MODEL:-[^}]+\}' "${ROOT}/.claude/" "${ROOT}/.codex/" 2>/dev/null \
+    if ! fallbacks=$(grep_or_empty -rhoE \
+        --exclude-dir=logs --exclude-dir=checkpoints \
+        --exclude-dir=research --exclude-dir=reviews \
+        '\$\{CODEX_MODEL:-[^}]+\}' "${ROOT}/.claude/" "${ROOT}/.codex/" \
         | sed 's/.*:-\(.*\)}/\1/' \
         | sort -u \
-        | grep -v 'gpt-5.5-mini' || true)
+        | grep_or_empty -v 'gpt-5.5-mini'); then
+        echo "  Could not scan .claude/ and .codex/ for CODEX_MODEL fallbacks"
+        ok=false
+    fi
 
     while IFS= read -r fb; do
         [[ -z "${fb}" ]] && continue
@@ -124,15 +206,18 @@ print(d.get('env', {}).get('CODEX_MODEL', ''))
             echo "  Mismatch: fallback ${fb} != CODEX_MODEL ${settings_model}"
             ok=false
         fi
-    done <<< "${fallbacks}"
+    done <<< "${fallbacks}" || {
+        echo "  Could not read the CODEX_MODEL fallback list"
+        return 1
+    }
 
     # The shared Codex wrapper carries the same fallback in Python, so it has
     # to move with the single centralized model value too.
     local consult="${ROOT}/.claude/skills/_shared/codex_consult.py"
     if [[ -f "${consult}" ]]; then
         local consult_model
-        consult_model=$(grep -E '^DEFAULT_MODEL\s*=' "${consult}" \
-            | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+        consult_model=$(grep -E '^DEFAULT_MODEL[[:space:]]*=' "${consult}" \
+            | head -1 | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
         if [[ -z "${consult_model}" ]]; then
             echo "  Could not read DEFAULT_MODEL from codex_consult.py"
             ok=false
@@ -364,29 +449,15 @@ check_native_boundaries() {
         fi
     done
 
-    local native_entry
-    while IFS= read -r native_entry; do
-        case "${native_entry}" in
-            settings.json|settings.local.json|settings.orchestra.json|orchestra-version) ;;
-            agents|skills|rules|hooks|docs|logs|checkpoints|STATE.md) ;;
-            *) echo "  Unexpected .claude entry: ${native_entry}"; ok=false ;;
-        esac
-    done < <(find "${ROOT}/.claude" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
-    while IFS= read -r native_entry; do
-        case "${native_entry}" in
-            config.toml|config.orchestra.toml|AGENTS.md) ;;
-            *) echo "  Unexpected .codex entry: ${native_entry}"; ok=false ;;
-        esac
-    done < <(find "${ROOT}/.codex" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+    check_allowed_entries "${ROOT}/.claude" \
+        settings.json settings.local.json settings.orchestra.json orchestra-version \
+        agents skills rules hooks docs logs checkpoints STATE.md || ok=false
+    check_allowed_entries "${ROOT}/.codex" \
+        config.toml config.orchestra.toml AGENTS.md || ok=false
     # .agents/ is Antigravity's native directory and holds exactly one thing:
     # the CLI-subagent contract it loads. Shared policy lives under .claude/
     # and is referenced by path.
-    while IFS= read -r native_entry; do
-        if [[ "${native_entry}" != "AGENTS.md" ]]; then
-            echo "  Unexpected .agents entry: ${native_entry}"
-            ok=false
-        fi
-    done < <(find "${ROOT}/.agents" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+    check_allowed_entries "${ROOT}/.agents" AGENTS.md || ok=false
 
     if [[ ! -f "${ROOT}/.claude/settings.json" ]] ||
         ! grep -Fq '.claude/hooks/' "${ROOT}/.claude/settings.json" ||
@@ -424,14 +495,32 @@ check_skill_scripts() {
         --exclude-dir=research
         --exclude-dir=reviews
     )
+    # README.md is project-owned in an installed project and may not exist;
+    # AGENTS.md is template-owned and always scanned, so its absence fails.
+    local readme=()
+    if [[ -f "${ROOT}/README.md" ]]; then
+        readme=("${ROOT}/README.md")
+    fi
 
     # 8a) Every .claude/skills/**.py|.sh path mentioned in shared markdown resolves.
     local referenced
-    referenced=$(grep -rhoE "${doc_scope[@]}" '\.claude/skills/[A-Za-z0-9_/-]+\.(py|sh)' \
-        "${ROOT}/.claude" "${ROOT}/.agents" "${ROOT}/.codex" 2>/dev/null | sort -u || true)
-    referenced+=$'\n'
-    referenced+=$(grep -rhoE '\.claude/skills/[A-Za-z0-9_/-]+\.(py|sh)' \
-        "${ROOT}/AGENTS.md" "${ROOT}/README.md" 2>/dev/null | sort -u || true)
+    if ! referenced=$(
+        grep_or_empty -rhoE "${doc_scope[@]}" '\.claude/skills/[A-Za-z0-9_/-]+\.(py|sh)' \
+            "${ROOT}/.claude" "${ROOT}/.agents" "${ROOT}/.codex" &&
+            grep_or_empty -hoE '\.claude/skills/[A-Za-z0-9_/-]+\.(py|sh)' \
+                "${ROOT}/AGENTS.md" ${readme[@]+"${readme[@]}"}
+    ); then
+        echo "  Could not scan the documentation for script references"
+        return 1
+    fi
+    if ! referenced=$(printf '%s\n' "${referenced}" | sort -u); then
+        echo "  Could not deduplicate the documented script list"
+        return 1
+    fi
+    if [[ -z "${referenced}" ]]; then
+        echo "  No .claude/skills script references found in any documentation"
+        return 1
+    fi
     local ref
     while IFS= read -r ref; do
         [[ -z "${ref}" ]] && continue
@@ -439,21 +528,33 @@ check_skill_scripts() {
             echo "  Documented script does not exist: ${ref}"
             ok=false
         fi
-    done <<< "$(echo "${referenced}" | sort -u)"
+    done <<< "${referenced}" || {
+        echo "  Could not read the documented script list"
+        return 1
+    }
 
     # 8b) Every bundled script is documented somewhere, so orphans surface.
     #     Matching on the bare filename is enough: a script's own directory
     #     README refers to it by name, while callers use the full path.
+    local scripts
+    if ! scripts=$(find "${ROOT}/.claude/skills" -type f \( -name '*.py' -o -name '*.sh' \) | sort) ||
+        [[ -z "${scripts}" ]]; then
+        echo "  Could not find any bundled scripts under .claude/skills"
+        return 1
+    fi
     local script
     while IFS= read -r script; do
         [[ -z "${script}" ]] && continue
         local rel="${script#"${ROOT}/"}"
         if ! grep -rqF "${doc_scope[@]}" "$(basename "${rel}")" \
-            "${ROOT}/.claude" "${ROOT}/.agents" "${ROOT}/README.md" 2>/dev/null; then
+            "${ROOT}/.claude" "${ROOT}/.agents" ${readme[@]+"${readme[@]}"} 2>/dev/null; then
             echo "  Bundled script is not documented in any markdown: ${rel}"
             ok=false
         fi
-    done < <(find "${ROOT}/.claude/skills" -type f \( -name '*.py' -o -name '*.sh' \) | sort)
+    done <<< "${scripts}" || {
+        echo "  Could not read the bundled script list"
+        return 1
+    }
 
     ${ok}
 }

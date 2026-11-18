@@ -77,6 +77,25 @@ info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
 error() { echo "[ERROR] $*" >&2; }
 
+# Portable equivalent of GNU `realpath -m`: resolve every symlink in the
+# components that exist and keep a missing tail as-is. BSD/macOS realpath has
+# no -m, so the escape check would abort there. python3 is already required by
+# the hooks this script installs, and a missing interpreter fails closed.
+# Where available, ALLOW_MISSING makes a symlink loop or an unreadable
+# component an error, as with GNU realpath -m, instead of an unresolved path.
+canonical_path() {
+    if ! command -v python3 &>/dev/null; then
+        error "python3 is required to validate managed paths."
+        return 1
+    fi
+    python3 -c 'import os, sys
+path = sys.argv[1]
+if hasattr(os.path, "ALLOW_MISSING"):
+    print(os.path.realpath(path, strict=os.path.ALLOW_MISSING))
+else:
+    print(os.path.realpath(path))' "$1"
+}
+
 usage() {
     cat <<'EOF'
 Usage: scripts/install.sh [OPTIONS] [TARGET_DIR]
@@ -190,7 +209,7 @@ validate_destination_paths() {
             fi
         done
 
-        resolved="$(realpath -m -- "${TARGET_ROOT}/${path}")"
+        resolved="$(canonical_path "${TARGET_ROOT}/${path}")"
         if [[ "${resolved}" != "${TARGET_ROOT}/"* ]]; then
             error "Refusing path that resolves outside the target: ${path} -> ${resolved}"
             exit 2

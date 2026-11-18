@@ -1,0 +1,62 @@
+# Quality gates for this template repository.
+#
+# The job names below are the status-check names that branch protection and
+# auto-merge depend on ("Gates (ubuntu-latest)", "Gates (macos-latest)").
+# Renaming the job or the matrix values renames the checks, so change them only
+# together with the branch-protection settings.
+#
+# This directory is repository-only: scripts/install.sh and scripts/update.sh
+# copy an explicit allow-list of paths and never ship .github/ downstream.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Gates (${{ matrix.os }})
+    strategy:
+      # Report both platforms even when one fails: the point of the matrix is
+      # to catch GNU-vs-BSD divergence, which needs both results.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # setup-uv publishes no floating major tag after v7, so the release is
+      # pinned to its commit SHA.
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          python3 --version
+          uv --version
+          git --version
+
+      - name: Consistency checks (scripts/check.sh)
+        run: bash scripts/check.sh
+
+      # pytest, ruff (used by some tests) and the rest of the dev tooling come
+      # from the locked "dev" extra, as documented in README.md / pyproject.toml.
+      - name: Install dev dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Test suite (pytest)
+        run: uv run --locked --extra dev pytest
