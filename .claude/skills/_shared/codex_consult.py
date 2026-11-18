@@ -23,6 +23,15 @@ sent explicitly on every call, so what was granted is readable in the command
 rather than inherited from a config file, and ``--sandbox read-only`` remains
 the right choice for planning and review consultations.
 
+The model and the reasoning effort are sent explicitly on every call for the
+same reason. Both come from the model manifest beside this script
+(``models.json``, read through ``models.resolve``), so a call does not depend
+on its working directory or on whether Codex trusts the project's
+``.codex/config.toml``. Precedence for the model is ``--model``, then a
+non-empty ``$CODEX_MODEL``, then the project's ``.claude/models.local.json``,
+then the manifest; a caller's ``--config model_reasoning_effort=...`` replaces
+the manifest's effort. There is no hard-coded fallback model.
+
 Because the default is unrestricted, every run is bracketed by an
 ``edit_provenance`` snapshot and the resulting ``edits`` object names the
 files Codex actually created, changed, or deleted — including files it
@@ -40,7 +49,8 @@ Usage:
 Exit codes:
     0  codex exec exited 0 and its output was saved and verified
     1  bad args (both prompt sources, unreadable prompt file, bad --cwd,
-       unparseable --now)
+       unparseable --now), or no model: no --model, no $CODEX_MODEL, and the
+       model manifest is missing or invalid
     2  codex CLI not found on PATH
     3  codex exec exited non-zero or timed out, or a log file could not be
        written, created, or verified
@@ -59,11 +69,13 @@ from pathlib import Path
 from typing import NoReturn
 
 import edit_provenance
+import models
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 
-DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_TIMEOUT = 600
+# The codex --config key that carries the reasoning effort.
+EFFORT_CONFIG_KEY = "model_reasoning_effort"
 SANDBOX_CHOICES = ["read-only", "workspace-write", "danger-full-access"]
 # The wrapper's default is the project's default: `.codex/config.toml` sets
 # `sandbox_mode = "danger-full-access"`, and a wrapper that quietly substituted
@@ -234,8 +246,36 @@ def validate_config_overrides(overrides: list[str]) -> str | None:
     return None
 
 
+def manifest_codex_defaults() -> tuple[dict[str, str | None], str | None]:
+    """Read the Codex model and effort from the manifest beside this script.
+
+    The manifest is located from the script's own install root, not from
+    ``--project-root``: ``models.json`` ships next to this file, while
+    ``--project-root`` only relocates logs and the default working directory.
+    Returns ``(defaults, error)``; on an error the defaults are empty, and the
+    caller decides whether that matters (an explicit ``--model`` still works).
+    """
+    try:
+        return models.resolve(PROJECT_ROOT)["codex"], None
+    except models.ManifestError as exc:
+        return {}, str(exc)
+
+
+def effort_overrides(overrides: list[str], effort: str | None) -> list[str]:
+    """Append the manifest's effort unless the caller already chose one.
+
+    The caller's value is never followed by a second one: whether a later
+    ``--config`` wins over an earlier one is not something to rely on.
+    """
+    if effort is None:
+        return overrides
+    if any(item.partition("=")[0] == EFFORT_CONFIG_KEY for item in overrides):
+        return overrides
+    return [*overrides, f"{EFFORT_CONFIG_KEY}={effort}"]
+
+
 def _not_found_report(
-    model: str, sandbox: str, write_access: bool, detail: str
+    model: str | None, sandbox: str, write_access: bool, detail: str
 ) -> dict:
     """Build the JSON payload for the two ways codex-missing can surface."""
     return {
@@ -286,7 +326,10 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
     parser.add_argument(
         "--model",
         default=None,
-        help="Defaults to $CODEX_MODEL, else gpt-5.6-sol",
+        help=(
+            "Defaults to $CODEX_MODEL, else codex.model in the model manifest "
+            "(.claude/skills/_shared/models.json)"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -386,10 +429,38 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
     else:
         prompt = sys.stdin.read()
 
-    # An empty CODEX_MODEL is treated as unset: codex rejects an empty --model,
-    # and an exported-but-blank variable is a common shell accident.
-    env_model = os.environ.get("CODEX_MODEL") or DEFAULT_MODEL
-    model = args.model if args.model is not None else env_model
+    # An empty --model or CODEX_MODEL is treated as unset: codex rejects an
+    # empty --model, and an exported-but-blank variable is a common shell
+    # accident. A None model means the project set codex.model to null in
+    # .claude/models.local.json: --model is then omitted and Codex's own
+    # configuration decides.
+    manifest_codex, manifest_error = manifest_codex_defaults()
+    model = args.model or os.environ.get("CODEX_MODEL") or manifest_codex.get("model")
+    if model is None and manifest_error is not None:
+        _emit(
+            {
+                "ok": False,
+                "error": (
+                    "no Codex model: pass --model, set CODEX_MODEL, or restore "
+                    f".claude/skills/_shared/models.json ({manifest_error})"
+                ),
+            }
+        )
+        return EXIT_BAD_ARGS
+    # A model from --model or $CODEX_MODEL lets the call go ahead without the
+    # manifest, but the manifest's effort is then unknown and is not sent.
+    # That is said out loud: silently, Codex would run on whatever effort its
+    # own configuration holds and nothing would show why.
+    warning: str | None = None
+    if manifest_error is not None:
+        warning = (
+            "the model manifest could not be read, so no reasoning effort was "
+            f"passed and Codex's own configuration decides it: {manifest_error}"
+        )
+        print(f"warning: {warning}", file=sys.stderr)
+    config_overrides = effort_overrides(
+        args.config, manifest_codex.get("reasoning_effort")
+    )
     sandbox = args.sandbox
     write_access = sandbox != "read-only"
     caller = args.caller or os.environ.get("ORCHESTRA_CALLER") or None
@@ -433,10 +504,13 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
         return EXIT_FAILED
 
     cwd = args.cwd if args.cwd is not None else project_root
-    argv = ["codex", "exec", "--model", model, "--sandbox", sandbox]
+    argv = ["codex", "exec"]
+    if model is not None:
+        argv.extend(["--model", model])
+    argv.extend(["--sandbox", sandbox])
     if args.skip_git_repo_check:
         argv.append("--skip-git-repo-check")
-    for override in args.config:
+    for override in config_overrides:
         argv.extend(["--config", override])
     # The prompt is always the final argv element and is never shell-expanded.
     argv.append(prompt)
@@ -525,6 +599,7 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
             "response_chars": len(stdout_text),
             "response_head": stdout_text[:400],
             "artifacts": artifacts,
+            "warning": warning,
             "error": error,
         }
     )

@@ -269,8 +269,10 @@ Rules:
   when the call starts is excluded, so it is never misattributed to the
   callee.
 
-- Pin the model with `--model` when the tier matters (Codex reads `CODEX_MODEL`;
-  omitting `--model` for a peer CLI keeps that CLI's own default).
+- Pin the model with `--model` when the tier matters (Codex defaults to
+  `$CODEX_MODEL` when it is set, else `codex.model` in
+  `.claude/skills/_shared/models.json`; omitting `--model` for a peer CLI keeps
+  that CLI's own default).
 - Bound the call: keep the wrapper's timeout, and cap agentic turns for
   long-running peers where the callee supports it (e.g.
   `--cli-arg --max-turns --cli-arg 8` for Claude Code). With no sandbox in the

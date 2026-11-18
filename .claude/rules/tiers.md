@@ -34,8 +34,8 @@ and referenced by skills, rules, and configuration.
   (`.claude/rules/codex-delegation.md` section "Prompt Contract").
 - **Outputs**: Structured response (TL;DR / Analysis / Plan / Patch Strategy /
   Validation / Risks); file patches; validation commands.
-- **Model**: Codex CLI model (`CODEX_MODEL` env in `.claude/settings.json`,
-  mirrored in `.codex/config.toml`).
+- **Model**: Codex CLI model (`codex.model` in the model manifest,
+  `.claude/skills/_shared/models.json`, rendered into `.codex/config.toml`).
 - **Guardrails**: See root `AGENTS.md` section "Guardrails (Completion Verification)".
 
 ## Tier 3 -- `fable` (Rare Escalation / Final Authority)

@@ -9,8 +9,8 @@ Multi-Agent AI Development Environment
 > The install and update commands below pull from this fork.
 
 ```
-Claude Code (Orchestrator) ─┬─ Sonnet Subagents (Routine Implementation)
-                             ├─ Opus Subagents (Research, Analysis, Difficult Implementation)
+Claude Code (Orchestrator) ─┬─ Opus Subagents (Routine Implementation)
+                             ├─ Fable Subagents (Research, Analysis, Difficult Implementation)
                              └─ Codex CLI (Planning & Complex Code)
 ```
 
@@ -54,7 +54,10 @@ replace them.
 
 An existing `.claude/settings.json` is never overwritten. When a manual merge is
 needed, the installer writes `.claude/settings.orchestra.json`; merge the required
-settings and delete the candidate before starting Claude Code.
+settings and delete the candidate before starting Claude Code. The only keys the
+installer advances in it are the model keys of the model manifest (see
+[Keeping AI CLIs Up to Date](#keeping-ai-clis-up-to-date)); a value you chose
+yourself is kept.
 
 Then start Claude Code and run `/init` inside it:
 
@@ -135,12 +138,29 @@ Confirm versions afterward:
 claude --version && codex --version
 ```
 
-The Codex model is centralized in `.claude/settings.json` (`env.CODEX_MODEL`), which every `${CODEX_MODEL:-...}` reference resolves to. `.codex/config.toml` (`model` + `model_reasoning_effort = "xhigh"`) must be kept in sync — `scripts/check.sh` verifies coherence between the two. To always use the latest model, bump that single value (currently `gpt-5.6-sol`) — no need to edit individual skill files. The `${CODEX_MODEL:-...}` fallback is just a default for when the env var is unset. Note: `update.sh` never auto-merges `.claude/settings.json` — downstream users must bump `env.CODEX_MODEL` manually after reviewing the Phase 5 diff.
+Every model the orchestration uses is set in one file,
+`.claude/skills/_shared/models.json`: the main-agent model, the default subagent
+model, the model of each agent in `.claude/agents/`, and the Codex model and
+reasoning effort. To change one, run
+`python3 .claude/skills/_shared/models.py set <key> <value>` and then
+`python3 .claude/skills/_shared/models.py apply`, which rewrites the generated
+copies: the `model:` line of each agent definition, `model` and
+`env.CLAUDE_CODE_SUBAGENT_MODEL` in `.claude/settings.json`, and `model` and
+`model_reasoning_effort` in `.codex/config.toml`. Do not edit the copies by
+hand. In this template `scripts/check.sh` fails on any copy that differs from
+the manifest. In an installed project it fails when a copy still holds a value
+the template once shipped (it drifted), but a value the project set itself in
+`.claude/settings.json` or `.codex/config.toml` is kept and reported as
+`custom`, and the check passes. The Codex wrapper
+reads the manifest at run time and passes model and effort explicitly;
+`--model` and a `CODEX_MODEL` environment variable still override it per call.
 
-Claude subagent routing is explicit in `.claude/agents/`: `general-purpose-sonnet`
-and `general-purpose-opus` pin their own model aliases in frontmatter. Unspecified
-subagents default to Sonnet through `.claude/settings.json`
-(`env.CLAUDE_CODE_SUBAGENT_MODEL`).
+`scripts/update.sh` runs the same `apply` in an installed project, so a model
+change reaches it on its next update. In the two project-owned files a key is
+advanced only when it is absent or still holds a value the template once
+shipped; a value the project chose itself is kept and reported. To override a
+single key, or to opt out with `"manage_native_settings": false`, create
+`.claude/models.local.json` in the project.
 
 Peer CLI agents are reached through `.claude/skills/_shared/cli_consult.py`,
 which supports Claude Code (`--cli claude`) and Antigravity (`--cli
@@ -157,7 +177,7 @@ below is a non-normative overview of the default setup.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│       Claude Code (Orchestrator — Opus, 1M context)         │
+│       Claude Code (Orchestrator — Fable)                    │
 │       → Context conservation is top priority                │
 │       → Handles user interaction, coordination, concise edits│
 │                          │                                  │
@@ -171,7 +191,7 @@ below is a non-normative overview of the default setup.
 │  │                       │                              │   │
 │  │  ┌────────────────────┴─────────────────────────┐    │   │
 │  │  │ Tier 2 — Sol                                 │    │   │
-│  │  │ Codex CLI  (gpt-5.6-sol, effort xhigh)      │    │   │
+│  │  │ Codex CLI  (model, effort: models.json)     │    │   │
 │  │  │ → Design, planning, complex code, debugging  │    │   │
 │  │  └──────────────────────────────────────────────┘    │   │
 │  │                       │                              │   │
@@ -485,7 +505,8 @@ rm -rf "$template_dir"
 - Known legacy `.agents/hooks/` and `.agents/logs/` references in Claude
   settings are migrated to `.claude/`; other settings differences still require
   manual review.
-- `.claude/settings.json` and `.codex/config.toml` are never overwritten; both only show a diff (manual merge required)
+- `.claude/settings.json` and `.codex/config.toml` are never overwritten; both only show a diff (manual merge required). The one exception is the model keys of the model manifest: the update advances them with `models.py apply`, keeps any value the project chose itself, and changes nothing at all when a file's layout is not one it can edit safely (it says which line to fix)
+- The update that first delivers the model manifest is still run by the previous `scripts/update.sh`, which has no apply step: run the update a second time (or `python3 .claude/skills/_shared/models.py apply`) to advance the model keys. Until then `scripts/check.sh` reports the drift
 - The installed template version is stored in `.claude/orchestra-version`; a downstream project's root `VERSION` is never modified
 - If the update modifies `scripts/update.sh` itself (e.g. a new version adds
   template directories such as `.claude/rules/`), **run `./scripts/update.sh` a second

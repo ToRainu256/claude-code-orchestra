@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / ".claude" / "skills" / "_shared" / "codex_consult.py"
+SHARED_DIR = REPO_ROOT / ".claude" / "skills" / "_shared"
+SCRIPT = SHARED_DIR / "codex_consult.py"
+# What the wrapper needs beside it to run from another install root.
+WRAPPER_MODULES = ("codex_consult.py", "models.py", "edit_provenance.py")
+MANIFEST_NAME = "models.json"
 
 
 def write_fake_codex(
@@ -54,8 +60,13 @@ def run_codex_consult(
     no_codex: bool = False,
     env_overrides: dict[str, str] | None = None,
     stdin_input: str | None = None,
+    script: Path = SCRIPT,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    # A Claude Code session exports whatever its settings file puts in `env`,
+    # so an ambient CODEX_MODEL would decide the model instead of the manifest.
+    # Tests that mean to set it pass it through env_overrides.
+    env.pop("CODEX_MODEL", None)
     if env_overrides:
         env.update(env_overrides)
     if no_codex:
@@ -65,7 +76,7 @@ def run_codex_consult(
     elif path_prefix is not None:
         env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
     return subprocess.run(
-        [sys.executable, str(SCRIPT), "--project-root", str(tmp_path), *args],
+        [sys.executable, str(script), "--project-root", str(tmp_path), *args],
         input=stdin_input,
         stdin=subprocess.DEVNULL if stdin_input is None else None,
         env=env,
@@ -81,10 +92,45 @@ def write_prompt(tmp_path: Path, text: str, name: str = "prompt.txt") -> Path:
     return prompt_file
 
 
-def test_success_writes_response_and_reports_head(tmp_path: Path) -> None:
+def make_install_root(
+    tmp_path: Path,
+    *,
+    with_manifest: bool = True,
+    local_override: dict[str, Any] | None = None,
+) -> Path:
+    """Copy the wrapper into its own install root and return the script path.
+
+    The wrapper finds the manifest beside itself, so a missing manifest or a
+    project-local override can only be exercised from a separate root.
+    """
+    root = tmp_path / "install"
+    shared = root / ".claude" / "skills" / "_shared"
+    shared.mkdir(parents=True)
+    for name in WRAPPER_MODULES:
+        shutil.copy2(SHARED_DIR / name, shared / name)
+    if with_manifest:
+        shutil.copy2(SHARED_DIR / MANIFEST_NAME, shared / MANIFEST_NAME)
+    if local_override is not None:
+        (root / ".claude" / "models.local.json").write_text(
+            json.dumps(local_override), encoding="utf-8"
+        )
+    return shared / "codex_consult.py"
+
+
+def config_values(argv: list[str]) -> list[str]:
+    """Every value that follows a ``--config`` flag in a recorded argv."""
+    return [argv[i + 1] for i, item in enumerate(argv) if item == "--config"]
+
+
+def test_success_writes_response_and_reports_head(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    write_fake_codex(bin_dir, stdout="Codex response body\n", exit_code=0)
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(
+        bin_dir, stdout="Codex response body\n", exit_code=0, argv_log=argv_log
+    )
     prompt_file = write_prompt(tmp_path, "Objective: do the thing")
 
     result = run_codex_consult(
@@ -97,7 +143,16 @@ def test_success_writes_response_and_reports_head(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["exit_code"] == 0
-    assert payload["model"] == "gpt-5.6-sol"
+    # With no --model and no CODEX_MODEL the model is the manifest's, and both
+    # it and the effort reach codex explicitly rather than through whichever
+    # config file the working directory happens to select.
+    expected = resolved_models["codex"]
+    assert payload["model"] == expected["model"]
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert recorded_argv[recorded_argv.index("--model") + 1] == expected["model"]
+    assert config_values(recorded_argv) == [
+        f"model_reasoning_effort={expected['reasoning_effort']}"
+    ]
     # The wrapper's default matches .codex/config.toml rather than being
     # quietly stricter than the CLI a caller would have run by hand.
     assert payload["sandbox"] == "danger-full-access"
@@ -275,7 +330,8 @@ def test_codex_model_env_var_is_honoured_and_flag_overrides_it(
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    write_fake_codex(bin_dir, stdout="ok\n")
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
     prompt_file = write_prompt(tmp_path, "Objective: model check")
 
     env_result = run_codex_consult(
@@ -287,6 +343,10 @@ def test_codex_model_env_var_is_honoured_and_flag_overrides_it(
     assert env_result.returncode == 0, env_result.stderr
     env_payload = json.loads(env_result.stdout)
     assert env_payload["model"] == "gpt-custom-env"
+    # What is reported must be what codex was actually started with.
+    env_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert env_argv[env_argv.index("--model") + 1] == "gpt-custom-env"
+    assert env_argv.count("--model") == 1
 
     override_result = run_codex_consult(
         tmp_path,
@@ -297,6 +357,256 @@ def test_codex_model_env_var_is_honoured_and_flag_overrides_it(
     assert override_result.returncode == 0, override_result.stderr
     override_payload = json.loads(override_result.stdout)
     assert override_payload["model"] == "gpt-explicit"
+    override_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert override_argv[override_argv.index("--model") + 1] == "gpt-explicit"
+    assert override_argv.count("--model") == 1
+
+
+def test_an_empty_codex_model_env_var_falls_through_to_the_manifest(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """An exported-but-blank variable is a common shell accident, and codex
+    rejects an empty --model."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_fake_codex(bin_dir, stdout="ok\n")
+    prompt_file = write_prompt(tmp_path, "Objective: model check")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        env_overrides={"CODEX_MODEL": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["model"] == resolved_models["codex"]["model"]
+
+
+def test_caller_effort_replaces_the_manifest_effort(tmp_path: Path) -> None:
+    """Whether a later --config wins over an earlier one is codex's business,
+    so the wrapper never sends two efforts: the caller's is the only one."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: cheap question")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file), "--config", "model_reasoning_effort=low"],
+        path_prefix=bin_dir,
+    )
+
+    assert result.returncode == 0, result.stderr
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert config_values(recorded_argv) == ["model_reasoning_effort=low"]
+
+
+def test_wrapper_has_no_hard_coded_model() -> None:
+    """A hidden constant is how one install ended up on a model nobody chose:
+    the manifest is the only place a default model may come from."""
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "DEFAULT_MODEL" not in source
+    assert "models.resolve(" in source
+
+
+def test_missing_manifest_without_a_model_is_bad_args(tmp_path: Path) -> None:
+    script = make_install_root(tmp_path, with_manifest=False)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        script=script,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "no Codex model" in payload["error"]
+    assert "models.json" in payload["error"]
+    # Refused before codex was ever started.
+    assert not argv_log.exists()
+
+
+def test_missing_manifest_still_honours_an_explicit_model(tmp_path: Path) -> None:
+    script = make_install_root(tmp_path, with_manifest=False)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file), "--model", "gpt-explicit"],
+        path_prefix=bin_dir,
+        script=script,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["model"] == "gpt-explicit"
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    # No manifest means no effort to state, so none is invented.
+    assert config_values(recorded_argv) == []
+    # But the call does not go ahead in silence: Codex is now running on
+    # whatever effort its own configuration holds.
+    assert "models.json" in payload["warning"]
+    assert "warning: " in result.stderr
+
+
+INVALID_OVERRIDE = '{"schema_version": 1, "codex": {"modle": "typo"}}'
+
+
+def test_invalid_local_override_without_a_model_is_bad_args(tmp_path: Path) -> None:
+    """A broken override makes the manifest unreadable as a whole. With no
+    model from the caller there is nothing to run on, and the error names the
+    file to fix."""
+    script = make_install_root(tmp_path)
+    (script.parents[2] / "models.local.json").write_text(INVALID_OVERRIDE)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        script=script,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "models.local.json" in payload["error"]
+    assert not argv_log.exists()
+
+
+def test_invalid_local_override_with_a_model_warns_instead_of_hiding_it(
+    tmp_path: Path,
+) -> None:
+    """The caller's model lets the call go ahead, but the manifest's effort is
+    unknown and is not sent. That must be visible in the result."""
+    script = make_install_root(tmp_path)
+    (script.parents[2] / "models.local.json").write_text(INVALID_OVERRIDE)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        env_overrides={"CODEX_MODEL": "gpt-custom-env"},
+        script=script,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["model"] == "gpt-custom-env"
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert recorded_argv[recorded_argv.index("--model") + 1] == "gpt-custom-env"
+    assert config_values(recorded_argv) == []
+    assert "models.local.json" in payload["warning"]
+    assert "no reasoning effort was passed" in payload["warning"]
+    assert "warning: " in result.stderr
+
+
+def test_a_readable_manifest_means_no_warning(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_fake_codex(bin_dir, stdout="ok\n")
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path, ["--prompt-file", str(prompt_file)], path_prefix=bin_dir
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["warning"] is None
+    assert "warning: " not in result.stderr
+
+
+def test_project_local_override_decides_model_and_effort(tmp_path: Path) -> None:
+    script = make_install_root(
+        tmp_path,
+        local_override={
+            "schema_version": 1,
+            "codex": {"model": "gpt-local-choice", "reasoning_effort": "low"},
+        },
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        script=script,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["model"] == "gpt-local-choice"
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert recorded_argv[recorded_argv.index("--model") + 1] == "gpt-local-choice"
+    assert config_values(recorded_argv) == ["model_reasoning_effort=low"]
+
+    env_result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        env_overrides={"CODEX_MODEL": "gpt-custom-env"},
+        script=script,
+    )
+    assert env_result.returncode == 0, env_result.stderr
+    # $CODEX_MODEL outranks the project override, which outranks the manifest.
+    assert json.loads(env_result.stdout)["model"] == "gpt-custom-env"
+
+
+def test_unmanaged_codex_keys_leave_the_choice_to_codex(tmp_path: Path) -> None:
+    """A null leaf in the local override means "do not manage this key": the
+    wrapper then sends neither flag and Codex's own configuration decides."""
+    script = make_install_root(
+        tmp_path,
+        local_override={
+            "schema_version": 1,
+            "codex": {"model": None, "reasoning_effort": None},
+        },
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.json"
+    write_fake_codex(bin_dir, stdout="ok\n", argv_log=argv_log)
+    prompt_file = write_prompt(tmp_path, "Objective: anything")
+
+    result = run_codex_consult(
+        tmp_path,
+        ["--prompt-file", str(prompt_file)],
+        path_prefix=bin_dir,
+        script=script,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["model"] is None
+    recorded_argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert "--model" not in recorded_argv
+    assert config_values(recorded_argv) == []
 
 
 def test_skip_git_repo_check_is_forwarded_before_the_prompt(tmp_path: Path) -> None:

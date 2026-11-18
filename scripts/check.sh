@@ -145,89 +145,43 @@ check_tier_ids() {
 check "Tier IDs present in tiers.md" check_tier_ids
 
 # --------------------------------------------------------------------------
-# 3) Model coherence: CODEX_MODEL in settings.json == model in config.toml
-#    == fallback values in ${CODEX_MODEL:-...} across .claude/ and .codex/
-#    (gpt-5.5-mini is excluded from comparison)
+# 3) Model coherence: every place a model value lives matches the manifest
+#    (.claude/skills/_shared/models.json, merged with the project's own
+#    .claude/models.local.json). `models.py check` compares the agent
+#    frontmatter, .claude/settings.json and .codex/config.toml against it and
+#    writes nothing; the process environment is ignored.
+#
+#    In an installed project (.claude/orchestra-version exists) a value the
+#    project chose on purpose is reported as `custom`, not as drift. The
+#    template has no project choices, so there the check is strict: a value
+#    the manifest does not name, a managed file that is missing or opted out,
+#    or a committed local override fails it.
 # --------------------------------------------------------------------------
 check_model_coherence() {
-    local settings="${ROOT}/.claude/settings.json"
-    local config="${ROOT}/.codex/config.toml"
-    local ok=true
-
-    # Extract CODEX_MODEL from settings.json
-    local settings_model
-    settings_model=$(python3 -c "
-import json, sys
-with open('${settings}') as f:
-    d = json.load(f)
-print(d.get('env', {}).get('CODEX_MODEL', ''))
-" 2>/dev/null)
-
-    if [[ -z "${settings_model}" ]]; then
-        echo "  Could not read CODEX_MODEL from ${settings}"
+    local models="${ROOT}/.claude/skills/_shared/models.py"
+    if [[ ! -f "${models}" ]]; then
+        echo "  .claude/skills/_shared/models.py not found"
+        return 1
+    fi
+    if ! command -v python3 > /dev/null 2>&1; then
+        echo "  python3 is required to check the model manifest"
         return 1
     fi
 
-    # Extract model from config.toml (simple grep; avoids toml parser dep)
-    local config_model
-    config_model=$(grep -E '^model[[:space:]]*=' "${config}" | head -1 \
-        | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
-
-    if [[ -z "${config_model}" ]]; then
-        echo "  Could not read model from ${config}"
-        return 1
+    # The findings are the script's stderr lines; its stdout is one JSON
+    # object for programmatic callers and is not needed here.
+    local strict=""
+    if [[ ! -e "${ROOT}/.claude/orchestra-version" ]]; then
+        strict="--strict"
     fi
-
-    # Compare settings vs config
-    if [[ "${settings_model}" != "${config_model}" ]]; then
-        echo "  Mismatch: settings.json CODEX_MODEL=${settings_model} vs config.toml model=${config_model}"
-        ok=false
-    fi
-
-    # Extract distinct fallback values from ${CODEX_MODEL:-...} patterns
-    # Generated content (run logs, checkpoints, research and review notes) can
-    # quote the pattern in prose and is not configuration, so it is excluded
-    # the same way the skill-scripts check below excludes it.
-    local fallbacks
-    if ! fallbacks=$(grep_or_empty -rhoE \
-        --exclude-dir=logs --exclude-dir=checkpoints \
-        --exclude-dir=research --exclude-dir=reviews \
-        '\$\{CODEX_MODEL:-[^}]+\}' "${ROOT}/.claude/" "${ROOT}/.codex/" \
-        | sed 's/.*:-\(.*\)}/\1/' \
-        | sort -u \
-        | grep_or_empty -v 'gpt-5.5-mini'); then
-        echo "  Could not scan .claude/ and .codex/ for CODEX_MODEL fallbacks"
-        ok=false
-    fi
-
-    while IFS= read -r fb; do
-        [[ -z "${fb}" ]] && continue
-        if [[ "${fb}" != "${settings_model}" ]]; then
-            echo "  Mismatch: fallback ${fb} != CODEX_MODEL ${settings_model}"
-            ok=false
-        fi
-    done <<< "${fallbacks}" || {
-        echo "  Could not read the CODEX_MODEL fallback list"
-        return 1
-    }
-
-    # The shared Codex wrapper carries the same fallback in Python, so it has
-    # to move with the single centralized model value too.
-    local consult="${ROOT}/.claude/skills/_shared/codex_consult.py"
-    if [[ -f "${consult}" ]]; then
-        local consult_model
-        consult_model=$(grep -E '^DEFAULT_MODEL[[:space:]]*=' "${consult}" \
-            | head -1 | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
-        if [[ -z "${consult_model}" ]]; then
-            echo "  Could not read DEFAULT_MODEL from codex_consult.py"
-            ok=false
-        elif [[ "${consult_model}" != "${settings_model}" ]]; then
-            echo "  Mismatch: codex_consult.py DEFAULT_MODEL=${consult_model} != CODEX_MODEL ${settings_model}"
-            ok=false
-        fi
-    fi
-
-    ${ok}
+    local report status=0
+    report="$(python3 "${models}" --project-root "${ROOT}" check ${strict:+"${strict}"} \
+        2>&1 > /dev/null)" || status=$?
+    local line
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] || echo "  ${line}"
+    done <<< "${report}"
+    ((status == 0))
 }
 check "Model coherence" check_model_coherence
 
@@ -451,6 +405,7 @@ check_native_boundaries() {
 
     check_allowed_entries "${ROOT}/.claude" \
         settings.json settings.local.json settings.orchestra.json orchestra-version \
+        models.local.json \
         agents skills rules hooks docs logs checkpoints STATE.md || ok=false
     check_allowed_entries "${ROOT}/.codex" \
         config.toml config.orchestra.toml AGENTS.md || ok=false

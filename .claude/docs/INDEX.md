@@ -30,6 +30,6 @@
 
 ## Related Canonical Files (outside .claude/docs/)
 
-- **Model configuration**: `.claude/settings.json` (`env.CODEX_MODEL`) and `.codex/config.toml` (`model`)
+- **Model configuration**: `.claude/skills/_shared/models.json` is the single source of truth for every model; `.claude/skills/_shared/models.py` (`apply` / `check`) renders it into `.claude/agents/`, `.claude/settings.json` and `.codex/config.toml`
 - **Claude-to-Codex details**: `.claude/rules/codex-delegation.md`
 - **Root bootstrap**: `AGENTS.md` is the single root contract for both the main agent and every CLI runtime; no `CLAUDE.md` and no symlinks are involved

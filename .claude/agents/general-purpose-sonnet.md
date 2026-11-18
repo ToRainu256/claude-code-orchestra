@@ -2,7 +2,7 @@
 name: general-purpose-sonnet
 description: "Sonnet subagent for routine, well-scoped implementation. Use for approved plans, localized features and fixes, tests, refactoring, and mechanical file work with clear acceptance criteria."
 tools: Read, Edit, Write, Bash, Grep, Glob
-model: sonnet
+model: opus
 ---
 
 You are the default implementation arm of the Claude Code orchestrator. Deliver

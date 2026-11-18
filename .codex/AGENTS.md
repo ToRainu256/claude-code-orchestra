@@ -10,12 +10,17 @@ Codex operates as **Tier 2 (`sol`)** in the agent hierarchy. See
 
 ## Model Configuration
 
-Source of truth: `.codex/config.toml`
+Source of truth for the model and the reasoning effort: the model manifest,
+`.claude/skills/_shared/models.json`. `python3 .claude/skills/_shared/models.py apply`
+renders both into `.codex/config.toml`; do not edit them there (in an installed
+project a value set there by hand is kept and reported as `custom`; to change
+it deliberately, record it in `.claude/models.local.json`). The other two keys
+are set in `.codex/config.toml` directly.
 
 | Key                      | Value          |
 |--------------------------|----------------|
-| `model`                  | `gpt-5.6-sol`  |
-| `model_reasoning_effort` | `xhigh`        |
+| `model`                  | manifest `codex.model` |
+| `model_reasoning_effort` | manifest `codex.reasoning_effort` |
 | `approval_policy`        | `never`        |
 | `sandbox_mode`           | `danger-full-access` |
 

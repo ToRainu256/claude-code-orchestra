@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install.sh"
+SETTINGS_REL = ".claude/settings.json"
+CONFIG_REL = ".codex/config.toml"
+MODELS_LOCAL_REL = ".claude/models.local.json"
+# Stand-ins for values a project chose itself. No template version shipped
+# them, so the model manifest must never replace them.
+CUSTOM_CODEX_MODEL = "gpt-project-own-pin"
+CUSTOM_CLAUDE_MODEL = "claude-project-9-pin"
+CUSTOM_EFFORT = "low"
 
 
 def init_git_repo(path: Path) -> None:
@@ -74,6 +87,104 @@ def run_update(
         capture_output=True,
         text=True,
         env=env,
+    )
+
+
+def install_from_template(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a template repo and install it into a fresh project."""
+    template = build_template_repo(tmp_path)
+    target = tmp_path / "project"
+    init_git_repo(target)
+    result = run_install(target, script=template / "scripts/install.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return template, target
+
+
+def canonical_json(value: Any) -> str:
+    """The layout the template ships its settings in, and the tool rewrites."""
+    return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+
+
+def read_settings(target: Path) -> dict[str, Any]:
+    return json.loads((target / SETTINGS_REL).read_text(encoding="utf-8"))
+
+
+def set_toml_value(text: str, key: str, value: str) -> str:
+    """Replace one top-level ``key = "..."`` line, whatever it holds today."""
+    edited, count = re.subn(
+        rf'(?m)^{re.escape(key)} = "[^"]*"$', f'{key} = "{value}"', text
+    )
+    assert count == 1, f"{key} is not a single plain top-level line"
+    return edited
+
+
+def never_shipped(resolved: dict[str, Any], key: str, candidates: list[str]) -> str:
+    """Pick a value for *key* that no template version ever shipped."""
+    section, _, leaf = key.partition(".")
+    shipped = {*resolved["superseded"].get(key, []), resolved[section][leaf]}
+    return next(value for value in candidates if value not in shipped)
+
+
+def write_python3_shim(shim_dir: Path, on_apply: str) -> None:
+    """Put a `python3` first on PATH that runs *on_apply* (a shell command)
+    just before the model tool's `apply`, and is the real interpreter for
+    everything else. It stages a condition at exactly that point of an update
+    without touching the scripts or the tool under test."""
+    real = shutil.which("python3")
+    assert real is not None
+    shim_dir.mkdir()
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'for arg in "$@"; do\n'
+        '    if [[ "${arg}" == "apply" ]]; then\n'
+        f"        {on_apply}\n"
+        "    fi\n"
+        "done\n"
+        f'exec "{real}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+
+# Runs the model tool with every attempt to create a file under `.codex/`
+# denied, which is what a read-only directory does. Denying it inside the
+# interpreter instead of with `chmod` makes it hold for any user, and at
+# exactly the point where the tool writes.
+DENY_CODEX_WRITES = """\
+import os
+import runpy
+import sys
+
+real_open = os.open
+
+
+def deny(path, flags, mode=0o777, **kwargs):
+    if os.sep + ".codex" + os.sep in str(path) and flags & os.O_CREAT:
+        raise PermissionError(13, "Permission denied", str(path))
+    return real_open(path, flags, mode, **kwargs)
+
+
+os.open = deny
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def bump_template_version(template: Path, version: str) -> None:
+    """Give the template a new VERSION, so a test can tell whether the update
+    reached the phase that records it."""
+    (template / "VERSION").write_text(f"{version}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(template), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(template), "commit", "-qm", "bump"], check=True)
+
+
+def run_gate(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(root / "scripts/check.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -338,7 +449,7 @@ def test_install_preserves_existing_settings_and_writes_merge_candidate(
 
 
 def test_install_preserves_existing_codex_config_and_writes_merge_candidate(
-    tmp_path: Path,
+    tmp_path: Path, resolved_models: dict[str, Any]
 ) -> None:
     """`.codex/config.toml` is a settings file, not template content.
 
@@ -346,18 +457,26 @@ def test_install_preserves_existing_codex_config_and_writes_merge_candidate(
     install or update silently overwrote a downstream project's model choice,
     approval policy, and sandbox mode — while `.claude/settings.json`, the same
     kind of file, was carefully preserved.
+
+    The model manifest patches single keys in it, and only ones the project
+    did not choose: the model the project pinned stays, and the one managed
+    key the file lacked is added.
     """
     target = tmp_path / "project"
     init_git_repo(target)
-    config = target / ".codex/config.toml"
+    config = target / CONFIG_REL
     config.parent.mkdir(parents=True)
-    custom_config = 'model = "gpt-5.6-sol-mini"\n'
+    custom_config = f'model = "{CUSTOM_CODEX_MODEL}"\napproval_policy = "on-request"\n'
     config.write_text(custom_config, encoding="utf-8")
 
     result = run_install(target)
 
     assert result.returncode == 0, result.stderr
-    assert config.read_text(encoding="utf-8") == custom_config
+    effort = resolved_models["codex"]["reasoning_effort"]
+    assert config.read_text(encoding="utf-8") == (
+        custom_config + f'model_reasoning_effort = "{effort}"\n'
+    )
+    assert f'kept "{CUSTOM_CODEX_MODEL}"' in result.stdout
     candidate = target / ".codex/config.orchestra.toml"
     assert candidate.read_text(encoding="utf-8") == (
         REPO_ROOT / ".codex/config.toml"
@@ -367,23 +486,629 @@ def test_install_preserves_existing_codex_config_and_writes_merge_candidate(
     assert (target / ".codex/AGENTS.md").is_file()
 
 
-def test_update_never_overwrites_codex_config(tmp_path: Path) -> None:
-    template = build_template_repo(tmp_path)
+def test_install_reports_a_settings_layout_it_will_not_edit(tmp_path: Path) -> None:
+    """A one-line settings file is valid JSON this tool cannot rewrite without
+    reformatting it, so it is left alone and the installer says so."""
     target = tmp_path / "project"
     init_git_repo(target)
-    assert run_install(target, script=template / "scripts/install.sh").returncode == 0
+    settings = target / SETTINGS_REL
+    settings.parent.mkdir(parents=True)
+    custom_settings = '{"language": "english"}\n'
+    settings.write_text(custom_settings, encoding="utf-8")
 
-    config = target / ".codex/config.toml"
-    edited = config.read_text(encoding="utf-8").replace(
-        'model_reasoning_effort = "xhigh"', 'model_reasoning_effort = "medium"'
+    result = run_install(target)
+
+    assert result.returncode == 0, result.stderr
+    assert settings.read_text(encoding="utf-8") == custom_settings
+    assert f"refused: {SETTINGS_REL}" in result.stdout
+    assert "Model manifest was NOT applied" in result.stdout
+
+
+def test_install_advances_a_shipped_default_in_existing_settings(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    target = tmp_path / "project"
+    init_git_repo(target)
+    settings = target / SETTINGS_REL
+    settings.parent.mkdir(parents=True)
+    shipped = resolved_models["superseded"]["claude.subagent_default"][0]
+    existing = {
+        "language": "english",
+        "env": {"CLAUDE_CODE_SUBAGENT_MODEL": shipped, "KEEP_ME": "1"},
+    }
+    settings.write_text(canonical_json(existing), encoding="utf-8")
+
+    result = run_install(target)
+
+    assert result.returncode == 0, result.stderr
+    expected = {
+        "language": "english",
+        "env": {
+            "CLAUDE_CODE_SUBAGENT_MODEL": resolved_models["claude"]["subagent_default"],
+            "KEEP_ME": "1",
+        },
+        "model": resolved_models["claude"]["main"],
+    }
+    assert settings.read_text(encoding="utf-8") == canonical_json(expected)
+
+
+def test_install_finishes_then_fails_loudly_on_an_invalid_model_override(
+    tmp_path: Path,
+) -> None:
+    """A project that already carries a broken override still gets a complete
+    installation, and a non-zero exit so the unapplied models are not missed."""
+    target = tmp_path / "project"
+    init_git_repo(target)
+    override = target / MODELS_LOCAL_REL
+    override.parent.mkdir(parents=True)
+    override.write_text('{"schema_version": 1, "codex": {"modle": "typo"}}')
+
+    result = run_install(target)
+
+    assert result.returncode == 1, result.stdout
+    assert "models.local.json" in result.stderr
+    assert "model manifest was not applied" in result.stderr
+    # Everything after the model step still ran.
+    assert (target / ".claude/orchestra-version").is_file()
+    assert ".claude/logs/" in (target / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_update_keeps_custom_model_values_and_reports_them(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """A value the project chose survives an update byte for byte.
+
+    This used to hold trivially, because the updater never wrote to either
+    settings file. It now patches the manifest's model keys, so what protects
+    a deliberate choice is the rule that only a value some template version
+    shipped may be replaced.
+    """
+    template, target = install_from_template(tmp_path)
+    config = target / CONFIG_REL
+    custom_effort = never_shipped(
+        resolved_models, "codex.reasoning_effort", [CUSTOM_EFFORT, "max"]
     )
-    assert edited != config.read_text(encoding="utf-8")
-    config.write_text(edited, encoding="utf-8")
+    edited_config = set_toml_value(
+        set_toml_value(config.read_text(encoding="utf-8"), "model", CUSTOM_CODEX_MODEL),
+        "model_reasoning_effort",
+        custom_effort,
+    )
+    config.write_text(edited_config, encoding="utf-8")
+    settings = read_settings(target)
+    settings["model"] = CUSTOM_CLAUDE_MODEL
+    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = CUSTOM_CLAUDE_MODEL
+    settings["env"]["CODEX_MODEL"] = CUSTOM_CODEX_MODEL
+    edited_settings = canonical_json(settings)
+    (target / SETTINGS_REL).write_text(edited_settings, encoding="utf-8")
 
     update_result = run_update(target, template)
 
     assert update_result.returncode == 0, update_result.stderr
-    assert config.read_text(encoding="utf-8") == edited
+    assert config.read_text(encoding="utf-8") == edited_config
+    assert (target / SETTINGS_REL).read_text(encoding="utf-8") == edited_settings
+    for kept in (
+        f'model: kept "{CUSTOM_CLAUDE_MODEL}"',
+        f'env.CLAUDE_CODE_SUBAGENT_MODEL: kept "{CUSTOM_CLAUDE_MODEL}"',
+        f'env.CODEX_MODEL: kept "{CUSTOM_CODEX_MODEL}"',
+        f'{CONFIG_REL} model: kept "{CUSTOM_CODEX_MODEL}"',
+        f'model_reasoning_effort: kept "{custom_effort}"',
+    ):
+        assert kept in update_result.stdout, kept
+    # A deliberate value is not drift, so the project's own gate stays green.
+    check = subprocess.run(
+        ["bash", str(target / "scripts/check.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
+
+
+def test_update_advances_shipped_model_defaults_and_nothing_else(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """The gap this closes: a template model bump never reached an installed
+    project, because both settings files were only ever shown as a diff."""
+    template, target = install_from_template(tmp_path)
+    superseded = resolved_models["superseded"]
+    config = target / CONFIG_REL
+    pristine_config = config.read_text(encoding="utf-8")
+    project_config = pristine_config.replace(
+        'approval_policy = "never"', 'approval_policy = "on-request"'
+    )
+    assert project_config != pristine_config
+    stale_config = set_toml_value(
+        set_toml_value(project_config, "model", superseded["codex.model"][0]),
+        "model_reasoning_effort",
+        superseded["codex.reasoning_effort"][0],
+    )
+    config.write_text(stale_config, encoding="utf-8")
+
+    project_settings = read_settings(target)
+    project_settings["language"] = "english"
+    stale_settings = json.loads(json.dumps(project_settings))
+    del stale_settings["model"]
+    stale_settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = superseded[
+        "claude.subagent_default"
+    ][0]
+    stale_settings["env"]["CODEX_MODEL"] = superseded["codex.model"][0]
+    (target / SETTINGS_REL).write_text(canonical_json(stale_settings), encoding="utf-8")
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    # Only the managed values moved: the project's own edits are byte-identical.
+    assert config.read_text(encoding="utf-8") == project_config
+    updated = read_settings(target)
+    assert updated == project_settings
+    assert "CODEX_MODEL" not in updated["env"]
+    assert updated["model"] == resolved_models["claude"]["main"]
+    assert f'{CONFIG_REL} model: "{superseded["codex.model"][0]}"' in (
+        update_result.stdout
+    )
+    assert "custom:" not in update_result.stdout
+    # A second run has nothing left to do.
+    before = (config.read_bytes(), (target / SETTINGS_REL).read_bytes())
+    assert run_update(target, template).returncode == 0
+    assert (config.read_bytes(), (target / SETTINGS_REL).read_bytes()) == before
+
+
+def test_update_honours_the_project_model_override(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """Agent definitions are replaced wholesale on every update, so a project
+    override only survives because the update re-renders them afterwards."""
+    template, target = install_from_template(tmp_path)
+    agent = sorted(resolved_models["claude"]["agents"])[0]
+    assigned = resolved_models["claude"]["agents"][agent]
+    override_model = next(m for m in ("haiku", "sonnet") if m != assigned)
+    override = {
+        "schema_version": 1,
+        "claude": {"agents": {agent: override_model}},
+        "codex": {"model": CUSTOM_CODEX_MODEL},
+    }
+    override_text = json.dumps(override, indent=2) + "\n"
+    (target / MODELS_LOCAL_REL).write_text(override_text, encoding="utf-8")
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    agent_file = (target / ".claude/agents" / f"{agent}.md").read_text(encoding="utf-8")
+    assert f"\nmodel: {override_model}\n" in agent_file
+    assert f'model = "{CUSTOM_CODEX_MODEL}"' in (target / CONFIG_REL).read_text(
+        encoding="utf-8"
+    )
+    # The override is the project's file: never shipped, never rewritten.
+    assert (target / MODELS_LOCAL_REL).read_text(encoding="utf-8") == override_text
+    assert not (template / MODELS_LOCAL_REL).exists()
+    check = subprocess.run(
+        ["bash", str(target / "scripts/check.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
+
+
+def test_update_leaves_native_settings_alone_when_the_project_opts_out(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    template, target = install_from_template(tmp_path)
+    superseded = resolved_models["superseded"]
+    config = target / CONFIG_REL
+    stale_config = set_toml_value(
+        config.read_text(encoding="utf-8"),
+        "model_reasoning_effort",
+        superseded["codex.reasoning_effort"][0],
+    )
+    config.write_text(stale_config, encoding="utf-8")
+    settings = read_settings(target)
+    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = superseded[
+        "claude.subagent_default"
+    ][0]
+    stale_settings = canonical_json(settings)
+    (target / SETTINGS_REL).write_text(stale_settings, encoding="utf-8")
+    (target / MODELS_LOCAL_REL).write_text(
+        json.dumps({"schema_version": 1, "manage_native_settings": False}),
+        encoding="utf-8",
+    )
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    assert config.read_text(encoding="utf-8") == stale_config
+    assert (target / SETTINGS_REL).read_text(encoding="utf-8") == stale_settings
+
+
+REFUSED_CONFIG_LAYOUTS = {
+    "single-quoted value": lambda text: text.replace(
+        "\nmodel_reasoning_effort = ", "\nmodel_reasoning_effort = 'x' # ", 1
+    ),
+    "multi-line string": lambda text: 'notes = """\nmodel = "inside a string"\n"""\n'
+    + text,
+    "duplicate key": lambda text: text.replace(
+        "\nmodel_reasoning_effort = ",
+        '\nmodel_reasoning_effort = "medium"\nmodel_reasoning_effort = ',
+        1,
+    ),
+}
+
+
+@pytest.mark.parametrize("layout", sorted(REFUSED_CONFIG_LAYOUTS))
+def test_update_refuses_an_unusual_config_layout_and_changes_no_file(
+    layout: str, tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """One file the tool will not edit means no file is edited: a project is
+    never left with its settings advanced and its Codex config not."""
+    template, target = install_from_template(tmp_path)
+    config = target / CONFIG_REL
+    pristine = config.read_text(encoding="utf-8")
+    odd_config = REFUSED_CONFIG_LAYOUTS[layout](pristine)
+    assert odd_config != pristine
+    config.write_text(odd_config, encoding="utf-8")
+    # The settings file is in a layout the tool can edit and needs an edit.
+    settings = read_settings(target)
+    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = resolved_models["superseded"][
+        "claude.subagent_default"
+    ][0]
+    stale_settings = canonical_json(settings)
+    (target / SETTINGS_REL).write_text(stale_settings, encoding="utf-8")
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    assert config.read_text(encoding="utf-8") == odd_config
+    assert (target / SETTINGS_REL).read_text(encoding="utf-8") == stale_settings
+    assert f"refused: {CONFIG_REL}" in update_result.stdout
+    assert "Model manifest was NOT applied" in update_result.stdout
+    # The update itself still ran to completion.
+    assert "Done!" in update_result.stdout
+    assert find_debris(target) == []
+
+
+def test_update_refusal_says_that_agent_overrides_are_not_in_effect(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """Agent definitions are replaced from the template before the model step.
+    When that step then refuses a file, nothing re-renders them, so a project
+    override silently stops applying unless the update says so."""
+    template, target = install_from_template(tmp_path)
+    agent = sorted(resolved_models["claude"]["agents"])[0]
+    assigned = resolved_models["claude"]["agents"][agent]
+    override_model = next(m for m in ("haiku", "sonnet") if m != assigned)
+    (target / MODELS_LOCAL_REL).write_text(
+        json.dumps(
+            {"schema_version": 1, "claude": {"agents": {agent: override_model}}}
+        ),
+        encoding="utf-8",
+    )
+    config = target / CONFIG_REL
+    odd_config = REFUSED_CONFIG_LAYOUTS["single-quoted value"](
+        config.read_text(encoding="utf-8")
+    )
+    config.write_text(odd_config, encoding="utf-8")
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    agent_file = (target / ".claude/agents" / f"{agent}.md").read_text(encoding="utf-8")
+    assert f"\nmodel: {assigned}\n" in agent_file
+    assert config.read_text(encoding="utf-8") == odd_config
+    assert "models.local.json is not in effect" in update_result.stdout
+    # Once the reported line is fixed, a plain apply finishes the job.
+    config.write_text(
+        (template / CONFIG_REL).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    applied = subprocess.run(
+        ["python3", str(target / ".claude/skills/_shared/models.py"), "apply"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    agent_file = (target / ".claude/agents" / f"{agent}.md").read_text(encoding="utf-8")
+    assert f"\nmodel: {override_model}\n" in agent_file
+
+
+def test_update_finishes_then_fails_loudly_on_an_invalid_model_override(
+    tmp_path: Path,
+) -> None:
+    """An unreadable override is not a layout to skip past: the update still
+    completes every phase, so the project is not left half-updated, and then
+    exits non-zero so the failure cannot be missed."""
+    template, target = install_from_template(tmp_path)
+    (template / "VERSION").write_text("99.0.0\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(template), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(template), "commit", "-qm", "bump"], check=True)
+    (target / MODELS_LOCAL_REL).write_text(
+        json.dumps({"schema_version": 1, "codex": {"modle": "typo"}}), encoding="utf-8"
+    )
+    settings_before = (target / SETTINGS_REL).read_bytes()
+    config_before = (target / CONFIG_REL).read_bytes()
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 1
+    combined = update_result.stdout + update_result.stderr
+    assert "models.local.json" in combined
+    assert "model manifest was not applied" in update_result.stderr
+    assert (target / ".claude/orchestra-version").read_text(encoding="utf-8") == (
+        "99.0.0\n"
+    )
+    assert (target / SETTINGS_REL).read_bytes() == settings_before
+    assert (target / CONFIG_REL).read_bytes() == config_before
+    assert find_debris(target) == []
+
+
+def test_update_fails_loudly_when_the_model_write_fails(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """A failed write is not a refused layout. The tool reports the two with
+    different exit codes, and the update must act on that difference: here it
+    finishes its remaining phases and exits non-zero, and it must not claim
+    that the models were merely "not applied"."""
+    template, target = install_from_template(tmp_path)
+    bump_template_version(template, "99.0.0")
+    config = target / CONFIG_REL
+    stale_config = set_toml_value(
+        config.read_text(encoding="utf-8"),
+        "model_reasoning_effort",
+        resolved_models["superseded"]["codex.reasoning_effort"][0],
+    )
+    config.write_text(stale_config, encoding="utf-8")
+    settings_before = (target / SETTINGS_REL).read_bytes()
+    # `.codex/` is not writable for the tool, so the temporary file for
+    # config.toml cannot be created; the one for settings.json already has been.
+    wrapper = tmp_path / "deny_codex_writes.py"
+    wrapper.write_text(DENY_CODEX_WRITES, encoding="utf-8")
+    shim_dir = tmp_path / "shim"
+    write_python3_shim(shim_dir, f'exec "{shutil.which("python3")}" "{wrapper}" "$@"')
+
+    update_result = run_update(target, template, extra_path=shim_dir)
+
+    assert update_result.returncode == 1, update_result.stdout
+    assert "could not be applied" in update_result.stderr
+    assert "NOT applied; no file was changed" not in update_result.stdout
+    assert "Model manifest applied" not in update_result.stdout
+    # The phases after the model step still ran.
+    assert (target / ".claude/orchestra-version").read_text(encoding="utf-8") == (
+        "99.0.0\n"
+    )
+    assert "Update Summary" in update_result.stdout
+    # All-or-nothing held: nothing was written and nothing was left behind.
+    assert config.read_text(encoding="utf-8") == stale_config
+    assert (target / SETTINGS_REL).read_bytes() == settings_before
+    assert not list(target.rglob("*models-tmp*"))
+    assert find_debris(target) == []
+
+
+def test_install_fails_loudly_when_the_model_write_fails(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """The installer draws the same line as the updater between a refused
+    layout and a failed write, from the tool's exit code alone."""
+    target = tmp_path / "project"
+    init_git_repo(target)
+    config = target / CONFIG_REL
+    config.parent.mkdir(parents=True)
+    # A config the project already had, still on a default an earlier
+    # template shipped: the model step has to write to `.codex/`.
+    stale_config = (
+        f'model_reasoning_effort = "'
+        f'{resolved_models["superseded"]["codex.reasoning_effort"][0]}"\n'
+    )
+    config.write_text(stale_config, encoding="utf-8")
+    wrapper = tmp_path / "deny_codex_writes.py"
+    wrapper.write_text(DENY_CODEX_WRITES, encoding="utf-8")
+    shim_dir = tmp_path / "shim"
+    write_python3_shim(shim_dir, f'exec "{shutil.which("python3")}" "{wrapper}" "$@"')
+
+    result = subprocess.run(
+        ["bash", str(INSTALL_SCRIPT), "--yes", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 1, result.stdout
+    assert "could not be applied" in result.stderr
+    assert "NOT applied; no file was changed" not in result.stdout
+    # The steps after the model step still ran.
+    assert (target / ".claude/orchestra-version").is_file()
+    assert "installation complete" in result.stdout
+    assert config.read_text(encoding="utf-8") == stale_config
+    assert not list(target.rglob("*models-tmp*"))
+
+
+def test_update_stops_when_the_model_step_is_interrupted(tmp_path: Path) -> None:
+    """Ctrl-C during the model step ends the tool with the signal. The update
+    must stop there, not report a failure and carry on with later phases."""
+    template, target = install_from_template(tmp_path)
+    bump_template_version(template, "99.0.0")
+    installed_version = (target / ".claude/orchestra-version").read_text(
+        encoding="utf-8"
+    )
+    interrupted = 130
+    shim_dir = tmp_path / "shim"
+    write_python3_shim(shim_dir, f"exit {interrupted}")
+
+    update_result = run_update(target, template, extra_path=shim_dir)
+
+    assert update_result.returncode == interrupted, update_result.stdout
+    assert "stopping the update" in update_result.stderr
+    assert "Update Summary" not in update_result.stdout
+    assert (target / ".claude/orchestra-version").read_text(
+        encoding="utf-8"
+    ) == installed_version
+    assert find_debris(target) == []
+
+
+def test_install_stops_when_the_model_step_is_interrupted(tmp_path: Path) -> None:
+    target = tmp_path / "project"
+    init_git_repo(target)
+    interrupted = 130
+    shim_dir = tmp_path / "shim"
+    write_python3_shim(shim_dir, f"exit {interrupted}")
+
+    result = subprocess.run(
+        ["bash", str(INSTALL_SCRIPT), "--yes", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == interrupted, result.stdout
+    assert "stopping the installation" in result.stderr
+    assert "installation complete" not in result.stdout
+
+
+def test_update_to_a_template_without_the_manifest_warns_and_succeeds(
+    tmp_path: Path,
+) -> None:
+    """Rolling back to a template ref from before the manifest is a supported
+    update, not a failure: there is simply no model step to run."""
+    template, target = install_from_template(tmp_path)
+    for name in ("models.py", "models.json"):
+        (template / ".claude/skills/_shared" / name).unlink()
+    subprocess.run(["git", "-C", str(template), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(template), "commit", "-qm", "before the manifest"],
+        check=True,
+    )
+    settings_before = (target / SETTINGS_REL).read_bytes()
+    config_before = (target / CONFIG_REL).read_bytes()
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    assert "is not part of this template version" in update_result.stdout
+    # Said again in the summary, where it will be read.
+    assert "models were not applied" in update_result.stdout.split("Update Summary")[1]
+    assert (target / SETTINGS_REL).read_bytes() == settings_before
+    assert (target / CONFIG_REL).read_bytes() == config_before
+
+
+def test_the_template_gate_rejects_what_only_a_project_may_have(
+    tmp_path: Path,
+) -> None:
+    """In the template nothing is a project choice. A value the manifest does
+    not name, or a committed opt-out, is a hand edit that would otherwise ship
+    to every new installation with the gate still green. An installed project
+    keeps the lenient check: see
+    test_update_keeps_custom_model_values_and_reports_them."""
+    template = build_template_repo(tmp_path)
+    assert not (template / ".claude/orchestra-version").exists()
+    baseline = run_gate(template)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+
+    config = template / CONFIG_REL
+    pristine = config.read_text(encoding="utf-8")
+    config.write_text(
+        set_toml_value(pristine, "model", CUSTOM_CODEX_MODEL), encoding="utf-8"
+    )
+    hand_edited = run_gate(template)
+    config.write_text(pristine, encoding="utf-8")
+
+    override = template / MODELS_LOCAL_REL
+    override.write_text(
+        json.dumps({"schema_version": 1, "manage_native_settings": False}),
+        encoding="utf-8",
+    )
+    opted_out = run_gate(template)
+    override.unlink()
+
+    for result in (hand_edited, opted_out):
+        assert result.returncode == 1, result.stdout
+        assert "FAIL: Model coherence" in result.stdout
+        assert "strict: " in result.stdout
+    assert CUSTOM_CODEX_MODEL in hand_edited.stdout
+    assert run_gate(template).returncode == 0
+
+
+def test_install_ignores_the_model_tools_temporary_files(tmp_path: Path) -> None:
+    """A run that is killed outright leaves a temporary copy of a settings
+    file behind. It must not be one `git add -A` away from a commit."""
+    target = tmp_path / "project"
+    init_git_repo(target)
+
+    assert run_install(target).returncode == 0
+
+    for leftover in (
+        ".claude/.settings.json.models-tmp.4242",
+        ".codex/.config.toml.models-tmp.4242",
+        ".claude/agents/.codex-debugger.md.models-tmp.4242",
+    ):
+        ignored = subprocess.run(
+            ["git", "-C", str(target), "check-ignore", "-q", leftover], check=False
+        )
+        assert ignored.returncode == 0, leftover
+    pattern = ".*.models-tmp.*"
+    assert (
+        pattern in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_first_update_by_an_older_updater_is_completed_by_the_second_run(
+    tmp_path: Path, resolved_models: dict[str, Any]
+) -> None:
+    """The rollout case: the run that delivers the manifest is executed by the
+    previous `update.sh`, which has no apply phase. It must leave a state the
+    project's own gate reports, and a second run must finish the job."""
+    template, target = install_from_template(tmp_path)
+    updater = target / "scripts/update.sh"
+    previous = updater.read_text(encoding="utf-8").replace("    apply_models\n", "", 1)
+    assert "    apply_models\n" not in previous
+    updater.write_text(previous, encoding="utf-8")
+    # An installation from before the manifest has neither the tool nor the
+    # data: the first run has to deliver both, or the gate and the Codex
+    # wrapper have nothing to read.
+    shared = target / ".claude/skills/_shared"
+    for name in ("models.py", "models.json"):
+        (shared / name).unlink()
+    shipped = resolved_models["superseded"]["claude.subagent_default"][0]
+    settings = read_settings(target)
+    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = shipped
+    (target / SETTINGS_REL).write_text(canonical_json(settings), encoding="utf-8")
+
+    first = run_update(target, template)
+
+    assert first.returncode == 0, first.stderr
+    assert "once more" in first.stdout
+    assert read_settings(target)["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == shipped
+    delivered = subprocess.run(
+        ["python3", str(shared / "models.py"), "get", "codex.model"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert delivered.returncode == 0, delivered.stdout + delivered.stderr
+    assert json.loads(delivered.stdout)["value"] == resolved_models["codex"]["model"]
+    check = subprocess.run(
+        ["bash", str(target / "scripts/check.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 1
+    assert "FAIL: Model coherence" in check.stdout
+    assert "models.py apply" in check.stdout
+
+    second = run_update(target, template)
+
+    assert second.returncode == 0, second.stderr
+    assert (
+        read_settings(target)["env"]["CLAUDE_CODE_SUBAGENT_MODEL"]
+        == resolved_models["claude"]["subagent_default"]
+    )
+    check = subprocess.run(
+        ["bash", str(target / "scripts/check.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
 
 
 def test_install_refuses_parent_symlink_that_escapes_target(tmp_path: Path) -> None:
