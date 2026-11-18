@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / ".claude/agents"
@@ -36,26 +37,56 @@ def read_frontmatter(path: Path) -> dict[str, str]:
     raise AssertionError(f"Unclosed frontmatter: {path}")
 
 
-def test_model_specific_general_purpose_agents_are_defined() -> None:
-    expected_models = {
-        "general-purpose-opus.md": ("general-purpose-opus", "opus"),
-        "general-purpose-sonnet.md": ("general-purpose-sonnet", "sonnet"),
-    }
+def frontmatter_lines(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "---"
+    return lines[1 : lines.index("---", 1)]
 
-    for filename, (expected_name, expected_model) in expected_models.items():
-        frontmatter = read_frontmatter(AGENTS_DIR / filename)
-        assert frontmatter["name"] == expected_name
-        assert frontmatter["model"] == expected_model
+
+def test_general_purpose_agents_are_defined() -> None:
+    for name in ("general-purpose-opus", "general-purpose-sonnet"):
+        assert read_frontmatter(AGENTS_DIR / f"{name}.md")["name"] == name
 
     assert not (AGENTS_DIR / "general-purpose.md").exists()
 
 
-def test_unspecified_subagents_default_to_sonnet() -> None:
+def test_every_agent_runs_the_model_the_manifest_assigns(
+    resolved_models: dict[str, Any],
+) -> None:
+    """The manifest is the only place an agent's model is chosen.
+
+    The agent files and the manifest keys must be the same set, so an agent
+    cannot be added without a reviewed model, and each file carries exactly one
+    ``model:`` line holding the assigned value.
+    """
+    assigned = resolved_models["claude"]["agents"]
+    agent_files = sorted(AGENTS_DIR.glob("*.md"))
+
+    assert {path.stem for path in agent_files} == set(assigned)
+    assert agent_files, "no agent definitions found"
+    for path in agent_files:
+        frontmatter = read_frontmatter(path)
+        assert frontmatter["name"] == path.stem
+        assert frontmatter["model"] == assigned[path.stem], path.name
+        model_lines = [
+            line for line in frontmatter_lines(path) if line.startswith("model:")
+        ]
+        assert len(model_lines) == 1, path.name
+
+
+def test_settings_models_match_the_manifest(resolved_models: dict[str, Any]) -> None:
     settings = json.loads(
         (REPO_ROOT / ".claude/settings.json").read_text(encoding="utf-8")
     )
 
-    assert settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
+    assert (
+        settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"]
+        == resolved_models["claude"]["subagent_default"]
+    )
+    assert settings["model"] == resolved_models["claude"]["main"]
+    # A settings-file env value is exported to every child process, where it
+    # would shadow the manifest for each Codex wrapper call.
+    assert "CODEX_MODEL" not in settings["env"]
 
 
 def test_routing_docs_do_not_reference_removed_general_purpose_agent() -> None:

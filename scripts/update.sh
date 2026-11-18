@@ -77,11 +77,25 @@ LEGACY_PROJECT_DIRS=(
 )
 
 # Machine-readable native settings: never overwritten, shown as a diff only.
-# A downstream project edits its model, approval policy, and hooks here.
+# A downstream project edits its approval policy, hooks, and permissions here.
+# The one exception is the model keys named by the model manifest, which
+# apply_models advances one key at a time (see MODELS_SCRIPT below).
 SETTINGS_FILES=(
     ".claude/settings.json"
     ".codex/config.toml"
 )
+
+# The model manifest's own tool, as synced into the project by sync_safe_dirs.
+# It renders the agent frontmatter and patches the model keys of the two
+# settings files above; .claude/models.local.json is the project's override.
+MODELS_SCRIPT=".claude/skills/_shared/models.py"
+MODELS_LOCAL_OVERRIDE=".claude/models.local.json"
+# models.py exit codes this script branches on. "A layout was refused and
+# nothing was written" is its own code, distinct from a failed write, so the
+# two are told apart without reading the tool's messages. A status at or above
+# the signal base means the tool was interrupted (it re-raises the signal).
+MODELS_EXIT_REFUSED=2
+MODELS_EXIT_SIGNAL_BASE=128
 
 # =============================================================================
 # Color output (with fallback for non-color terminals)
@@ -132,6 +146,10 @@ UPDATED_FILES=()
 AUTO_YES=false
 TARGET_REF=""
 SELF_UPDATED=false
+# Findings from apply_models that the summary repeats, and whether the model
+# step failed outright (as opposed to refusing a layout and writing nothing).
+MODEL_NOTES=()
+MODEL_APPLY_FAILED=false
 
 # In-flight stage-and-swap tracking (see sync_safe_dirs). At most one
 # SAFE_DIR is mid-transition at a time since the loop is sequential; the
@@ -734,6 +752,89 @@ migrate_native_settings_paths() {
     info "Migrated legacy .agents paths in settings to .claude paths."
 }
 
+# Render the model manifest into every place a model value lives: the agent
+# frontmatter just synced from the template (so a project override in
+# .claude/models.local.json survives the wholesale swap) and the model keys of
+# the two project-owned settings files. A project-owned key is advanced only
+# when it is absent, already current, or still a value an earlier template
+# version shipped; a deliberate value is kept and reported.
+#
+# models.py computes every file before it writes any, so a refused layout
+# leaves all of them byte-identical and a rerun after the fix is safe. This
+# phase therefore never aborts the update partway: it reports loudly here and
+# again in the summary. A refused layout is a warning; a hard failure (an
+# invalid manifest or override, or a write error) turns into a non-zero exit,
+# but only after every remaining phase has run. Which of the two happened is
+# decided by the tool's exit code, never by its wording. An interrupted tool
+# stops the update there and then.
+apply_models() {
+    header "Applying Model Manifest"
+
+    local models="${PROJECT_ROOT}/${MODELS_SCRIPT}"
+    if [[ ! -f "${models}" ]]; then
+        warn "${MODELS_SCRIPT} is not part of this template version; models were NOT applied."
+        MODEL_NOTES+=("models were not applied: ${MODELS_SCRIPT} is missing from the synced template")
+        return 0
+    fi
+    if ! command -v python3 &>/dev/null; then
+        error "python3 is required to apply the model manifest; models were NOT applied."
+        MODEL_NOTES+=("models were not applied: python3 was not found")
+        MODEL_APPLY_FAILED=true
+        return 0
+    fi
+
+    # The findings are the script's stderr lines; its stdout is one JSON object
+    # for programmatic callers and is not needed here.
+    local report status=0
+    report="$(python3 "${models}" --project-root "${PROJECT_ROOT}" apply 2>&1 >/dev/null)" ||
+        status=$?
+
+    local line
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        case "${line}" in
+            changed:*)
+                info "${line#changed: }"
+                UPDATED_FILES+=("model: ${line#changed: }")
+                ;;
+            skipped:*)
+                info "${line}"
+                ;;
+            error:*)
+                error "${line#error: }"
+                MODEL_NOTES+=("${line}")
+                ;;
+            *)
+                warn "${line}"
+                MODEL_NOTES+=("${line}")
+                ;;
+        esac
+    done <<< "${report}"
+
+    if [[ "${status}" -eq 0 ]]; then
+        info "Model manifest applied."
+        return 0
+    fi
+    if [[ "${status}" -ge "${MODELS_EXIT_SIGNAL_BASE}" ]]; then
+        error "Interrupted while applying the model manifest; stopping the update."
+        exit "${status}"
+    fi
+    if [[ "${status}" -ne "${MODELS_EXIT_REFUSED}" ]]; then
+        error "Model manifest could not be applied (${MODELS_SCRIPT} exited ${status})."
+        MODEL_APPLY_FAILED=true
+        return 0
+    fi
+    warn "Model manifest was NOT applied; no file was changed (see above)."
+    # The agent definitions were just replaced from the template, and nothing
+    # re-rendered them: a project override is not in effect until apply runs.
+    if [[ -e "${PROJECT_ROOT}/${MODELS_LOCAL_OVERRIDE}" || -L "${PROJECT_ROOT}/${MODELS_LOCAL_OVERRIDE}" ]]; then
+        local stale="agent definitions carry the template's models until apply succeeds: ${MODELS_LOCAL_OVERRIDE} is not in effect"
+        warn "${stale}"
+        MODEL_NOTES+=("${stale}")
+    fi
+    warn "Fix the reported file, then run: python3 ${MODELS_SCRIPT} apply"
+}
+
 check_settings_files() {
     header "Checking Settings Files"
 
@@ -824,6 +925,14 @@ print_summary() {
 
     echo ""
 
+    if [[ ${#MODEL_NOTES[@]} -gt 0 ]]; then
+        warn "Model manifest (python3 ${MODELS_SCRIPT} apply):"
+        for item in "${MODEL_NOTES[@]}"; do
+            echo "  ${YELLOW}!${RESET} ${item}"
+        done
+        echo ""
+    fi
+
     if [[ "${SELF_UPDATED}" == "true" ]]; then
         warn "scripts/update.sh itself was updated during this run."
         warn "Run ${BOLD}./scripts/update.sh${RESET} once more to sync targets added in the new version (e.g. new template directories)."
@@ -852,10 +961,15 @@ main() {
     sync_safe_dirs
     sync_safe_files
     migrate_native_settings_paths
+    apply_models
     check_settings_files
     update_version
     print_summary
 
+    if [[ "${MODEL_APPLY_FAILED}" == true ]]; then
+        error "The template was updated, but the model manifest was not applied (see above)."
+        exit 1
+    fi
     info "Done!"
 }
 

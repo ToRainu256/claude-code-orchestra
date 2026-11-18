@@ -57,6 +57,11 @@ logs/
 .claude/logs/*
 !.claude/logs/.gitkeep
 
+# Temporary files of the model manifest tool (.claude/skills/_shared/models.py).
+# A run that is killed outright leaves one behind: a full copy of the file
+# beside it.
+.*.models-tmp.*
+
 # Checkpoints (session-specific, may contain sensitive info)
 .claude/checkpoints/*
 !.claude/checkpoints/.gitkeep

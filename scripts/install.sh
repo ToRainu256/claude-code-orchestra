@@ -43,9 +43,11 @@ TEMPLATE_OWNED_FILES=(
     "scripts/update.sh"
 )
 # Machine-readable native settings. These are the user's to edit — a downstream
-# project changes its model, approval policy, or hooks here — so they are never
-# overwritten; when they differ from the template a merge candidate is written
-# beside them. Format: "<settings-path>:<candidate-path>".
+# project changes its approval policy, hooks, or permissions here — so they are
+# never overwritten; when they differ from the template a merge candidate is
+# written beside them. Format: "<settings-path>:<candidate-path>". The one
+# exception is the model keys named by the model manifest, which apply_models
+# advances one key at a time.
 NATIVE_SETTINGS=(
     ".claude/settings.json:.claude/settings.orchestra.json"
     ".codex/config.toml:.codex/config.orchestra.toml"
@@ -63,7 +65,19 @@ GITIGNORE_ENTRIES=(
     ".claude/logs/"
     ".claude/checkpoints/"
     ".orchestra-backup-*/"
+    ".*.models-tmp.*"
 )
+
+# The model manifest's own tool, as installed into the target, and the exit
+# codes this script branches on. "A layout was refused and nothing was written"
+# is its own code, distinct from a failed write, so the two are told apart
+# without reading the tool's messages. A status at or above the signal base
+# means the tool was interrupted (it re-raises the signal).
+MODELS_SCRIPT=".claude/skills/_shared/models.py"
+MODELS_LOCAL_OVERRIDE=".claude/models.local.json"
+MODELS_EXIT_REFUSED=2
+MODELS_EXIT_SIGNAL_BASE=128
+MODEL_APPLY_FAILED=false
 
 AUTO_YES=false
 FORCE=false
@@ -112,7 +126,9 @@ The template installs the root AGENTS.md contract as a real file. An existing
 CLAUDE.md is moved aside to CLAUDE.md.pre-agents-md.bak, because Claude Code
 reads AGENTS.md only when no CLAUDE.md is present. Existing
 .claude/settings.json is never overwritten; a merge candidate is written to
-.claude/settings.orchestra.json when the files differ.
+.claude/settings.orchestra.json when the files differ. Only the model keys
+named by the model manifest (.claude/skills/_shared/models.json) are advanced
+in it, and a value the project chose on purpose is kept.
 EOF
 }
 
@@ -442,6 +458,52 @@ install_settings() {
     done
 }
 
+# Render the model manifest into the target: the agent frontmatter (so a
+# .claude/models.local.json the project already has takes effect) and the model
+# keys of the two settings files. A key the project set on purpose is kept and
+# reported. models.py computes every file before writing any, so a refused
+# layout changes nothing and is a warning. Otherwise the installation
+# completes; a hard failure (an invalid manifest or override, or a write error)
+# turns into a non-zero exit only at the very end. Which of the two happened is
+# decided by the tool's exit code, never by its wording. An interrupted tool
+# stops the installation there and then.
+apply_models() {
+    local report status=0
+    report="$(python3 "${TARGET_ROOT}/${MODELS_SCRIPT}" \
+        --project-root "${TARGET_ROOT}" apply 2>&1 >/dev/null)" || status=$?
+
+    local line
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        case "${line}" in
+            changed:*) info "Model manifest: ${line#changed: }" ;;
+            skipped:*) info "Model manifest: ${line}" ;;
+            error:*) error "Model manifest: ${line#error: }" ;;
+            *) warn "Model manifest: ${line}" ;;
+        esac
+    done <<< "${report}"
+
+    if [[ "${status}" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "${status}" -ge "${MODELS_EXIT_SIGNAL_BASE}" ]]; then
+        error "Interrupted while applying the model manifest; stopping the installation."
+        exit "${status}"
+    fi
+    if [[ "${status}" -ne "${MODELS_EXIT_REFUSED}" ]]; then
+        error "Model manifest could not be applied (${MODELS_SCRIPT} exited ${status})."
+        MODEL_APPLY_FAILED=true
+        return 0
+    fi
+    warn "Model manifest was NOT applied; no file was changed (see above)."
+    # The agent definitions were just copied from the template, and nothing
+    # re-rendered them: a project override is not in effect until apply runs.
+    if [[ -e "${TARGET_ROOT}/${MODELS_LOCAL_OVERRIDE}" || -L "${TARGET_ROOT}/${MODELS_LOCAL_OVERRIDE}" ]]; then
+        warn "Agent definitions carry the template's models until apply succeeds: ${MODELS_LOCAL_OVERRIDE} is not in effect."
+    fi
+    warn "Fix the reported file, then run: python3 ${MODELS_SCRIPT} apply"
+}
+
 install_version_marker() {
     local destination="${TARGET_ROOT}/.claude/orchestra-version"
     cp -a "${SOURCE_ROOT}/VERSION" "${destination}.tmp.$$"
@@ -494,9 +556,14 @@ main() {
     copy_project_files_if_missing
     install_agent_files
     install_settings
+    apply_models
     install_version_marker
     ensure_gitignore_entries
     print_summary
+    if [[ "${MODEL_APPLY_FAILED}" == true ]]; then
+        error "Orchestra was installed, but the model manifest was not applied (see above)."
+        exit 1
+    fi
 }
 
 main "$@"

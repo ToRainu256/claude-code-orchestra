@@ -1,0 +1,39 @@
+{
+  "$comment": "Single source of truth for orchestration models. Edit with: python3 .claude/skills/_shared/models.py set <key> <value>, then: python3 .claude/skills/_shared/models.py apply. Projects override keys in .claude/models.local.json. Never edit the generated locations by hand.",
+  "schema_version": 1,
+  "claude": {
+    "main": "fable",
+    "subagent_default": "opus",
+    "agents": {
+      "general-purpose-sonnet": "opus",
+      "general-purpose-opus": "fable",
+      "codex-debugger": "opus",
+      "fable-advisor": "fable"
+    }
+  },
+  "codex": {
+    "model": "gpt-6.2-astra",
+    "reasoning_effort": "xhigh"
+  },
+  "superseded": {
+    "claude.main": [],
+    "claude.subagent_default": [
+      "sonnet",
+      "claude-opus-4-6",
+      "claude-sonnet-4-5-20250929"
+    ],
+    "codex.model": [
+      "codex",
+      "gpt-5-codex",
+      "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.4",
+      "gpt-5.5",
+      "gpt-5.6-sol"
+    ],
+    "codex.reasoning_effort": [
+      "medium",
+      "high"
+    ]
+  }
+}

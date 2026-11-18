@@ -316,9 +316,21 @@ def _prep_git_repo(root: Path) -> None:
     )
 
 
+def _prep_model_manifest(root: Path) -> None:
+    shared = root / ".claude" / "skills" / "_shared"
+    shared.mkdir(parents=True)
+    (shared / "models.json").write_bytes(
+        (SKILLS_DIR / "_shared" / "models.json").read_bytes()
+    )
+
+
 SUCCESS_CASES: dict[Path, tuple[Callable[[Path], None], list[str]]] = {
     SKILLS_DIR / "_shared" / "verify.sh": (_prep_nothing, ["--allow-no-gates"]),
     SKILLS_DIR / "_shared" / "edit_provenance.py": (_prep_git_repo, ["--snapshot"]),
+    SKILLS_DIR / "_shared" / "models.py": (
+        _prep_model_manifest,
+        ["get", "codex.model"],
+    ),
     SKILLS_DIR / "context-loader" / "load_context.py": (_prep_agent_docs, []),
     SKILLS_DIR / "catchup" / "collect_repo_state.py": (_prep_git_repo, []),
     SKILLS_DIR / "troubleshoot" / "repro.py": (_prep_nothing, ["true"]),
