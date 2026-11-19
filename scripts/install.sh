@@ -52,10 +52,14 @@ NATIVE_SETTINGS=(
     ".claude/settings.json:.claude/settings.orchestra.json"
     ".codex/config.toml:.codex/config.orchestra.toml"
 )
+# Project-owned files, created only where the project has none. Format:
+# "<destination>:<pristine seed in the template>". The seeds live apart from
+# this repository's own .claude/STATE.md and .claude/docs/DESIGN.md, which
+# record its own development and must never reach another project.
 PROJECT_FILES_IF_MISSING=(
-    ".claude/STATE.md"
-    ".claude/docs/DESIGN.md"
-    ".claude/docs/research/.gitkeep"
+    ".claude/STATE.md:scripts/scaffold/STATE.md"
+    ".claude/docs/DESIGN.md:scripts/scaffold/DESIGN.md"
+    ".claude/docs/research/.gitkeep:.claude/docs/research/.gitkeep"
 )
 GITIGNORE_ENTRIES=(
     ".claude/settings.local.json"
@@ -167,8 +171,9 @@ parse_args() {
 
 require_source_paths() {
     local path
+    # "${array[@]##*:}" is the seed half of every "<destination>:<seed>" entry.
     for path in "${TEMPLATE_OWNED_DIRS[@]}" \
-        "${TEMPLATE_OWNED_FILES[@]}" "${PROJECT_FILES_IF_MISSING[@]}" \
+        "${TEMPLATE_OWNED_FILES[@]}" "${PROJECT_FILES_IF_MISSING[@]##*:}" \
         "AGENTS.md" ".claude/settings.json" ".codex/config.toml" \
         "VERSION"; do
         if [[ ! -e "${SOURCE_ROOT}/${path}" && ! -L "${SOURCE_ROOT}/${path}" ]]; then
@@ -201,7 +206,7 @@ validate_destination_paths() {
         "${TEMPLATE_OWNED_DIRS[@]}"
         "${LEGACY_RUNTIME_PATHS[@]}"
         "${TEMPLATE_OWNED_FILES[@]}"
-        "${PROJECT_FILES_IF_MISSING[@]}"
+        "${PROJECT_FILES_IF_MISSING[@]%%:*}"
         "AGENTS.md"
         "CLAUDE.md"
         "CLAUDE.md.pre-agents-md.bak"
@@ -365,15 +370,16 @@ remove_legacy_runtime_paths() {
 }
 
 copy_project_files_if_missing() {
-    local path destination
-    for path in "${PROJECT_FILES_IF_MISSING[@]}"; do
+    local entry path destination
+    for entry in "${PROJECT_FILES_IF_MISSING[@]}"; do
+        path="${entry%%:*}"
         destination="${TARGET_ROOT}/${path}"
         if [[ -e "${destination}" || -L "${destination}" ]]; then
             info "Preserved existing ${path}"
             continue
         fi
         mkdir -p "$(dirname "${destination}")"
-        cp -a "${SOURCE_ROOT}/${path}" "${destination}"
+        cp -a "${SOURCE_ROOT}/${entry##*:}" "${destination}"
         info "Installed ${path}"
     done
 }

@@ -33,6 +33,16 @@ claude
 Run `/init` inside Claude Code to detect the project stack and populate the project
 identity and design document.
 
+The button copies the whole repository, including the state and design this
+repository keeps about its own development. Reset both to the pristine seeds
+before running `/init`:
+
+```bash
+cp scripts/scaffold/STATE.md .claude/STATE.md
+cp scripts/scaffold/DESIGN.md .claude/docs/DESIGN.md
+rm -f PROGRESS.md
+```
+
 ### Existing Project
 
 Run this from the root of an existing Git repository:
@@ -51,6 +61,15 @@ reads `AGENTS.md` only when no `CLAUDE.md` shadows it. Template-owned path
 conflicts stop the install before changes are made. After reviewing the reported
 paths, `--force` can be used to back them up under `.orchestra-backup-*/` and
 replace them.
+
+A project with no `.claude/STATE.md` or `.claude/docs/DESIGN.md` receives the
+pristine seeds from `scripts/scaffold/`, not the files this repository keeps at
+those paths for its own development. Existing ones are never replaced, by the
+installer or by any later update; `.claude/STATE.md` may only be appended to,
+with the migrated content described above. One exception: an updater from
+before this change copies this repository's own file into a project that lacks
+either, so replace the updater first (see
+[Template Update](#template-update)).
 
 An existing `.claude/settings.json` is never overwritten. When a manual merge is
 needed, the installer writes `.claude/settings.orchestra.json`; merge the required
@@ -280,6 +299,7 @@ reached through a symlink.
     ├── check.sh                # Contract, bootstrap, model, and tier coherence checker
     ├── install.sh              # Conflict-aware installer for existing projects
     ├── update.sh               # Template update script
+    ├── scaffold/               # Pristine STATE.md / DESIGN.md seeds a new install receives (never installed as a directory)
     └── rename-roles.py         # Template maintenance only (never installed): the role-rename codemod (check / --apply)
 ```
 
@@ -518,6 +538,10 @@ rm -rf "$template_dir"
 - `.claude/STATE.md`, project design/research, logs, and checkpoints are
   preserved. Legacy 2/3-zone `AGENTS.md` or `CLAUDE.md` state is migrated into
   `.claude/STATE.md` before the bootstrap is replaced.
+- A missing `.claude/STATE.md` or `.claude/docs/DESIGN.md` is seeded from
+  `scripts/scaffold/`. An updater from before the scaffold existed copies the
+  template's own file instead, so a project that lacks either and still has
+  such an updater should replace the updater first (the recipe above).
 - Only template-owned runtime subdirectories are atomically synced. Legacy
   runtime paths under `.agents/` and `.codex/` are removed.
 - Real legacy `.agents/{docs,logs,checkpoints}` data and `.agents/STATE.md` are

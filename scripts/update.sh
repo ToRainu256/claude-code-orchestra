@@ -639,21 +639,40 @@ _emit_boundary_block() {
     echo "${BOUNDARY_LINE}"
 }
 
+# Create a project-owned file from the template's pristine seed where the
+# project has none; an existing file is never touched. The seeds live in
+# scripts/scaffold/, apart from the template repository's own state. A template
+# ref from before that split (an older tag, or another repository through
+# ORCHESTRA_TEMPLATE_REPO) has no scaffold directory and keeps the pristine file
+# at the destination path itself. The fallback is keyed on the scaffold path
+# being absent, not on the seed: a template that has anything there but lacks a
+# seed is broken, and falling back would hand out that repository's own state.
+seed_project_file_if_missing() {
+    local path="$1" seed_name="$2"
+    local destination="${PROJECT_ROOT}/${path}"
+    [[ ! -f "${destination}" ]] || return 0
+
+    local scaffold="${TEMPLATE_DIR}/scripts/scaffold"
+    local seed="${scaffold}/${seed_name}"
+    if [[ ! -e "${scaffold}" && ! -L "${scaffold}" ]]; then
+        seed="${TEMPLATE_DIR}/${path}"
+    fi
+    if [[ ! -f "${seed}" ]]; then
+        error "Template has no seed for ${path}: ${seed#"${TEMPLATE_DIR}"/} is missing."
+        exit 1
+    fi
+    cp -f "${seed}" "${destination}"
+    UPDATED_FILES+=("${path}")
+}
+
 migrate_legacy_agent_state() {
     header "Preserving Agent State"
 
     local state="${PROJECT_ROOT}/.claude/STATE.md"
     mkdir -p "${PROJECT_ROOT}/.claude/docs/research" \
         "${PROJECT_ROOT}/.claude/logs" "${PROJECT_ROOT}/.claude/checkpoints"
-    if [[ ! -f "${state}" ]]; then
-        cp -f "${TEMPLATE_DIR}/.claude/STATE.md" "${state}"
-        UPDATED_FILES+=(".claude/STATE.md")
-    fi
-    if [[ ! -f "${PROJECT_ROOT}/.claude/docs/DESIGN.md" ]]; then
-        cp -f "${TEMPLATE_DIR}/.claude/docs/DESIGN.md" \
-            "${PROJECT_ROOT}/.claude/docs/DESIGN.md"
-        UPDATED_FILES+=(".claude/docs/DESIGN.md")
-    fi
+    seed_project_file_if_missing ".claude/STATE.md" "STATE.md"
+    seed_project_file_if_missing ".claude/docs/DESIGN.md" "DESIGN.md"
 
     local source="" fmt="none" label=""
     for label in CLAUDE.md AGENTS.md; do
