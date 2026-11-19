@@ -68,6 +68,7 @@ GITIGNORE_ENTRIES=(
     "CLAUDE.local.md"
     ".claude/logs/"
     ".claude/checkpoints/"
+    ".claude/worktrees/"
     ".orchestra-backup-*/"
     ".*.models-tmp.*"
 )
