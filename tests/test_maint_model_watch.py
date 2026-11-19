@@ -1066,6 +1066,29 @@ def test_launcher_refuses_a_clone_path_that_is_a_link(installed: support.Fork) -
     assert not installed.paths.logs_dir.exists()
 
 
+def test_launcher_refuses_a_run_directory_that_is_a_link(
+    installed: support.Fork,
+) -> None:
+    # The launcher writes git's words under run/ before run.py checks the
+    # layout, so a linked run directory must stop it before that write.
+    elsewhere = installed.root / "elsewhere"
+    elsewhere.mkdir()
+    kept = elsewhere / "launcher-git.out"
+    kept.write_text("not the launcher's file\n", encoding="utf-8")
+    run_dir = installed.paths.run_dir
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.symlink_to(elsewhere, target_is_directory=True)
+
+    done = launch(installed, "run")
+
+    assert done.returncode == common.EXIT_USAGE
+    assert "run is a link" in done.stderr
+    assert kept.read_text(encoding="utf-8") == "not the launcher's file\n"
+    assert installed.gh_state()["calls"] == []
+    assert not installed.paths.logs_dir.exists()
+
+
 def test_launcher_without_a_clone_creates_nothing(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     done = subprocess.run(

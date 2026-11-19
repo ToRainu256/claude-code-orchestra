@@ -220,6 +220,10 @@ main() {
         refuse "no approved revision; run launchd.sh install"
     fi
 
+    # Git's words are written under run/ before anything else looks at the
+    # layout, so a run directory that is a link elsewhere is refused here.
+    [[ ! -L "${base}/run" ]] || refuse "${base}/run is a link; it must be a real directory"
+
     # Nothing is created before this point: a launcher that is not installed
     # properly leaves no trace.
     mkdir -p "${base}/logs/maint" "${base}/run"
