@@ -43,9 +43,11 @@ available as executors or advisors when their capabilities fit the task.
 6. Translate hooks, model selection, permissions, and sandbox settings only
    where the target runtime requires machine-readable configuration. Preserve
    least privilege and document any unavoidable semantic difference.
-7. Update the default statement in `AGENTS.md`, the `.claude/STATE.md`
-   seed, and installer/updater manifests only when the user requested a new
-   template default. A repository-only switch changes only `.claude/STATE.md`
+7. Update the default statement in `AGENTS.md`, the `scripts/scaffold/STATE.md`
+   seed (what a new installation receives), and installer/updater manifests
+   only when the user requested a new template default. The live
+   `.claude/STATE.md` changes too only if this repository itself switches,
+   which is step 4. A repository-only switch changes only `.claude/STATE.md`
    and must survive updates without modifying template-owned bootstrap files.
 8. Record the decision in the appropriate design log and run the validation
    below.

@@ -176,7 +176,9 @@ def test_main_agent_change_runbook_is_present_but_not_mandatory_read() -> None:
         "## Rollback",
     ):
         assert heading in content
-    assert "Claude Code" in read_repo_file(".claude/STATE.md")
+    # The template default lives in the seed a new installation receives; the
+    # live .claude/STATE.md records only this repository's own main agent.
+    assert "Claude Code" in read_repo_file("scripts/scaffold/STATE.md")
 
 
 def test_subagent_schema_directories_hold_no_runtime_content() -> None:

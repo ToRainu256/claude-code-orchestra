@@ -7,8 +7,10 @@ of the composed result before replacing), the ``## Repository Identity`` writer
 that ``init/SKILL.md`` previously performed by hand with raw Edit/Write, and the
 ``progress_tracker_preserved`` field, which used to be a hard-coded ``True``.
 
-Every test runs against a copy of the repository's own STATE.md under
-``--project-root tmp_path``, so the real shared state is never touched.
+Every test runs against a copy of the pristine STATE.md seed a new project
+receives (``scripts/scaffold/STATE.md``) under ``--project-root tmp_path``, so
+the real shared state is never touched and the writers stay pinned to the
+document shape they first have to edit.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".claude" / "skills" / "_shared" / "append_state_block.py"
-TEMPLATE_STATE = REPO_ROOT / ".claude" / "STATE.md"
+TEMPLATE_STATE = REPO_ROOT / "scripts" / "scaffold" / "STATE.md"
 
 
 def _load_module(path: Path, name: str) -> ModuleType:
@@ -41,7 +43,7 @@ asb = _load_module(SCRIPT, "append_state_block_writer_under_test")
 
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
-    """A fixture repository whose .claude/STATE.md is a copy of the real one."""
+    """A fixture repository whose .claude/STATE.md is a copy of the seed."""
     state = tmp_path / ".claude" / "STATE.md"
     state.parent.mkdir(parents=True)
     shutil.copy(TEMPLATE_STATE, state)

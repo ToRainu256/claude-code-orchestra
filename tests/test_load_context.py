@@ -187,12 +187,14 @@ def test_main_agent_missing_value_parses_to_none(tmp_path: Path) -> None:
 
 def test_real_repo_design_template_is_detected_as_placeholder(tmp_path: Path) -> None:
     """Regression guard tied to the actual pristine template (see commit
-    'Keep distributed DESIGN.md a pristine placeholder')."""
+    'Keep distributed DESIGN.md a pristine placeholder'). The distributed
+    file is the seed in scripts/scaffold/; this repository's own
+    .claude/docs/DESIGN.md is its working design and is not shipped."""
     write_rules(tmp_path, ["coding-principles"])
     write_state(tmp_path)
     docs_dir = tmp_path / ".claude" / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
-    real_design = (REPO_ROOT / ".claude" / "docs" / "DESIGN.md").read_text(
+    real_design = (REPO_ROOT / "scripts" / "scaffold" / "DESIGN.md").read_text(
         encoding="utf-8"
     )
     (docs_dir / "DESIGN.md").write_text(real_design, encoding="utf-8")

@@ -1011,12 +1011,14 @@ REFERENCE_TEMPLATES: dict[str, tuple[tuple[str, str | None, str | None], ...]] =
         ),
     ),
     "guide": ((".claude/skills/catchup/references/guide-template.md", None, None),),
-    # These two have no separate template: the seed document install.sh copies
-    # into a project *is* the reference, so the contract is pinned to the live
-    # file. A section renamed in either document without updating the contract
-    # is then a test failure instead of a runtime surprise.
-    "design-doc": ((".claude/docs/DESIGN.md", None, None),),
-    "state-doc": ((".claude/STATE.md", None, None),),
+    # These two have no separate template: the seed in scripts/scaffold/ that
+    # install.sh and update.sh copy into a project *is* the reference. It is
+    # pinned to the seed, not to this repository's live .claude/ files, which
+    # record this repository's own work and may diverge. A section renamed in
+    # a seed without updating the contract is then a test failure instead of
+    # a runtime surprise.
+    "design-doc": (("scripts/scaffold/DESIGN.md", None, None),),
+    "state-doc": (("scripts/scaffold/STATE.md", None, None),),
 }
 
 # `{placeholder}` tokens as the templates write them.
@@ -1270,8 +1272,10 @@ def test_design_doc_rejects_a_document_missing_a_writer_target(tmp_path: Path) -
 def test_contract_accepts_this_repository_s_live_document(
     contract: str, rel_path: str
 ) -> None:
-    """The seed documents are also this repository's live ones: a contract that
-    rejects the file it exists to check would be unusable from day one."""
+    """This repository's live documents diverge from the seeds but are written
+    by the same skills: a contract that rejects the file it exists to check
+    would be unusable here. ``tests/test_scaffold.py`` pins the same
+    property."""
     result = run_validate_doc("--contract", contract, "--file", rel_path)
 
     assert result.returncode == 0, result.stdout

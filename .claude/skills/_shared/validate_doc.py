@@ -13,9 +13,10 @@ Each contract's required headings are taken verbatim from the template (or, for
 ``plan-doc``, the SKILL.md output format) that declares them;
 ``tests/test_validate_doc.py`` validates those templates against their contract
 so the two cannot drift apart. ``design-doc`` and ``state-doc`` have no separate
-template: their reference document *is* the seed
-``.claude/docs/DESIGN.md`` / ``.claude/STATE.md`` that ``scripts/install.sh``
-copies into a project, and both are project-owned and mutable afterwards, so
+template: their reference document *is* the seed the template keeps in
+``scripts/scaffold/``, which ``scripts/install.sh`` copies to
+``.claude/docs/DESIGN.md`` / ``.claude/STATE.md`` in a project that has none,
+and both are project-owned and mutable afterwards, so
 each requires only the sections their writers (``update_design.py``,
 ``append_state_block.py``, ``refresh_guard.py``) depend on rather than every
 heading the seed happens to contain. A contract may additionally require

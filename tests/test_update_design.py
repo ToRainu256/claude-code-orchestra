@@ -6,9 +6,10 @@ contract it is documented to follow (no pre-replace validation, no dedup of
 section updates, decision dedup keyed on today's date, unescaped table cells,
 rows inserted after the section's trailing blank line).
 
-Every test runs against a copy of the repository's own DESIGN.md under
-``--project-root tmp_path``, so the real document is never touched and the
-writers stay pinned to the document shape they actually have to edit.
+Every test runs against a copy of the pristine DESIGN.md seed a new project
+receives (``scripts/scaffold/DESIGN.md``) under ``--project-root tmp_path``, so
+the real document is never touched and the writers stay pinned to the document
+shape they actually have to edit.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".claude" / "skills" / "_shared" / "update_design.py"
-TEMPLATE_DESIGN = REPO_ROOT / ".claude" / "docs" / "DESIGN.md"
+TEMPLATE_DESIGN = REPO_ROOT / "scripts" / "scaffold" / "DESIGN.md"
 
 
 def _load_module(path: Path, name: str) -> ModuleType:
@@ -41,7 +42,7 @@ update_design = _load_module(SCRIPT, "update_design_under_test")
 
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
-    """A fixture repository whose DESIGN.md is a copy of the real one."""
+    """A fixture repository whose DESIGN.md is a copy of the seed."""
     design = tmp_path / ".claude" / "docs" / "DESIGN.md"
     design.parent.mkdir(parents=True)
     shutil.copy(TEMPLATE_DESIGN, design)
