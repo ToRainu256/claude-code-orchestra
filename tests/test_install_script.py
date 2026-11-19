@@ -1225,6 +1225,31 @@ def test_install_ignores_the_model_tools_temporary_files(tmp_path: Path) -> None
     )
 
 
+def test_install_ignores_agent_worktrees(tmp_path: Path) -> None:
+    """Claude Code checks out worktree-isolated agents under .claude/worktrees/.
+    Each is a full copy of the repository, so an installed project must not be
+    one `git add -A` away from committing one."""
+    target = tmp_path / "project"
+    init_git_repo(target)
+
+    assert run_install(target).returncode == 0
+
+    gitignore = (target / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".claude/worktrees/" in gitignore
+    ignored = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "check-ignore",
+            "-q",
+            ".claude/worktrees/agent-example/AGENTS.md",
+        ],
+        check=False,
+    )
+    assert ignored.returncode == 0
+
+
 def test_first_update_by_an_older_updater_is_completed_by_the_second_run(
     tmp_path: Path, resolved_models: dict[str, Any]
 ) -> None:
@@ -1679,6 +1704,36 @@ def test_install_seeds_a_new_project_from_the_scaffold_not_the_template_s_state(
     # The seeds reach a project only as the two files they seed.
     assert not (target / "scripts/scaffold").exists()
     assert run_gate(target).returncode == 0
+
+
+def test_install_and_update_never_ship_the_template_s_progress_or_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """The template repository records its own progress in `PROGRESS.md` and
+    `.claude/checkpoints/`. Neither is template content: a new project starts
+    without them, and an update leaves the project's own untouched."""
+    template = build_template_repo(tmp_path)
+    (template / "PROGRESS.md").write_bytes(b"# PROGRESS" + LIVE_SENTINEL)
+    (template / ".claude/checkpoints/2026-01-01-000000.md").write_bytes(
+        b"# Checkpoint" + LIVE_SENTINEL
+    )
+    commit_template(template, "template progress")
+    target = tmp_path / "project"
+    init_git_repo(target)
+
+    installed = run_install(target, script=template / "scripts/install.sh")
+
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert not (target / "PROGRESS.md").exists()
+    assert [p.name for p in (target / ".claude/checkpoints").iterdir()] == []
+
+    own_progress = b"# PROGRESS" + PROJECT_SENTINEL
+    (target / "PROGRESS.md").write_bytes(own_progress)
+    updated = run_update(target, template)
+
+    assert updated.returncode == 0, updated.stdout + updated.stderr
+    assert (target / "PROGRESS.md").read_bytes() == own_progress
+    assert [p.name for p in (target / ".claude/checkpoints").iterdir()] == []
 
 
 def test_install_leaves_a_project_s_own_state_and_design_untouched(
