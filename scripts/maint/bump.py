@@ -47,6 +47,14 @@ REGULAR_ENTRY = ("100644", "blob")
 # repository.
 PLAIN_MODES = ("100644", "100755")
 DELETED_MODE = "000000"
+# The longest name, and the longest path, the Mac's file system accepts, in
+# bytes of UTF-8. A tree that adds a longer one cannot be checked out there.
+# A name may use all of NAME_MAX (255). PATH_MAX (1024) counts the
+# terminating NUL, so the longest path that works is one byte shorter.
+NAME_MAX_BYTES = 255
+PATH_MAX_BYTES = 1024 - 1
+# How much of such a path is shown: enough to find it, never the whole of it.
+LONG_PATH_SHOWN = 80
 RAW_FIELDS = 5
 RECORDS_KEPT = 20
 TOML_TABLE_RE = re.compile(r"^[ \t]*\[")
@@ -257,6 +265,25 @@ def bump_problem_between(
     )
 
 
+def _added_or_changed(
+    git: common.Git, base: str, head: str
+) -> list[tuple[str, str]] | None:
+    """(new mode, path) of every entry ``head`` adds or changes relative to
+    ``base``; None when git cannot list them. Deletions are not listed."""
+    result = git.run(["diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head])
+    if not result.ok:
+        return None
+    tokens = result.stdout.split("\0")
+    found: list[tuple[str, str]] = []
+    for index in range(0, len(tokens) - 1, 2):
+        fields = tokens[index].split()
+        if not tokens[index].startswith(":") or len(fields) != RAW_FIELDS:
+            return None
+        if fields[1] != DELETED_MODE:
+            found.append((fields[1], tokens[index + 1]))
+    return found
+
+
 def special_entries(git: common.Git, base: str, head: str) -> list[str] | None:
     """Entries ``head`` adds or changes that are not plain files, as
     ``path (mode NNNNNN)``; None when git cannot list them.
@@ -265,18 +292,47 @@ def special_entries(git: common.Git, base: str, head: str) -> list[str] | None:
     tree impossible to check out, or make a path mean something its name does
     not say. Deletions are not listed.
     """
-    result = git.run(["diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, head])
-    if not result.ok:
+    entries = _added_or_changed(git, base, head)
+    if entries is None:
         return None
-    tokens = result.stdout.split("\0")
+    return sorted(
+        f"{path} (mode {mode})" for mode, path in entries if mode not in PLAIN_MODES
+    )
+
+
+def path_length_problem(path: str) -> str | None:
+    """Why the Mac's file system cannot hold ``path``, or None.
+
+    Lengths are counted in bytes of UTF-8. A name git reported in another
+    encoding was decoded with replacement characters, each of which counts
+    as three bytes: the count can only come out too high, never too low.
+    """
+    longest = max(len(name.encode("utf-8")) for name in path.split("/"))
+    if longest > NAME_MAX_BYTES:
+        return f"a name of {longest} bytes, over {NAME_MAX_BYTES}"
+    total = len(path.encode("utf-8"))
+    if total > PATH_MAX_BYTES:
+        return f"{total} bytes, over {PATH_MAX_BYTES}"
+    return None
+
+
+def overlong_entries(git: common.Git, base: str, head: str) -> list[str] | None:
+    """Paths ``head`` adds or changes that the Mac's file system cannot hold,
+    as ``path... (why)`` with the path made safe to show and cut short; None
+    when git cannot list them.
+
+    Such a tree cannot be checked out, which would leave the Mac running an
+    older revision than the one recorded as approved. Deletions are not
+    listed.
+    """
+    entries = _added_or_changed(git, base, head)
+    if entries is None:
+        return None
     found: list[str] = []
-    for index in range(0, len(tokens) - 1, 2):
-        fields = tokens[index].split()
-        if not tokens[index].startswith(":") or len(fields) != RAW_FIELDS:
-            return None
-        mode = fields[1]
-        if mode not in PLAIN_MODES and mode != DELETED_MODE:
-            found.append(f"{tokens[index + 1]} (mode {mode})")
+    for _, path in entries:
+        problem = path_length_problem(path)
+        if problem is not None:
+            found.append(f"{common.safe_text(path, LONG_PATH_SHOWN)} ({problem})")
     return sorted(found)
 
 
@@ -340,6 +396,24 @@ def attach_pull(paths: common.Paths, slug: str, commit: str, number: int) -> Non
         for item in _read_records(paths)
     ]
     _write_records(paths, records)
+
+
+def adopt_pull(paths: common.Paths, slug: str, commit: str, number: int) -> bool:
+    """Tie pull request ``number`` to the record for ``slug`` only when that
+    record was made for ``commit`` and names no pull request yet: a run that
+    stopped between opening the pull request and recording its number. True
+    when the record was changed."""
+    waiting = [
+        item
+        for item in _read_records(paths)
+        if item.get("slug") == slug
+        and item.get("commit") == commit
+        and item.get("pull") is None
+    ]
+    if not waiting:
+        return False
+    attach_pull(paths, slug, commit, number)
+    return True
 
 
 def drop_record(paths: common.Paths, slug: str | None) -> None:

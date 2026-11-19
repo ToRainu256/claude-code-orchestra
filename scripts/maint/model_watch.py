@@ -590,6 +590,14 @@ def _resume_open(
         return Outcome("git-failed", _FAILED, value)
     if kind != "ok":
         return _withdraw(ctx, pull, value or "the branch is gone")
+    # A run that stopped between opening this pull request and recording its
+    # number left a record that could never promote. The pull request is
+    # tied to it only when GitHub names exactly the recorded commit as its
+    # head, and that commit is the branch this run has just verified.
+    number = _pull_number(pull.get("url"))
+    if number is not None and pull.get("headRefOid") == value:
+        if bump.adopt_pull(ctx.paths, bump_.slug, value, number):
+            ctx.log.line(f"model-watch: record tied to pull request {number}")
     outcome = _auto_merge(ctx, pull.get("url"), value, "pending")
     if outcome.exit_code != _OK:
         return outcome
@@ -633,12 +641,33 @@ def _bump(ctx: common.Context, tree: Path, bump_: Bump) -> Outcome:
     return _vouch_and_open(ctx, bump_, built, tree)
 
 
+def _override_entries(ctx: common.Context, main: str) -> list[str] | None:
+    """Every entry at ``main``, file or directory, that names the project
+    override file in any case or normalization: macOS checks
+    ``.Claude/Models.Local.JSON`` out as the very file the manifest tool
+    reads. None when the tree cannot be listed."""
+    listed = ctx.git.run(["ls-tree", "-r", "-t", "-z", "--name-only", main])
+    if not listed.ok:
+        return None
+    wanted = promote.casefold_path(promote.LOCAL_OVERRIDE_REL)
+    return [
+        path
+        for path in listed.stdout.split("\0")
+        if path and promote.casefold_path(path) == wanted
+    ]
+
+
 def _watch(
     ctx: common.Context, tree: Path, main: str, catalog: object
 ) -> tuple[Outcome, int]:
     """The outcome, and how many informational notices could not be filed."""
-    if bump.tree_entry(ctx.git, main, promote.LOCAL_OVERRIDE_REL) is not None:
-        why = f"the default branch carries {promote.LOCAL_OVERRIDE_REL}; remove it"
+    overrides = _override_entries(ctx, main)
+    if overrides is None:
+        why = "cannot list the tree of the default branch"
+        return Outcome("git-failed", _FAILED, why), 0
+    if overrides:
+        name = common.one_line(overrides[0])
+        why = f"the default branch carries {name}; remove it"
         return Outcome("override-in-tree", _OWNER, why), 0
     values = _manifest_values(ctx, main)
     if values is None:
