@@ -26,6 +26,7 @@ import json
 import os
 import pty
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -99,7 +100,11 @@ MODULES: tuple[ModuleType, ...] = (
 # The git stand-in. `{real}` is the real git, `{bare}` the scratch fork.
 # A file named `<this script>.stall` holding one word makes any command with
 # that word as an argument hang, for the deadline tests; `<this script>.fail`
-# makes it fail.
+# makes it fail, printing `<this script>.said` when there is one.
+# `<this script>.linger` makes it hang like a fetch whose remote helper is
+# stuck on the network: a background child keeps git's own stdout and stderr
+# open and outlives git when the deadline ends it. Every pid it starts is
+# appended to `<this script>.lingering`, so a test can reap them.
 FAKE_GIT = """#!/bin/sh
 GIT_ALLOW_PROTOCOL=file
 export GIT_ALLOW_PROTOCOL
@@ -107,14 +112,24 @@ stall=""
 [ -f "$0.stall" ] && stall="$(cat "$0.stall")"
 fail=""
 [ -f "$0.fail" ] && fail="$(cat "$0.fail")"
+linger=""
+[ -f "$0.linger" ] && linger="$(cat "$0.linger")"
 network=no
 for arg in "$@"; do
     if [ -n "$fail" ] && [ "$arg" = "$fail" ]; then
         echo "fake git: forced failure of $arg" >&2
+        [ -f "$0.said" ] && cat "$0.said" >&2
         exit 1
     fi
     if [ -n "$stall" ] && [ "$arg" = "$stall" ]; then
         sleep 20 > /dev/null 2>&1
+    fi
+    if [ -n "$linger" ] && [ "$arg" = "$linger" ]; then
+        sleep 30 &
+        echo "$!" >> "$0.lingering"
+        sleep 30 > /dev/null 2>&1 &
+        echo "$!" >> "$0.lingering"
+        wait
     fi
     case "$arg" in
         fetch | push | ls-remote) network=yes ;;
@@ -409,9 +424,32 @@ class Fork:
     def codex_calls(self, first: str) -> list[list[str]]:
         return [call for call in self.codex_state()["calls"] if call[:1] == [first]]
 
-    def fail_git(self, word: str) -> None:
-        """Make every git command with ``word`` as an argument fail."""
+    def fail_git(self, word: str, said: str = "") -> None:
+        """Make every git command with ``word`` as an argument fail, printing
+        ``said`` to stderr after its own line."""
         (self.bin_dir / "git.fail").write_text(word, encoding="utf-8")
+        if said:
+            (self.bin_dir / "git.said").write_text(said, encoding="utf-8")
+
+    def linger_git(self, word: str) -> None:
+        """Make every git command with ``word`` as an argument hang while a
+        child that keeps git's output open outlives it."""
+        (self.bin_dir / "git.linger").write_text(word, encoding="utf-8")
+
+    def reap_lingering(self) -> list[int]:
+        """End every child ``linger_git`` started; return the ones still
+        alive when asked."""
+        record = self.bin_dir / "git.lingering"
+        if not record.exists():
+            return []
+        alive: list[int] = []
+        for pid in [int(word) for word in record.read_text().split()]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        return alive
 
     def stall_git(self, word: str | None) -> None:
         """Make every git command with ``word`` as an argument hang."""
@@ -432,6 +470,24 @@ class Fork:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
         git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", message)
+        git(self.seed, "push", "--quiet", "origin", "HEAD:main")
+        return git(self.seed, "rev-parse", "HEAD")
+
+    def commit_entry(self, rel: str, text: str, message: str) -> str:
+        """Add one regular file to the fork's default branch through the index
+        alone, with a path the local file system need not be able to hold or
+        could fold onto another one. Returns the new SHA. The seed's work tree
+        does not get the file: remove it with ``git rm --cached`` before the
+        next ``commit``."""
+        blob = subprocess.run(
+            [REAL_GIT, "-C", str(self.seed), "hash-object", "-w", "--stdin"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=True,
+        ).stdout.decode()
+        entry = f"100644,{blob.strip()},{rel}"
+        git(self.seed, "update-index", "--add", "--cacheinfo", entry)
         git(self.seed, "commit", "--quiet", "-m", message)
         git(self.seed, "push", "--quiet", "origin", "HEAD:main")
         return git(self.seed, "rev-parse", "HEAD")
