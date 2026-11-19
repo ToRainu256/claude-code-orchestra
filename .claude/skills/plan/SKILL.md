@@ -55,7 +55,7 @@ consuming orchestrator context.
 
 ```
 Task tool:
-  subagent_type: "general-purpose-opus"
+  subagent_type: "general-purpose-deep"
   prompt: |
     Investigate this codebase for a planned change: {purpose from step 1}
 

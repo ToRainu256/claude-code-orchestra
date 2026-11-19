@@ -20,7 +20,7 @@
 | Codex adapter                 | normative             | `.codex/AGENTS.md`                            | Codex model config, sandbox discipline, enabled skills |
 | Shared rules                  | normative             | `.claude/rules/`                              | Coding, testing, security, routing, and state rules |
 | Shared skills                 | normative             | `.claude/skills/`                             | Workflow and deterministic helper implementations |
-| Agent definitions             | normative             | `.claude/agents/`                             | Model-specific executor definitions |
+| Agent definitions             | normative             | `.claude/agents/`                             | Role-specific executor definitions |
 | Shared hooks                  | normative             | `.claude/hooks/`                              | Called directly from `.claude/settings.json` |
 | Mutable agent state           | project-owned         | `.claude/STATE.md`                            | Repository identity and cross-session working state |
 | Main-agent change runbook     | normative             | `.claude/docs/change_main.md`                      | On-demand procedure for changing the main runtime |
@@ -30,6 +30,6 @@
 
 ## Related Canonical Files (outside .claude/docs/)
 
-- **Model configuration**: `.claude/skills/_shared/models.json` is the single source of truth for every model; `.claude/skills/_shared/models.py` (`apply` / `check`) renders it into `.claude/agents/`, `.claude/settings.json` and `.codex/config.toml`
+- **Model configuration**: `.claude/skills/_shared/models.json` is the single source of truth for every model; `.claude/skills/_shared/models.py` (`apply` / `check`) renders it into `.claude/agents/`, `.claude/settings.json` and `.codex/config.toml`. Documents name roles, never models: in the template, `.claude/skills/_shared/models_lint.py` fails on a model name outside the manifest and its reasoned exemptions
 - **Claude-to-Codex details**: `.claude/rules/codex-delegation.md`
 - **Root bootstrap**: `AGENTS.md` is the single root contract for both the main agent and every CLI runtime; no `CLAUDE.md` and no symlinks are involved

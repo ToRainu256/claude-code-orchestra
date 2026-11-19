@@ -15,10 +15,18 @@ and referenced by skills, rules, and configuration.
 - **Outputs**: Direct edits, user-facing responses, delegation calls to other tiers.
 - **Default runtime**: Claude Code. The active runtime is recorded in
   `.claude/STATE.md`.
-- **Default executor models**: Claude models configured through
-  `.claude/settings.json`.
-- **Tier-1 norm**: Implementation-work subagents run on Sonnet; research and
-  large-scale analysis subagents stay on Opus (1M context window).
+- **Default executor models**: Assigned per role in the model manifest
+  (`.claude/skills/_shared/models.json`) and rendered from it into the agent
+  definitions and `.claude/settings.json`. Documents name the role and leave
+  the model to the manifest.
+- **Tier-1 norm**: Routine, well-scoped implementation goes to
+  `general-purpose-standard`; research, large-scale analysis, and difficult
+  implementation go to `general-purpose-deep`. The role is chosen by the work,
+  never by the model it currently runs on. The manifest is expected to assign
+  `general-purpose-deep` the stronger model and `general-purpose-standard` one
+  that costs less to spend on routine work. Every routing rule in this
+  repository assumes that, and this is the only place it is stated: the other
+  documents describe the work each role takes, not the model behind it.
 
 ## Tier 2 -- `sol` (Long-Duration Executor)
 
@@ -38,15 +46,18 @@ and referenced by skills, rules, and configuration.
   `.claude/skills/_shared/models.json`, rendered into `.codex/config.toml`).
 - **Guardrails**: See root `AGENTS.md` section "Guardrails (Completion Verification)".
 
-## Tier 3 -- `fable` (Rare Escalation / Final Authority)
+## Tier 3 -- `fable` (Independent Judgment / Final Authority)
 
 - **Scope**: Design arbitration, unblocking stuck problems, final review of
   large changes -- and implementing the resolution when it is faster and safer
-  to land the fix than to hand it back down a tier that already failed twice.
+  to land the fix than to hand it back down a tier that has already failed at
+  it repeatedly.
 - **Selection criteria**: Escalation only -- used when lower tiers are stuck,
   conflicting, or a high-stakes decision requires independent judgment.
-  Scarcity is what keeps the signal high; the widened permission does not
-  widen the scope.
+  Its value is a judgment formed in a fresh context, independent of the
+  attempts that led to the escalation -- not a stronger model: the tier ID is
+  a permanent identifier, and other roles may run on the same model. It stays
+  an escalation route; the widened permission does not widen the scope.
 - **Permission boundary**: Full filesystem access, same as Tier 2. Review
   notes still belong in `.claude/docs/reviews/`, but that is now a convention
   about where judgment is recorded, not a restriction on what can be written.
@@ -58,7 +69,8 @@ and referenced by skills, rules, and configuration.
   implements -- a diff subject to the same completion verification as any
   other tier.
 - **Model**: Claude `fable-advisor` agent
-  (`.claude/agents/fable-advisor.md`).
+  (`.claude/agents/fable-advisor.md`); its model is assigned in the model
+  manifest like every other agent's.
 - **Guardrails**: See root `AGENTS.md` section "Guardrails
   (Completion Verification)". Fable's judgment is not self-certifying: a
   change it lands is verified like any other.
@@ -71,4 +83,4 @@ Multiple review mechanisms exist. Their scopes are distinct:
 |----------------------------------|-------------------------------------------------|----------------------------------|
 | team-execute Phase 2 reviewers   | Per-change ship gate (security, quality, tests) | Every team-execute change        |
 | `/codex:adversarial-review`      | Code-level design challenge (external plugin)   | On-demand via codex-plugin-cc    |
-| **Fable (Tier 3)**               | RARE escalation: arbitration, unblocking, large-change final judgment, and landing the resolution | Manual escalation when stuck or high-stakes |
+| **Fable (Tier 3)**               | Independent fresh-context judgment: arbitration, unblocking after repeated failure, large-change final review, and landing the resolution | Manual escalation when stuck or high-stakes |

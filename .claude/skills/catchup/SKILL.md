@@ -87,7 +87,7 @@ Top-level JSON keys:
   `tool`, plus `skipped_lines`.
 
 Feed the emitted JSON to Phase 2 as its sole input. For very large repos hand it
-to `general-purpose-opus` for the thematic grouping.
+to `general-purpose-deep` for the thematic grouping.
 
 ---
 

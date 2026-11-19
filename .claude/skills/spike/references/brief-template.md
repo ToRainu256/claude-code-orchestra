@@ -32,7 +32,7 @@ All sections are REQUIRED.
 {Which sub-question is most decisive -- investigate this first}
 
 ### Investigation Plan
-- Researcher (Opus): {what to research externally}
+- Researcher: {what to research externally}
 - Feasibility Analyst (Codex): {what to analyze technically}
 - Prototype (if applicable): {what to build and test}
 ```

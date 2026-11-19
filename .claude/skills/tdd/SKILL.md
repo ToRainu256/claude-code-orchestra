@@ -31,8 +31,8 @@ The split is fixed:
 | Work | Owner |
 |------|-------|
 | Requirement clarification, test-case list, boundary values | Lead (judgment, Self-Handle List item 5) |
-| Writing the tests and the production code, cycle by cycle | `general-purpose-sonnet` |
-| Cycles with ambiguous design, cross-cutting invariants, or security / concurrency / data-integrity risk | `general-purpose-opus` |
+| Writing the tests and the production code, cycle by cycle | `general-purpose-standard` |
+| Cycles with ambiguous design, cross-cutting invariants, or security / concurrency / data-integrity risk | `general-purpose-deep` |
 | A Red that is red for the wrong reason, or a Green that will not go green after one retry | `codex-debugger` |
 | Every `run_tests.py` / `verify.sh` gate and the final report | Lead — verification never delegates |
 
@@ -109,7 +109,7 @@ Delegate the Red-Green-Refactor loop with the six-element prompt contract from
 
 ```
 Task tool:
-  subagent_type: "general-purpose-sonnet"   # or general-purpose-opus, see the table above
+  subagent_type: "general-purpose-standard"   # or general-purpose-deep, see the table above
   prompt: |
     Objective: Implement {module} by strict TDD, one test case at a time.
 
@@ -142,7 +142,7 @@ Task tool:
 
 Then verify rather than trust: re-run `run_tests.py --expect pass` yourself and
 read the diff. A reported cycle with no matching `run_tests.py` exit `0` did not
-happen. If a cycle came back unfinished, escalate it (`general-purpose-opus` or
+happen. If a cycle came back unfinished, escalate it (`general-purpose-deep` or
 `codex-debugger`) instead of re-sending the same prompt to the same tier.
 
 The steps below are the contract the delegate follows — and what the lead runs

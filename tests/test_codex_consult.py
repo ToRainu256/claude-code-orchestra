@@ -942,13 +942,13 @@ def test_the_files_the_callee_edited_are_reported(tmp_path: Path) -> None:
 
     result = run_codex_consult(
         tmp_path,
-        ["--prompt-file", str(prompt_file), "--caller", "general-purpose-opus"],
+        ["--prompt-file", str(prompt_file), "--caller", "general-purpose-deep"],
         path_prefix=bin_dir,
     )
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["caller"] == "general-purpose-opus"
+    assert payload["caller"] == "general-purpose-deep"
     assert payload["label"] == "consult"
     assert payload["edits"]["tracked"] is True
     assert payload["edits"]["changed_files"] == ["existing.py"]

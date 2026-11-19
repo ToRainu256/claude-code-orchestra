@@ -53,15 +53,15 @@ decide:
 
 | Work | Route |
 |------|-------|
-| Routine, well-scoped implementation with clear acceptance criteria | `general-purpose-sonnet` |
-| Ambiguous, cross-cutting, security / concurrency / data-integrity / migration-sensitive implementation | `general-purpose-opus` |
-| Codebase-wide investigation, large-context analysis, external research | `general-purpose-opus` |
+| Routine, well-scoped implementation with clear acceptance criteria | `general-purpose-standard` |
+| Ambiguous, cross-cutting, security / concurrency / data-integrity / migration-sensitive implementation | `general-purpose-deep` |
+| Codebase-wide investigation, analysis that needs broad repository context, external research | `general-purpose-deep` |
 | Unknown root cause, failing tests or builds, unexpected behaviour | `codex-debugger` |
 | Architecture, planning, decomposition, complex algorithms, code review | Codex (`codex-system` skill / `.claude/skills/_shared/codex_consult.py`) |
-| Repeated failure, conflicting proposals, final review of a large change | `fable-advisor` (rare) |
+| Repeated failure, conflicting proposals, final review of a large change | `fable-advisor` (escalation: an independent fresh-context judgment) |
 
-Escalate rather than retry: a `general-purpose-sonnet` task that comes back
-wrong or under-specified goes to `general-purpose-opus` or Codex, not back to
+Escalate rather than retry: a `general-purpose-standard` task that comes back
+wrong or under-specified goes to `general-purpose-deep` or Codex, not back to
 the same tier with the same prompt.
 
 ## Parallel by Default

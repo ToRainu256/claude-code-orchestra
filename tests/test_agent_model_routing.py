@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / ".claude/agents"
 # Root AGENTS.md carries the routing policy: the former CLAUDE.md was merged
@@ -18,8 +20,29 @@ ROUTING_FILES = (
     *sorted((REPO_ROOT / ".claude/hooks").glob("*.py")),
 )
 BARE_GENERAL_PURPOSE = re.compile(
-    r"(?<![A-Za-z0-9-])general-purpose(?!-(?:opus|sonnet)|[A-Za-z0-9-])"
+    r"(?<![A-Za-z0-9-])general-purpose(?!-(?:deep|standard)|[A-Za-z0-9-])"
 )
+# Agent-Teams teammates each skill spawns, and the role each must be given. A
+# teammate spawned without an agent type runs on the default subagent model
+# with none of the role's tools or instructions, whatever the prose says.
+TEAMMATE_ROLES = {
+    "feature": {
+        "Researcher": "general-purpose-deep",
+        "Architect": "general-purpose-deep",
+    },
+    "spike": {
+        "Researcher": "general-purpose-deep",
+        "Feasibility Analyst": "general-purpose-deep",
+    },
+    "troubleshoot": {
+        "Root Cause Analyst": "general-purpose-deep",
+        "Impact Investigator": "general-purpose-deep",
+    },
+    "team-execute": {
+        "Implementer-{module}": "general-purpose-standard",
+        "Tester": "general-purpose-standard",
+    },
+}
 
 
 def read_frontmatter(path: Path) -> dict[str, str]:
@@ -44,7 +67,7 @@ def frontmatter_lines(path: Path) -> list[str]:
 
 
 def test_general_purpose_agents_are_defined() -> None:
-    for name in ("general-purpose-opus", "general-purpose-sonnet"):
+    for name in ("general-purpose-deep", "general-purpose-standard"):
         assert read_frontmatter(AGENTS_DIR / f"{name}.md")["name"] == name
 
     assert not (AGENTS_DIR / "general-purpose.md").exists()
@@ -101,10 +124,32 @@ def test_routing_docs_do_not_reference_removed_general_purpose_agent() -> None:
     assert stale_references == []
 
 
-def test_team_execution_defaults_to_sonnet_with_opus_escalation() -> None:
+def test_team_execution_defaults_to_the_standard_role_with_deep_escalation() -> None:
     team_execute = (REPO_ROOT / ".claude/skills/team-execute/SKILL.md").read_text(
         encoding="utf-8"
     )
 
-    assert "general-purpose-sonnet" in team_execute
-    assert "general-purpose-opus" in team_execute
+    assert "general-purpose-standard" in team_execute
+    assert "general-purpose-deep" in team_execute
+
+
+@pytest.mark.parametrize("skill", sorted(TEAMMATE_ROLES))
+def test_spawn_templates_name_the_role_of_every_teammate(skill: str) -> None:
+    """The line under each teammate's heading names its agent type first."""
+    lines = (
+        (REPO_ROOT / ".claude/skills" / skill / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    defined = {path.stem for path in AGENTS_DIR.glob("*.md")}
+
+    for teammate, role in TEAMMATE_ROLES[skill].items():
+        headings = [
+            index
+            for index, line in enumerate(lines)
+            if re.match(rf"\d+\. \*\*{re.escape(teammate)}\*\*", line)
+        ]
+        assert len(headings) == 1, f"{skill}: {teammate} is spawned {len(headings)}x"
+        agent_line = lines[headings[0] + 1].strip()
+        assert agent_line.startswith(f"Agent: `{role}`"), f"{skill}: {teammate}"
+        assert role in defined

@@ -129,6 +129,15 @@ REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 # agents directory.
 AGENT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
+# Agent names an earlier template version shipped, and what each became. The
+# old names stated a model; a project override that still uses one is refused
+# with the new name, never translated: the agent it names no longer exists.
+# models_lint.py reads this too, to fail on the old names in prose.
+LEGACY_AGENT_NAMES = {
+    "general-purpose-sonnet": "general-purpose-standard",
+    "general-purpose-opus": "general-purpose-deep",
+}
+
 SUBAGENT_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
 CODEX_ENV = "CODEX_MODEL"
 JSON_INDENT = 2
@@ -1037,6 +1046,28 @@ def _guard(rel: str, planner: Callable[[], FileResult]) -> FileResult:
         return FileResult(rel, refusal=str(exc))
 
 
+def _missing_agent_reason(name: str, resolved: Resolved) -> str:
+    """Why a model assigned to an agent that has no definition is refused.
+
+    Refused rather than dropped: the entry is somebody's choice of model, and
+    skipping it would discard that choice without a word. For a name an
+    earlier template version used, the reason is the exact edit that fixes it.
+    """
+    key = AGENT_PREFIX + name
+    source = LOCAL_REL if key in resolved.local_keys else MANIFEST_REL
+    renamed = LEGACY_AGENT_NAMES.get(name)
+    if renamed is not None:
+        return (
+            f"does not exist: the agent {name} was renamed to {renamed}. In "
+            f'{source}, rename the key "{name}" under claude.agents to '
+            f'"{renamed}"; no model is applied until then'
+        )
+    return (
+        f"does not exist, but {source} assigns {key}; remove the entry or "
+        "restore the agent definition"
+    )
+
+
 def _plan_agents(root: Path, resolved: Resolved) -> list[FileResult]:
     """Render every agent definition, and require a model for each one.
 
@@ -1068,10 +1099,7 @@ def _plan_agents(root: Path, resolved: Resolved) -> list[FileResult]:
             results.append(FileResult(rel, refusal=reason))
             continue
         if name not in defined:
-            reason = (
-                f"does not exist, but the manifest assigns {AGENT_PREFIX}{name}; "
-                "remove the entry or restore the agent definition"
-            )
+            reason = _missing_agent_reason(name, resolved)
             results.append(FileResult(rel, refusal=reason))
             continue
         target = assigned[name]

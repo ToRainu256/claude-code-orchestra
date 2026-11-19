@@ -40,7 +40,7 @@ All functions must have type annotations:
 ```python
 def call_llm(
     prompt: str,
-    model: str = "gpt-4",
+    model: str = "model-name",
     max_tokens: int = 1000
 ) -> str:
     ...

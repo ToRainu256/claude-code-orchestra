@@ -49,15 +49,17 @@ logs. Delegate these unless the user explicitly requests otherwise.
 
 - Active main agent (default: Claude Code): owns user interaction, routing,
   approvals, integration, and the final response.
-- `general-purpose-sonnet`: routine, well-scoped implementation.
-- `general-purpose-opus`: research, broad analysis, difficult or cross-cutting
+- `general-purpose-standard`: routine, well-scoped implementation.
+- `general-purpose-deep`: research, broad analysis, difficult or cross-cutting
   implementation, and Codex delegation.
 - `codex-debugger`: root-cause analysis for errors and failed checks.
 - Codex CLI / Tier 2 `sol`: design, planning, complex implementation, and deep
   debugging. Its work must be independently verified.
-- `fable-advisor` / Tier 3 `fable`: rare arbitration, unblocking, and final
-  review of large changes; may land the resolution when handing it back down
-  would repeat the failure that escalated to it.
+- `fable-advisor` / Tier 3 `fable`: an independent, fresh-context judgment for
+  arbitration, unblocking after repeated failure, and final review of large
+  changes. An escalation route, verified like any other tier; may land the
+  resolution when handing it back down would repeat the failure that escalated
+  to it.
 
 Full definitions live in `.claude/agents/`; stable role and permission details
 live in `.claude/rules/tiers.md`.
@@ -69,14 +71,16 @@ alone only on the closed Self-Handle List in `.claude/rules/delegation.md`:
 answers from already-loaded context, a single known file edited by ~20 lines or
 fewer, named gates and skill-bundled lead scripts, and user-facing interaction.
 
-- Routine, clear implementation → `general-purpose-sonnet`.
+- Routine, clear implementation → `general-purpose-standard`.
 - Ambiguous, security-, concurrency-, data-integrity-, or migration-sensitive
-  implementation → `general-purpose-opus`, consulting Codex as needed.
+  implementation → `general-purpose-deep`, consulting Codex as needed.
 - Design, planning, trade-offs, and complex implementation → Codex through
-  `general-purpose-opus` or the `codex-system` skill.
-- External research and large-context analysis → `general-purpose-opus`.
+  `general-purpose-deep` or the `codex-system` skill.
+- External research and analysis that needs broad repository context →
+  `general-purpose-deep`.
 - Unknown root cause → `codex-debugger`.
-- Repeatedly stuck or high-stakes arbitration → `fable-advisor`.
+- Repeatedly stuck, conflicting proposals, or final review of a large change →
+  `fable-advisor`, for an independent fresh-context judgment.
 
 Delegate as soon as any trigger fires — do not investigate first and then
 decide: a third file must be read, an unread file must be opened, output is
@@ -287,7 +291,7 @@ Rules:
   A direct `codex exec` is logged too, but with all four of those fields
   `null` — the missing provenance is the reason the wrapper is mandated.
 - Prefer the project's own delegation skills (`codex-system`,
-  `general-purpose-opus`) over an ad-hoc wrapper call when one already covers
+  `general-purpose-deep`) over an ad-hoc wrapper call when one already covers
   the task.
 
 ## Internal Context References

@@ -2,7 +2,7 @@
 
 Template contract for the Phase 1 Bug Report artifact.
 All sections are REQUIRED unless marked otherwise.
-`{placeholder}` tokens are filled by the orchestrator from error details, Opus subagent analysis, and Codex initial hypotheses.
+`{placeholder}` tokens are filled by the orchestrator from error details, deep subagent analysis, and Codex initial hypotheses.
 
 ---
 

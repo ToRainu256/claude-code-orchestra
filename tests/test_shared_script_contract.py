@@ -358,6 +358,8 @@ SUCCESS_EXEMPT: dict[Path, str] = {
     # Needs a real test run / a complete agent bootstrap to succeed.
     SKILLS_DIR / "_shared" / "run_tests.py": "tests/test_run_tests.py",
     SKILLS_DIR / "init" / "detect_stack.py": "tests/test_detect_stack.py",
+    # Needs a git work tree that holds files to scan.
+    SKILLS_DIR / "_shared" / "models_lint.py": "tests/test_models_lint.py",
     # Resolved paths are asserted directly there, including the relative form.
     SKILLS_DIR / "_shared" / "workspace.py": "tests/test_workspace.py",
 }

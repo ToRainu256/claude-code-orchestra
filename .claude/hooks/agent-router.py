@@ -3,19 +3,24 @@
 UserPromptSubmit hook: Route to appropriate agent based on user intent.
 
 Routing rules (checked in order, most specific first):
-- Design arbitration / stuck problems / final review → Fable advisor (rare)
+- Design arbitration / stuck problems / final review → fable-advisor
+  (independent fresh-context judgment; an escalation route)
 - Explicit review/rescue/delegation phrases → Codex Plugin commands
 - Planning, design, complex code → Codex CLI
-- Codebase understanding / large analysis / external research → Opus subagent
+- Codebase understanding / large analysis / external research →
+  general-purpose-deep subagent
 
-Multimodal files (PDF/video/audio/image) are handled directly by Claude (Opus 4.7+).
+The hints name roles, never models: which model a role runs on is decided in
+.claude/skills/_shared/models.json and nowhere else.
+
+Multimodal files (PDF/video/audio/image) are handled directly by Claude.
 """
 
 import json
 import re
 import sys
 
-# Triggers for Fable advisor (rare escalation: arbitration, stuck, final review)
+# Triggers for the fable-advisor escalation (arbitration, stuck, final review)
 FABLE_TRIGGERS = {
     "ja": [
         "設計判断に迷",
@@ -140,8 +145,8 @@ CODEX_TRIGGERS = {
     ],
 }
 
-# Triggers for Opus research (codebase analysis + external research)
-OPUS_RESEARCH_TRIGGERS = {
+# Triggers for deep research (codebase analysis + external research)
+DEEP_RESEARCH_TRIGGERS = {
     "ja": [
         "調べて",
         "リサーチ",
@@ -227,7 +232,7 @@ def detect_agent(prompt: str) -> tuple[str | None, str]:
     """
     prompt_lower = prompt.lower()
 
-    # Fable triggers (rare escalation: arbitration, stuck, final review)
+    # Fable triggers (escalation: arbitration, stuck, final review)
     # Checked FIRST — narrow, high-specificity triggers that must not be
     # swallowed by the broader Codex keywords.
     for lang, triggers in FABLE_TRIGGERS.items():
@@ -251,11 +256,11 @@ def detect_agent(prompt: str) -> tuple[str | None, str]:
             if matches_trigger(trigger, prompt_lower, lang):
                 return "codex", trigger
 
-    # Opus research triggers (codebase analysis + external research)
-    for lang, triggers in OPUS_RESEARCH_TRIGGERS.items():
+    # Deep research triggers (codebase analysis + external research)
+    for lang, triggers in DEEP_RESEARCH_TRIGGERS.items():
         for trigger in triggers:
             if matches_trigger(trigger, prompt_lower, lang):
-                return "opus-research", trigger
+                return "deep-research", trigger
 
     return None, ""
 
@@ -277,11 +282,13 @@ def main():
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": (
                         f"[Fable Advisor] Detected '{trigger}' — this may warrant the "
-                        "fable-advisor subagent (rare escalation: design arbitration / "
-                        "stuck problems / final review of large changes; read-only, never "
-                        "implements; notes saved to .claude/docs/reviews/). For routine "
-                        "review or implementation, use the normal Codex/team-execute "
-                        "routes instead."
+                        "fable-advisor subagent: an independent, fresh-context judgment "
+                        "for design arbitration, unblocking after repeated failure, or "
+                        "final review of a large change. It is an escalation route: it "
+                        "may land the resolution when handing it back would repeat the "
+                        "failure, its result is verified like any other tier's, and its "
+                        "notes are saved to .claude/docs/reviews/. For routine review or "
+                        "implementation, use the normal Codex/team-execute routes instead."
                     ),
                 }
             }
@@ -298,7 +305,7 @@ def main():
                         "task is on the Self-Handle List in .claude/rules/delegation.md. "
                         "Write the prompt to a file, then `python3 .claude/skills/_shared/"
                         "codex_consult.py --prompt-file <path> --sandbox read-only`, or "
-                        "delegate via general-purpose-opus to preserve main context."
+                        "delegate via general-purpose-deep to preserve main context."
                     ),
                 }
             }
@@ -319,15 +326,15 @@ def main():
             }
             print(json.dumps(output))
 
-        elif agent == "opus-research":
+        elif agent == "deep-research":
             output = {
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": (
-                        f"[Opus Research] Detected '{trigger}' — use general-purpose-opus "
-                        "for this task. Opus subagents handle research, codebase analysis, and investigation "
-                        "with 1M context and WebSearch/WebFetch. "
-                        "Use via Agent tool with subagent_type='general-purpose-opus'. "
+                        f"[Deep Research] Detected '{trigger}' — use general-purpose-deep "
+                        "for this task. That role handles research, codebase analysis, and "
+                        "investigation in its own context, with WebSearch/WebFetch. "
+                        "Use via Agent tool with subagent_type='general-purpose-deep'. "
                         "Save results to .claude/docs/research/."
                     ),
                 }

@@ -69,6 +69,11 @@
 | Treat `.codex/config.toml` as a native settings file rather than template content: `.codex/` leaves the wholesale-replaced directory lists, `.codex/AGENTS.md` is distributed as a template-owned file, and the config is never overwritten — a `.codex/config.orchestra.toml` merge candidate is written when it differs | `.claude/settings.json` was already protected this way, but `.codex/config.toml` sat inside the wholesale-replaced `.codex/` directory, so every install and update silently overwrote a downstream project's model, reasoning effort, approval policy, and sandbox mode. Both files are the same kind of artefact and now get the same treatment | Leave `.codex/` template-owned and tell users to re-apply their settings after each update (status quo; silent data loss with no signal at the call site) | 2026-09-01 |
 | Response style (natural Japanese, concise but complete) becomes normative in `.claude/rules/language.md` `## Response Style`, while `CLAUDE.md` `## Language Protocol` keeps which-language-goes-where; every other restatement becomes a pointer | `.claude/settings.json` already carried `"language": "japanese"`, so which language was enforced at the system-prompt level, but reply *length* was specified nowhere and the language rule was restated in ~11 places naming three different SSOTs — one of them a root `AGENTS.md` heading that does not exist and that `tests/test_orchestration_contract.py` forbids. The rule cannot live in `CLAUDE.md` (150-line cap, 2 lines of headroom) | A custom output style (rejected: `scripts/check.sh` whitelists `.claude/` top-level entries so `.claude/output-styles/` fails the boundary check, and output styles do not reach subagents); a `UserPromptSubmit` hook re-injecting the rule every turn (rejected: permanent token and latency cost) | 2026-09-09 |
 | Add a third normative clause, **Understandable on the first read**, to `.claude/rules/language.md` `## Response Style`, between *Concise but complete* and *Never compressed away* | The 2026-09-09 decision fixed which language a reply uses and how long it runs, but not whether it lands. Those two axes are satisfiable by a reply that is short, correct, Japanese, and still forces the reader to re-read a sentence or reconstruct context — the exact failure a user reported. The clause names the mechanics (one idea per sentence, consistent naming, terms expanded on first use, concrete path/command/number over abstraction, lists only where they cut reading effort, an explicit next action), so it is reviewable rather than a taste statement. It lands in the existing SSOT, so every pointer already installed keeps working and no new file enters the boundary check | Restate it in `CLAUDE.md` `## Language Protocol` (rejected: the 150-line cap leaves ~2 lines of headroom, and the 2026-09-09 decision already put response style here); add it to root `AGENTS.md` (rejected for now: that file governs subagent → orchestrator returns, which stay English and structured — a different axis) | 2026-09-18 |
+| One model manifest, `.claude/skills/_shared/models.json`, is the only place a model is chosen; `_shared/models.py` renders it (`apply`) into agent frontmatter and patches the model keys of `.claude/settings.json` and `.codex/config.toml`, `check [--strict]` reports drift, and `install.sh` / `update.sh` run `apply` after syncing. Claude values are aliases, Codex is a pinned slug, and `env.CODEX_MODEL` leaves the settings file (PR #2, shipped in 1.1.0) | A model lived in nine places (four frontmatter lines, two settings keys, two config keys, a wrapper constant) plus prose, and "diff only" propagation had already left three installs on three different Codex models. A project-owned key is advanced only when it is absent, already current, or a value some template version shipped (`superseded`), so a deliberate project value survives; edits are computed first and written all-or-nothing, and an unusual layout is refused with the exact line to change. `.claude/models.local.json` overrides one key or opts out | TOML manifest (no `tomllib` on the macOS system Python 3.9, no stdlib writer); pinned Claude IDs (every release becomes a bump PR that aliases make unnecessary); overwrite managed keys unconditionally (erases deliberate downstream choices); keep "diff only" (the gap that caused the drift) | 2026-11-18 |
+| Rename the two general-purpose roles to say what they are for: `general-purpose-sonnet` -> `general-purpose-standard`, `general-purpose-opus` -> `general-purpose-deep`. The rename is a committed, idempotent codemod, `scripts/rename-roles.py` (check by default, `--apply` to write), not shipped to projects. `codex-debugger`, `fable-advisor` and the tier IDs keep their names | The role name is what every router, hook hint, and skill shows the routing agent. With the manifest assigning `opus` to the routine role and `fable` to the deep one, both old names stated a model the role no longer ran on, and would be wrong again after any later reassignment. A codemod, rather than a one-off edit, because upstream still uses the old names: text that arrives with them is renamed by running it again, and its check mode is the gate that no old name is left. It refuses what it cannot do safely instead of guessing: a file that is not readable as text, a definition behind a symlink, a root that is not the repository's top level. Tier IDs are permanent identifiers, not model claims (`sol` already ran no "sol" model) | Keep the names as opaque IDs (zero churn, but each name misstates its model in every routing prompt); alias old -> new (impossible: the agent `name` is the `subagent_type`, and duplicate definitions would split routing across four names) | 2026-11-18 |
+| Prose names roles, never models, and `.claude/skills/_shared/models_lint.py` enforces it in this template (`scripts/check.sh`, check "Model names only in the manifest"): a model ID, a versioned model name, a bare model-family word, or a retired role name fails, in every file git tracks or would add, outside a short list of reasoned exemptions. README shows the role -> manifest-key table and the `get` command instead of the current assignment | After the manifest, the remaining stale copies were sentences: "Opus 4.6" in two always-loaded skill descriptions, "Opus 4.7+" in a hook, a Tier-1 norm naming two families, about a hundred lines in all. A sentence that names a model is a copy nobody updates; a gate is the only thing that stops the next one. The scope is the tree, not a list of places to look, so a new file is scanned the day it appears; a symlink to something unscanned and a file that is not text are findings, because both are also ways to hide text from the gate. The exemptions are the manifest, the two tools that define the names, history (this log, research, reviews, plans) and test fixtures, each with its reason in code; `fable` and `sol` are tier IDs and are deliberately not flagged. A single line can be excused with a marker, every use of which is reported and pinned by a test (none today). The lint is its own script rather than a `models.py` subcommand: it reads no manifest and shares only constants with the load -> plan -> commit pipeline that justifies that file's size. It runs in the template only: in a project the template-owned files are copies that already passed here, and the rest is the project's own text. Agent-Teams teammates in `feature`, `spike` and `troubleshoot` now name an agent type, because a teammate spawned without one ran on the default subagent model whatever the prose claimed | Generate prose from the manifest (a Markdown renderer for text that needs no model name at all); render a "current assignment" block into README (a second managed location, and README is project-owned once installed); a hand-kept list of paths to scan (a new top-level file went unscanned until someone edited the list); run the lint in installed projects too (it could only ever fail on a project's own wording) | 2026-11-18 |
+| `fable-advisor` is described by what it adds, an independent fresh-context judgment, not by scarcity: Tier 3 stays an escalation route (arbitration, unblocking after repeated failure, final review of large changes), may land the resolution, and is verified like any other tier. Supersedes the "scarcity keeps the signal high" wording of the 2026-07-10 and Tier-3-widening decisions, and corrects the router hint that still called it read-only | The manifest runs the main agent and the deep role on the same model as the advisor, so "rare because the model is scarce" no longer describes anything. What the advisor still has that the others do not is a context that did not take part in the failed attempts or the competing proposals. The tier ID `fable` is unchanged: it is an identifier, not a model claim | Rename the tier or the agent (tier IDs are permanent and referenced by skills, rules and configuration); drop Tier 3 (loses the one route that is independent of the context that got stuck) | 2026-11-18 |
+| `scripts/rename-roles.py` does not resolve merge conflicts, and taking in upstream changes is deliberately not part of this tool | Upstream still uses the old role names, so an upstream edit of any line that names a role conflicts with this tree. A resolver that re-ran the rename on the three recorded sides of each unmerged path was built and removed before release: three reviews found it trusted git's index and git's classification of a conflict more than they deserve, and staged over state git had left for a person (an uncommitted edit, a path whose name is also a pathspec, a conflict about where a file belongs rather than what it says). Upstream-intake pull requests are never merged automatically, so nothing needs that risk. The intake tooling is a later change on a different basis: apply the rename to the merge base and to the upstream tree in scratch, then let `git merge-tree --write-tree` merge them, with no surgery on a live index or work tree | Keep the resolver behind more guards (each guard answered one reproduced case; the class of mistake stayed); a persistent "renamed upstream mirror" branch (merge-base ambiguity once raw upstream is merged too) | 2026-11-19 |
 
 ## TODO / Open Questions
 
@@ -78,3 +83,75 @@
 - [ ] Antigravity as a main agent: auth is still OAuth-only (antigravity-cli#78), so a headless/CI main is not yet possible; revisit with the workflow skeletons together.
 - [x] update.sh rsync of SAFE_DIRS is not strictly atomic; consider stage-and-swap or post-sync self-check if interruption tolerance is needed — fixed 2026-07-18 (per-directory stage-and-swap with trap rollback; covered by a failure-injection test)
 - [ ] Native discovery symlinks assume a symlink-capable checkout. On Windows without `core.symlinks=true` (or Developer Mode), git materializes `.claude/agents`/`.claude/skills` as plain text files and discovery breaks silently. If a Windows contributor appears, add a sync-copy fallback (with a CI drift check) behind the same install/update entry points.
+
+## Release Notes
+
+### 1.1.0 (2026-11-18)
+
+**One file decides every model.** `.claude/skills/_shared/models.json` (the
+model manifest) holds the main-agent model, the default subagent model, the
+model of each agent in `.claude/agents/`, and the Codex model and reasoning
+effort. `python3 .claude/skills/_shared/models.py set <key> <value>` changes a
+value and `... models.py apply` renders it into every generated location;
+`scripts/install.sh` and `scripts/update.sh` run `apply` for a project.
+`scripts/check.sh` fails on a location that drifted from the manifest.
+
+**Two roles are renamed.** The names no longer state a model:
+
+| Old name | New name | Role |
+|----------|----------|------|
+| `general-purpose-sonnet` | `general-purpose-standard` | Routine, well-scoped implementation |
+| `general-purpose-opus` | `general-purpose-deep` | Research, large-scale analysis, difficult implementation, design judgment |
+
+`codex-debugger`, `fable-advisor` and the tier IDs (`default`, `sol`, `fable`)
+are unchanged.
+
+**What changes in an installed project.**
+
+- The update replaces `.claude/agents/` wholesale, so the two old definitions
+  are removed and the renamed ones arrive in the same run. Text the project
+  owns that names an old role as a `subagent_type` (`.claude/STATE.md`,
+  `.claude/docs/DESIGN.md`, its own prompts or scripts) is not rewritten:
+  rename it by hand. A delegation to an old name fails at once, because that
+  agent no longer exists.
+- The models change. `apply` sets `model` in `.claude/settings.json` (the main
+  agent; it was not set before) and advances `env.CLAUDE_CODE_SUBAGENT_MODEL`
+  (the default subagent) and the Codex `model` in `.codex/config.toml` when
+  they still hold a value the template shipped; it removes a shipped
+  `env.CODEX_MODEL`. A value the project chose itself is kept and reported as
+  `custom`. For an install whose `scripts/update.sh` predates the manifest this
+  happens on the **second** update run: the first run is still executed by the
+  old updater, which has no apply step (or run `models.py apply` once).
+- A project `model` in `.claude/settings.json` outranks each user's own
+  `/model` default. `.claude/settings.local.json` is the personal override.
+
+**Overriding a model in a project.** Create `.claude/models.local.json`; it is
+never shipped and never rewritten:
+
+```json
+{
+  "schema_version": 1,
+  "claude": {
+    "main": null,
+    "agents": { "general-purpose-deep": "opus" }
+  },
+  "codex": { "reasoning_effort": "high" }
+}
+```
+
+Any subset of the manifest's keys may appear. A `null` leaf leaves that one key
+unmanaged (here: the project keeps whatever main model it has), and
+`"manage_native_settings": false` stops `apply` from touching
+`.claude/settings.json` and `.codex/config.toml` at all. An override that still
+uses an old agent name as a key is refused, with the key to rename in the
+message. One such key blocks the whole apply: no model is written anywhere,
+the agent definitions keep the template's models, and the rest of the override
+is not in effect, until the key is renamed and `models.py apply` is run. It is
+never translated or dropped silently.
+
+**For this repository's maintainers.** `scripts/rename-roles.py` is the rename
+(`--apply`; with no flag it reports what is left, and exits 2 while anything
+is). It does not resolve merge conflicts: a branch that still uses the old
+names is taken in by hand until the intake tooling exists.
+`.claude/skills/_shared/models_lint.py` (in `scripts/check.sh`) fails on a model
+name outside the manifest and its reasoned exemptions.

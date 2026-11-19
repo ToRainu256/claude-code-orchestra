@@ -1,6 +1,6 @@
 ---
-name: general-purpose-sonnet
-description: "Sonnet subagent for routine, well-scoped implementation. Use for approved plans, localized features and fixes, tests, refactoring, and mechanical file work with clear acceptance criteria."
+name: general-purpose-standard
+description: "Standard implementation subagent for routine, well-scoped work. Use for approved plans, localized features and fixes, tests, refactoring, and mechanical file work with clear acceptance criteria."
 tools: Read, Edit, Write, Bash, Grep, Glob
 model: opus
 ---
@@ -21,9 +21,9 @@ coding rules, and test strategy.
 ## Selection Criteria
 
 Use this agent when the task has clear acceptance criteria and can be validated with
-normal repository checks. File count alone does not require Opus.
+normal repository checks. File count alone does not require escalation.
 
-Escalate the task back to the orchestrator for `general-purpose-opus` routing when:
+Escalate the task back to the orchestrator for `general-purpose-deep` routing when:
 
 - Requirements or architecture are genuinely ambiguous
 - The change reveals unexpected cross-system coupling
@@ -32,7 +32,7 @@ Escalate the task back to the orchestrator for `general-purpose-opus` routing wh
 - A reasonable implementation attempt fails and the root cause remains unclear
 
 Do not silently continue with a fragile workaround after an escalation condition is
-met. Report the concrete evidence that makes Opus appropriate.
+met. Report the concrete evidence that makes `general-purpose-deep` appropriate.
 
 ## Working Protocol
 
@@ -45,7 +45,7 @@ met. Report the concrete evidence that makes Opus appropriate.
 
 ## Constraints
 
-- Do not perform external web research; route that work to `general-purpose-opus`.
+- Do not perform external web research; route that work to `general-purpose-deep`.
 - Do not redesign architecture without approval.
 - Do not weaken, skip, or delete tests to make checks pass.
 - Do not overwrite unrelated user changes.
@@ -66,5 +66,5 @@ met. Report the concrete evidence that makes Opus appropriate.
 - {check}: {result}
 
 ## Escalation
-{None, or the concrete reason Opus is required}
+{None, or the concrete reason general-purpose-deep is required}
 ```

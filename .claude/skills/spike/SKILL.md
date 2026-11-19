@@ -1,10 +1,10 @@
 ---
 name: spike
 description: |
-  Time-boxed technical investigation/feasibility study with Codex-first multi-agent collaboration (Codex + Opus 4.6 + Agent Teams).
+  Time-boxed technical investigation/feasibility study with Codex-first multi-agent collaboration (Codex + Agent Teams).
   Codex CLI is consulted in EVERY phase for question framing, feasibility analysis, and final evaluation.
   Phase 1: Frame the investigation question & constraints (Claude user interaction + Codex question decomposition).
-  Phase 2: Parallel investigation (Agent Teams: Researcher [Opus external research] + Feasibility Analyst [Codex deep analysis] + optional prototype).
+  Phase 2: Parallel investigation (Agent Teams: Researcher [external research] + Feasibility Analyst [Codex deep analysis] + optional prototype).
   Phase 3: Codex synthesis into go/no-go recommendation & research report.
   Produces a DECISION DOCUMENT, NOT an implementation plan. Use /feature after a GO decision.
 metadata:
@@ -13,7 +13,7 @@ metadata:
 
 # Spike
 
-**Codex-first time-boxed technical investigation skill leveraging Codex deep reasoning, Opus 1M context, and Agent Teams.**
+**Codex-first time-boxed technical investigation skill leveraging Codex deep reasoning, broad external research, and Agent Teams.**
 
 > Preflight: ensure codex CLI is current (see codex-system skill).
 
@@ -44,7 +44,7 @@ This skill handles time-boxed feasibility studies and technical investigations. 
 
 - Bug diagnosis → `/troubleshoot`
 - Known feature to implement → `/feature`
-- Simple library lookup → direct research (Opus subagent)
+- Simple library lookup → direct research (`general-purpose-deep` subagent)
 - Code review → `/team-execute --review-only`
 
 Full skill routing: `AGENTS.md` section "Routing Policy".
@@ -64,7 +64,7 @@ Phase 1: FRAME (Claude Lead + Codex Question Decomposition)
   sub-questions and defines success criteria
     |
 Phase 2: INVESTIGATE (Agent Teams -- Parallel, Codex-driven)
-  Researcher (Opus) <-> Feasibility Analyst (Codex) communicate bidirectionally
+  Researcher <-> Feasibility Analyst (Codex) communicate bidirectionally
   Optional: Codex prototype (danger-full-access) for hands-on validation
     |
 Phase 3: SYNTHESIZE (Codex Evaluation + Claude Lead + User)
@@ -167,9 +167,14 @@ here, and why both teammates are pointed at the path instead of a pasted copy.
 ```
 Create an agent team named `{team_name}` for spike investigation: {slug}
 
-Spawn two teammates:
+Spawn two teammates. Name the agent type for each: a teammate spawned without
+one runs on the default subagent model, with none of the role's tools or
+instructions. Do not ask for a model in the prompt (see Role Routing in
+.claude/skills/team-execute/SKILL.md).
 
-1. **Researcher** -- Uses WebSearch/WebFetch for external research (Opus 1M context)
+1. **Researcher** -- Uses WebSearch/WebFetch for external research
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Researcher for spike: {slug}.
 
    Your job: Gather external evidence to answer the spike's sub-questions.
@@ -224,6 +229,8 @@ Spawn two teammates:
    "
 
 2. **Feasibility Analyst** -- Uses Codex CLI as PRIMARY analysis engine for technical feasibility
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Feasibility Analyst for spike: {slug}.
 
    Your job: Evaluate the technical feasibility of the spike question through deep analysis.
@@ -565,10 +572,10 @@ Paths resolved once in Phase 1 Step 0 (`.claude/skills/_shared/workspace.py --sk
 
 ## Tips
 
-- **Codex-first**: Every phase consults Codex. This is intentional -- Codex excels at structured reasoning about feasibility and trade-offs that complements Opus's broad research capabilities
+- **Codex-first**: Every phase consults Codex. This is intentional -- Codex excels at structured reasoning about feasibility and trade-offs that complements the Researcher's broad external research
 - **Time budget discipline**: Respect the time budget. If investigation is taking too long, Codex can evaluate with partial evidence and mark the verdict as INCONCLUSIVE
 - **Phase 1 is critical**: A well-decomposed question makes Phase 2 much more efficient. Invest time in framing the right sub-questions with Codex
-- **Phase 2**: Agent Teams bidirectional communication allows Researcher (Opus) and Feasibility Analyst (Codex-driven) to converge on evidence-based assessment
+- **Phase 2**: Agent Teams bidirectional communication allows Researcher and Feasibility Analyst (Codex-driven) to converge on evidence-based assessment
 - **Phase 3**: Codex synthesizes all findings into a decision. After a GO decision, proceed to `/feature` -- do NOT start implementation within the spike
 - **PROTOTYPE mode**: Prototype code is throwaway. It lives in `{paths.prototype_dir}` and is NOT production code. Its only purpose is to generate evidence for the decision -- and because that call is the skill's only `danger-full-access` invocation, the acceptance checks after it (`--require prototype_dir` plus `verify_delegation.py`) are not optional
 - **Short-circuit**: If Phase 2 discovers a hard blocker early, short-circuit to Phase 3 immediately. No need to complete all sub-questions if the answer is already clear

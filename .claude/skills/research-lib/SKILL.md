@@ -54,14 +54,14 @@ is the only place a version number lives.
 
 ## Research Items
 
-### Primary Tool: General-Purpose Subagent (Opus)
+### Primary Tool: Deep Subagent (`general-purpose-deep`)
 
-Use `general-purpose-opus` with WebSearch/WebFetch for comprehensive library
+Use `general-purpose-deep` with WebSearch/WebFetch for comprehensive library
 research. Pass the resolved path and version into the prompt:
 
 ```
 Agent tool:
-  subagent_type: "general-purpose-opus"
+  subagent_type: "general-purpose-deep"
   prompt: |
     Research: {library}. Find official documentation, key features,
     constraints, best practices, known issues, and usage patterns.

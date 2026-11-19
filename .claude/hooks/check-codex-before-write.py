@@ -205,7 +205,7 @@ def main():
                         "You SHOULD consult Codex before finalizing this change — it "
                         "catches design problems, better patterns, and hidden coupling "
                         "while they are still cheap to fix. "
-                        "**Recommended**: Use Task tool with subagent_type='general-purpose-opus' "
+                        "**Recommended**: Use Task tool with subagent_type='general-purpose-deep' "
                         "to preserve main context. "
                         "(Direct call OK for quick questions: write the prompt to a file, then "
                         "`python3 .claude/skills/_shared/codex_consult.py --prompt-file <path> "

@@ -2,7 +2,7 @@
 
 Template contracts for the MODE=existing Feature Brief and MODE=greenfield Project Brief.
 Both sections are REQUIRED when the corresponding mode is active.
-`{placeholder}` tokens are filled by the orchestrator from user requirements, Opus codebase scan, and Codex scope assessment.
+`{placeholder}` tokens are filled by the orchestrator from user requirements, the deep subagent codebase scan, and Codex scope assessment.
 
 ---
 
