@@ -1,10 +1,10 @@
 ---
 name: troubleshoot
 description: |
-  Diagnose and plan fixes for errors/bugs with Codex-first multi-agent collaboration (Codex + Opus 4.6 + Agent Teams).
+  Diagnose and plan fixes for errors/bugs with Codex-first multi-agent collaboration (Codex + Agent Teams).
   Codex CLI is consulted in EVERY phase for deep code reasoning, hypothesis evaluation, and fix validation.
-  Phase 1: Error reproduction & context gathering (Opus subagent 1M context + Codex initial analysis + Claude user interaction).
-  Phase 2: Parallel diagnosis (Agent Teams: Root Cause Analyst [Codex-driven] + Impact Investigator [Opus + Codex risk analysis]).
+  Phase 1: Error reproduction & context gathering (deep subagent context analysis + Codex initial analysis + Claude user interaction).
+  Phase 2: Parallel diagnosis (Agent Teams: Root Cause Analyst [Codex-driven] + Impact Investigator [codebase/history search + Codex risk analysis]).
   Phase 3: Fix plan synthesis, Codex validation & user approval.
   Fix implementation is handled separately by /team-execute.
 metadata:
@@ -13,7 +13,7 @@ metadata:
 
 # Troubleshoot
 
-**Codex-first error/bug diagnosis skill leveraging Codex deep reasoning, Opus 1M context, and Agent Teams.**
+**Codex-first error/bug diagnosis skill leveraging Codex deep reasoning, analysis of the full error context, and Agent Teams.**
 
 > Preflight: ensure codex CLI is current (see codex-system skill).
 
@@ -32,12 +32,12 @@ This skill handles the diagnosis phases (Phase 1-3) with a **Codex-first approac
 ## Workflow
 
 ```
-Phase 1: REPRODUCE & UNDERSTAND (Opus 1M context + Codex Initial Analysis + Claude Lead)
-  Opus subagent analyzes the error context, Codex generates initial hypotheses,
+Phase 1: REPRODUCE & UNDERSTAND (Deep Subagent + Codex Initial Analysis + Claude Lead)
+  The deep subagent analyzes the error context, Codex generates initial hypotheses,
   Claude gathers details from the user
     |
 Phase 2: DIAGNOSE (Agent Teams -- Parallel, Codex-driven)
-  Root Cause Analyst (Codex mandatory) <-> Impact Investigator (Opus + Codex) communicate bidirectionally
+  Root Cause Analyst (Codex mandatory) <-> Impact Investigator (Codex-assisted) communicate bidirectionally
   Both teammates consult Codex for deep reasoning throughout analysis
     |
 Phase 3: FIX PLAN & APPROVE (Codex Validation + Claude Lead + User)
@@ -46,11 +46,11 @@ Phase 3: FIX PLAN & APPROVE (Codex Validation + Claude Lead + User)
 
 ---
 
-## Phase 1: REPRODUCE & UNDERSTAND (Opus Subagent + Codex + Claude Lead)
+## Phase 1: REPRODUCE & UNDERSTAND (Deep Subagent + Codex + Claude Lead)
 
-**Reproduce the error and gather full context with Opus subagent's 1M context, then consult Codex for initial hypothesis generation, while Claude interacts with the user.**
+**Reproduce the error and gather full context with the deep subagent (`general-purpose-deep`), which reads it in its own context, then consult Codex for initial hypothesis generation, while Claude interacts with the user.**
 
-> Main orchestrator context is precious. Large-scale error context analysis is delegated to Opus subagent (1M context).
+> Main orchestrator context is precious. Large-scale error context analysis is delegated to the deep subagent.
 > Codex is consulted early for pattern recognition and hypothesis generation.
 
 ### Step 0: Resolve Workspace
@@ -115,12 +115,12 @@ To scope a regression, add `--bisect-good <last-known-good-ref>`. It reports the
 command to start it. The script never checks out a commit itself, so driving the
 bisect stays the Impact Investigator's call in Phase 2.
 
-Then hand that captured context to `general-purpose-opus` for the
+Then hand that captured context to `general-purpose-deep` for the
 **judgment** part — do NOT re-run the command or re-fetch git history:
 
 ```
 Task tool:
-  subagent_type: "general-purpose-opus"
+  subagent_type: "general-purpose-deep"
   prompt: |
     Analyze this reproduced error (already captured by repro.py):
 
@@ -147,8 +147,8 @@ Consult Codex for initial hypothesis generation before creating the Bug Report. 
 Objective: Analyze this error and generate initial hypotheses for root cause.
 Context:
 - Error: {error message / stack trace}
-- Failing location: {file:line from Opus subagent analysis}
-- Execution flow: {call chain from Opus subagent analysis}
+- Failing location: {file:line from deep subagent analysis}
+- Execution flow: {call chain from deep subagent analysis}
 Constraints:
 - Focus on root cause categories (state mutation, boundary, concurrency, dependency, type/contract)
 - Rank hypotheses by likelihood
@@ -200,9 +200,14 @@ it, so it must exist on disk -- not only in this conversation.
 ```
 Create an agent team named `{team_name}` for troubleshooting: {slug}
 
-Spawn two teammates:
+Spawn two teammates. Name the agent type for each: a teammate spawned without
+one runs on the default subagent model, with none of the role's tools or
+instructions. Do not ask for a model in the prompt (see Role Routing in
+.claude/skills/team-execute/SKILL.md).
 
 1. **Root Cause Analyst** — Uses Codex CLI as PRIMARY analysis engine for deep code reasoning
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Root Cause Analyst for bug: {slug}.
 
    Your job: Identify the definitive root cause of this error through deep code analysis.
@@ -341,7 +346,9 @@ Spawn two teammates:
    - {question asked to Codex}: {key insight from response}
    "
 
-2. **Impact Investigator** — Uses Opus with Git history, codebase search, WebSearch, and Codex for risk analysis
+2. **Impact Investigator** — Uses Git history, codebase search, WebSearch, and Codex for risk analysis
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Impact Investigator for bug: {slug}.
 
    Your job: Determine the full scope and impact of this bug, and gather context for the fix.
@@ -634,7 +641,7 @@ Paths resolved once in Phase 1 Step 0 (`.claude/skills/_shared/workspace.py --sk
 | File | Author | Purpose |
 |------|--------|---------|
 | `{paths.bug_report}` | Lead | Bug Report (Phase 1 synthesis) |
-| `{paths.context}` | Opus Subagent | Initial error context analysis |
+| `{paths.context}` | Deep Subagent | Initial error context analysis |
 | `{paths.root_cause}` | Root Cause Analyst | Root cause analysis (Codex-driven) |
 | `{paths.impact}` | Impact Investigator | Impact assessment (with Codex risk analysis) |
 | `.claude/STATE.md` (updated) | Lead | Cross-session bug fix context |
@@ -655,10 +662,10 @@ because in Phases 1-2 it does not exist yet):
 
 ## Tips
 
-- **Codex-first**: Every phase consults Codex. This is intentional -- Codex excels at deep code reasoning and pattern recognition that complements Opus's broad context analysis
+- **Codex-first**: Every phase consults Codex. This is intentional -- Codex excels at deep code reasoning and pattern recognition that complements the deep subagent's analysis of the wider error context
 - **Codex for hypothesis testing**: When hypotheses conflict, ask Codex to evaluate evidence for each. Codex is better at logical reasoning about code behavior than pattern matching
-- **Phase 1**: Opus subagent (1M context) reproduces the error and gathers full context, then Codex generates initial hypotheses, while Claude collects details from the user
-- **Phase 2**: Agent Teams bidirectional communication allows Root Cause Analyst (Codex-driven) and Impact Investigator (Opus + Codex) to converge on the true root cause
+- **Phase 1**: The deep subagent reproduces the error and gathers full context, then Codex generates initial hypotheses, while Claude collects details from the user
+- **Phase 2**: Agent Teams bidirectional communication allows Root Cause Analyst (Codex-driven) and Impact Investigator (Codex-assisted) to converge on the true root cause
 - **Phase 3**: Codex validates the fix plan before presenting to user. After approval, proceed to implementation with `/team-execute`
 - **Competing Hypotheses**: If Phase 2 yields inconclusive results, consider spawning additional teammates with adversarial hypotheses (see the `/team-execute` Phase 2 competing hypotheses pattern)
 - **Quick bugs**: For obvious single-file bugs, skip this skill and fix directly -- use this skill for non-trivial bugs where root cause is unclear

@@ -167,7 +167,7 @@ def main():
                         "You SHOULD have Codex review the implementation before "
                         "reporting it done — it catches bugs, security issues, and "
                         "design flaws while the change is still small. "
-                        "**Recommended**: Use Task tool with subagent_type='general-purpose-opus' "
+                        "**Recommended**: Use Task tool with subagent_type='general-purpose-deep' "
                         "to consult Codex with git diff and preserve main context."
                     ),
                 }

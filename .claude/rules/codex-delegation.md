@@ -58,11 +58,11 @@ Do NOT delegate to Codex when:
 - Obvious one-file tiny edits, typo fixes
 - Tasks that simply follow explicit user instructions
 - git commit, test execution, lint
-- **Routine, well-scoped implementation** → `general-purpose-sonnet`
+- **Routine, well-scoped implementation** → `general-purpose-standard`
 - **Difficult implementation** (ambiguous architecture, cross-cutting invariants,
-  security/concurrency/data-integrity risk, or repeated failure) → `general-purpose-opus`
-- **Codebase analysis** → `general-purpose-opus` (Opus 1M context)
-- **External information retrieval / web research** → `general-purpose-opus` (WebSearch/WebFetch)
+  security/concurrency/data-integrity risk, or repeated failure) → `general-purpose-deep`
+- **Codebase analysis** → `general-purpose-deep` (analysis that needs broad repository context)
+- **External information retrieval / web research** → `general-purpose-deep` (WebSearch/WebFetch)
 
 ## Hook-Detected Triggers
 
@@ -74,7 +74,7 @@ so it fires on read-only commands that merely display error-shaped output.
 
 | Situation | Hook | Suggested route |
 |-----------|------|-----------------|
-| Prompt contains design / debug / uncertainty keywords | `agent-router.py` | Codex, or `general-purpose-opus` |
+| Prompt contains design / debug / uncertainty keywords | `agent-router.py` | Codex, or `general-purpose-deep` |
 | Write/Edit touching design-related or structural code | `check-codex-before-write.py` | Codex design review |
 | Test or build failure | `post-test-analysis.py` | `codex-debugger` |
 | Bash output matches error patterns | `error-to-codex.py` | `codex-debugger` |

@@ -44,7 +44,7 @@ Usage:
     echo "Objective: ..." | python3 codex_consult.py --prompt-stdin
     python3 codex_consult.py --prompt-file p.txt --config model_reasoning_effort=low
     python3 codex_consult.py --prompt-file p.txt --sandbox read-only  # review call
-    python3 codex_consult.py --prompt-file p.txt --caller general-purpose-opus
+    python3 codex_consult.py --prompt-file p.txt --caller general-purpose-deep
 
 Exit codes:
     0  codex exec exited 0 and its output was saved and verified

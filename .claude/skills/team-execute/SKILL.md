@@ -166,16 +166,22 @@ rather than a typo. Feed the same JSON into the per-teammate `Your file
 ownership` block in Step 1-2 so the map that was checked is the map that was
 handed out.
 
-### Model Routing
+### Role Routing
 
-- Use `general-purpose-sonnet` for implementers and the tester by default.
-- Assign `general-purpose-opus` before spawning when a workstream has ambiguous
+Teammates are assigned a *role* (an agent type). Which model a role runs on is
+set in the model manifest (`.claude/skills/_shared/models.json`), so never ask
+for a model in a spawn prompt: a model named there outranks the role's
+definition.
+
+- Use `general-purpose-standard` for implementers and the tester by default.
+- Assign `general-purpose-deep` before spawning when a workstream has ambiguous
   architecture, broad cross-system invariants, subtle security/concurrency/data
   integrity/performance risk, or a history of failed implementation attempts.
-- Do not route by file count alone. Mechanical multi-file work stays on Sonnet when
-  the plan and acceptance criteria are clear.
-- If a Sonnet teammate discovers an escalation condition, have it report concrete
-  evidence, stop that workstream, and reassign the remaining work to Opus.
+- Do not route by file count alone. Mechanical multi-file work stays on
+  `general-purpose-standard` when the plan and acceptance criteria are clear.
+- If a `general-purpose-standard` teammate discovers an escalation condition, have
+  it report concrete evidence, stop that workstream, and reassign the remaining
+  work to `general-purpose-deep`.
 
 ---
 
@@ -195,8 +201,8 @@ Each teammate receives:
 Spawn teammates:
 
 1. **Implementer-{module}** for each module/workstream
-   Agent: `general-purpose-sonnet` by default; `general-purpose-opus` only when the
-   Model Routing criteria above are already met.
+   Agent: `general-purpose-standard` by default; `general-purpose-deep` only when the
+   Role Routing criteria above are already met.
 
    Prompt: "You are implementing {module} for project: {feature}.
 
@@ -221,7 +227,8 @@ Spawn teammates:
      bash .claude/skills/_shared/verify.sh and quote overall; exit 2 means a
      gate failed or no gate ran. No hook does this for you.
    - Communicate with other teammates if you need interface changes
-   - If the task reveals an Opus escalation condition, stop and report the evidence
+   - If the task reveals an escalation condition (see your agent definition),
+     stop and report the evidence
 
    When done with each task, mark it completed in the task list.
 
@@ -240,7 +247,7 @@ Spawn teammates:
    "
 
 2. **Tester** (optional but recommended)
-   Agent: `general-purpose-sonnet` by default.
+   Agent: `general-purpose-standard` by default.
 
    Prompt: "You are the Tester for project: {feature}.
 
@@ -298,8 +305,8 @@ Wait for all teammates to complete their tasks.
 | Teammate not making progress for a long time | Send a message to check, re-instruct if needed |
 | File conflict detected | Reassign file ownership |
 | Tests keep failing | Send message to the relevant Implementer |
-| Sonnet exposes ambiguous or high-risk complexity | Stop that workstream and reassign it to `general-purpose-opus` with the evidence collected so far |
-| Unexpected technical issue | Consult Codex via `general-purpose-opus` |
+| A `general-purpose-standard` teammate exposes ambiguous or high-risk complexity | Stop that workstream and reassign it to `general-purpose-deep` with the evidence collected so far |
+| Unexpected technical issue | Consult Codex via `general-purpose-deep` |
 
 ### Quality Gates — who actually runs them
 
@@ -512,7 +519,7 @@ did not exit `2` (or the user overrode it), and `gather_diff.py` reported
 `scope_empty: false`. Reviewers spawned against an empty `changed_files` list
 produce a clean review of nothing.
 
-Reviewers use `general-purpose-sonnet` by default. Use `general-purpose-opus` for a
+Reviewers use `general-purpose-standard` by default. Use `general-purpose-deep` for a
 review whose dominant risk is subtle security, concurrency, data integrity,
 performance, or cross-system behavior; Quality Reviewer may also consult Codex as
 specified below.
@@ -755,7 +762,7 @@ Clean up the team
 - **Separate Tester**: Having a dedicated Tester separate from Implementers enables a TDD-like workflow
 - **Reviewer specialization**: Each reviewer focuses on a different perspective to prevent blind spots
 - **Codex utilization**: Quality Reviewer delegates complex logic analysis to Codex
-- **Model routing**: Sonnet is the default; use Opus only when ambiguity, risk, or failed attempts justify the additional capability
+- **Role routing**: `general-purpose-standard` is the default; use `general-purpose-deep` only when ambiguity, risk, or failed attempts justify the deeper role
 - **Report persistence**: Save review results in `.claude/docs/research/` for reference during fixes
 - **Competing hypotheses mode**: Adversarial review pattern is effective for bug investigation
 - **Cost awareness**: Each Teammate is an independent Claude instance (high token consumption). 3 reviewers = 3x tokens; for small changes, a subagent-based review is sufficient

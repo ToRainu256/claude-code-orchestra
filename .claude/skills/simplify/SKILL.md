@@ -78,7 +78,7 @@ scopes are independent:
 
 ```
 Task tool:
-  subagent_type: "general-purpose-sonnet"   # general-purpose-opus when the code carries
+  subagent_type: "general-purpose-standard"   # general-purpose-deep when the code carries
                                             # security, concurrency, or data-integrity risk
   prompt: |
     Objective: Simplify {scope path} without changing observable behaviour.

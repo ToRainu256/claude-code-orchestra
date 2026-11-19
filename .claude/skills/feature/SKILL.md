@@ -112,14 +112,15 @@ Ask the user to clarify:
 5. **Success criteria**: How do you determine the feature is complete?
 6. **Final design** (greenfield): What form should the result take?
 
-### Opus Subagent Codebase Scan
+### Deep Subagent Codebase Scan
 
 Main orchestrator context is precious — large-scale codebase scanning is always
-delegated to `general-purpose-opus` (Opus, 1M context):
+delegated to the deep subagent (`general-purpose-deep`), which reads the codebase in its own
+context:
 
 ```
 Task tool:
-  subagent_type: "general-purpose-opus"
+  subagent_type: "general-purpose-deep"
   prompt: |
     Analyze this codebase for feature: {feature description}
 
@@ -182,7 +183,7 @@ instead — called out again at that call site.
 Prompts below show only the prompt body (Objective / Context / Constraints /
 Output format) — that is the file content for `--prompt-file`. MODE=existing
 consultations are **MANDATORY** — do not skip them. The most important input to
-every Codex prompt is the existing codebase patterns from the Opus subagent
+every Codex prompt is the existing codebase patterns from the deep subagent
 scan — always include them.
 
 ### DESIGN.md Update
@@ -292,9 +293,9 @@ All teammates spawned in MODE=greenfield write their work log to
 
 ---
 
-## MODE=existing — Phase 1E: SCOPE (Opus Subagent + Codex + Claude Lead)
+## MODE=existing — Phase 1E: SCOPE (Deep Subagent + Codex + Claude Lead)
 
-**Understand the feature's scope and impact on the existing codebase: run the Opus subagent scan (common protocol, existing task list) and consult Codex for scope and impact analysis, while Claude clarifies requirements with the user (common protocol).**
+**Understand the feature's scope and impact on the existing codebase: run the deep subagent scan (common protocol, existing task list) and consult Codex for scope and impact analysis, while Claude clarifies requirements with the user (common protocol).**
 
 ### Codex Scope & Impact Analysis (MANDATORY)
 
@@ -304,9 +305,9 @@ Via the Codex consult protocol:
 Objective: Analyze the scope and impact of adding this feature to the existing codebase.
 Context:
 - Feature: {feature description}
-- Affected modules: {from Opus subagent analysis}
-- Existing patterns: {from Opus subagent analysis}
-- Dependencies: {from Opus subagent analysis}
+- Affected modules: {from deep subagent analysis}
+- Existing patterns: {from deep subagent analysis}
+- Dependencies: {from deep subagent analysis}
 Constraints:
 - Assess how many files need to change and estimate LOC
 - Classify complexity: SIMPLE (1-3 files, <50 LOC), MODERATE (3-5 files), COMPLEX (5+ files)
@@ -436,9 +437,9 @@ Then update DESIGN.md (common protocol) and continue to Phase 3.
 
 ---
 
-## MODE=greenfield — Phase 1G: UNDERSTAND (Opus Subagent + Claude Lead)
+## MODE=greenfield — Phase 1G: UNDERSTAND (Deep Subagent + Claude Lead)
 
-**Analyze the codebase with the Opus subagent scan (common protocol, greenfield task list) while Claude gathers requirements from the user (common protocol).**
+**Analyze the codebase with the deep subagent scan (common protocol, greenfield task list) while Claude gathers requirements from the user (common protocol).**
 
 ### Create Project Brief
 
@@ -475,9 +476,14 @@ file, so lead and teammates work from the same bytes.
 ```
 Create an agent team for project planning: {feature}
 
-Spawn two teammates:
+Spawn two teammates. Name the agent type for each: a teammate spawned without
+one runs on the default subagent model, with none of the role's tools or
+instructions. Do not ask for a model in the prompt (see Role Routing in
+.claude/skills/team-execute/SKILL.md).
 
-1. **Researcher** — Uses WebSearch/WebFetch for external research (Opus 1M context)
+1. **Researcher** — Uses WebSearch/WebFetch for external research
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Researcher for project: {feature}.
 
    Your job: Research external information needed for this project.
@@ -515,6 +521,8 @@ Spawn two teammates:
    "
 
 2. **Architect** — Uses Codex CLI for design and planning
+   Agent: `general-purpose-deep`
+
    Prompt: "You are the Architect for project: {feature}.
 
    Your job: Use Codex CLI to design the architecture and create implementation plan.
@@ -866,7 +874,7 @@ its JSON) rather than hardcoded here.
 | File | Author | Purpose |
 |------|--------|---------|
 | `.claude/docs/research/feature-{slug}-brief.md` | Lead | Feature / Project Brief — validated with `--contract feature-brief` |
-| `.claude/docs/research/feature-{slug}-codebase.md` | Opus Subagent | Codebase scan |
+| `.claude/docs/research/feature-{slug}-codebase.md` | Deep Subagent | Codebase scan |
 | `.claude/docs/research/{slug}.md` (greenfield) | Researcher | External research findings |
 | `.claude/docs/libraries/{lib}.md` (greenfield) | Researcher | Library documentation |
 | `.claude/docs/DESIGN.md` (updated) | Lead / Architect (Codex-informed) | Architecture decisions |
@@ -882,8 +890,8 @@ its JSON) rather than hardcoded here.
 
 - **Mode first**: The biggest failure mode is picking the wrong path. When ambiguous, always AskUserQuestion — never guess
 - **Codex-first (existing mode)**: Every phase consults Codex. Codex excels at understanding how new code fits into existing patterns and identifying integration risks; early scope classification picks the right implementation route from the start; validation catches missing edge cases and convention violations before implementation begins
-- **Existing patterns**: The most important input to Codex is the existing codebase patterns from the Opus subagent scan — include them in every Codex prompt
-- **Agent Teams (greenfield mode)**: Bidirectional communication lets Researcher (Opus) and Architect (Codex) influence each other in real time
+- **Existing patterns**: The most important input to Codex is the existing codebase patterns from the deep subagent scan — include them in every Codex prompt
+- **Agent Teams (greenfield mode)**: Bidirectional communication lets Researcher and Architect (both `general-purpose-deep`; the Architect drives Codex) influence each other in real time
 - **Complexity routing**: Do not over-engineer simple features. 1-3 file changes should use Codex direct implementation, not Agent Teams
 - **Quality gates**: Every route ends with Completion Verification — `verify.sh` (gate failure or no gate at all is exit `2`) plus `verify_delegation.py` diff evidence. A Codex or teammate summary is input to that check, never a substitute for it
 - **Artifacts, not transcripts**: the brief, the scan, the research file and the work logs are files with contracts. If a phase cannot point at a validated file, the phase did not happen

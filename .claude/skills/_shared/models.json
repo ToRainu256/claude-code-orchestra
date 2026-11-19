@@ -5,8 +5,8 @@
     "main": "fable",
     "subagent_default": "opus",
     "agents": {
-      "general-purpose-sonnet": "opus",
-      "general-purpose-opus": "fable",
+      "general-purpose-standard": "opus",
+      "general-purpose-deep": "fable",
       "codex-debugger": "opus",
       "fable-advisor": "fable"
     }

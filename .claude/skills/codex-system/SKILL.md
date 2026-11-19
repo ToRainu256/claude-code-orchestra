@@ -4,7 +4,7 @@ description: |
   Codex CLI handles planning, design, and complex code implementation.
   Use for: architecture design, implementation planning, complex algorithms,
   debugging (root cause analysis), trade-off evaluation, code review.
-  External research is NOT Codex's job — use general-purpose-opus instead.
+  External research is NOT Codex's job — use general-purpose-deep instead.
   Explicit triggers: "plan", "design", "architecture", "think deeper",
   "analyze", "debug", "complex", "optimize".
 metadata:
@@ -59,7 +59,7 @@ python3 .claude/skills/_shared/codex_consult.py (--prompt-file PATH | --prompt-s
 
 ```
 Task tool parameters:
-- subagent_type: "general-purpose-opus"
+- subagent_type: "general-purpose-deep"
 - run_in_background: true (optional)
 - prompt: |
     Consult Codex about: {topic}
@@ -251,7 +251,7 @@ When the `openai/codex-plugin-cc` plugin is installed, these slash commands are 
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.5-mini --effort medium investigate flaky test
+/codex:rescue --model <model-id> --effort medium investigate flaky test
 /codex:rescue --background investigate the regression
 ```
 
@@ -281,7 +281,7 @@ When the `openai/codex-plugin-cc` plugin is installed, these slash commands are 
 | Background work + tracking | Plugin `--background` |
 | Ad-hoc design question | `codex_consult.py` (direct) |
 | Unrestricted implementation | `codex_consult.py` (the default) + [Verify Before Trusting](#verify-before-trusting) |
-| Subagent delegation | `codex_consult.py` via general-purpose-opus |
+| Subagent delegation | `codex_consult.py` via general-purpose-deep |
 | Consulting Claude Code or Antigravity | `cli_consult.py --cli {claude,antigravity}` |
 
 Plugin routes (the first four rows) leave no wrapper log, no `cli-tools.jsonl` entry, and no record of which files they changed; the `codex_consult.py` routes leave all three. Whichever route made the change, an unrestricted run is verified the same way.

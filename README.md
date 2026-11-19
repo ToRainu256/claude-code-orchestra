@@ -9,8 +9,8 @@ Multi-Agent AI Development Environment
 > The install and update commands below pull from this fork.
 
 ```
-Claude Code (Orchestrator) ─┬─ Opus Subagents (Routine Implementation)
-                             ├─ Fable Subagents (Research, Analysis, Difficult Implementation)
+Claude Code (Orchestrator) ─┬─ general-purpose-standard (Routine Implementation)
+                             ├─ general-purpose-deep (Research, Analysis, Difficult Implementation)
                              └─ Codex CLI (Planning & Complex Code)
 ```
 
@@ -69,7 +69,7 @@ claude
 
 The [`claude-only`](https://github.com/DeL-TaiseiOzaki/claude-code-orchestra/tree/claude-only)
 branch is a variant that does not use Codex CLI or Antigravity: Codex's planning,
-design, review, and debugging roles are handled by Claude Opus subagents, so only
+design, review, and debugging roles are handled by Claude subagents, so only
 `claude` needs to be installed. This edition lives in the upstream repository and
 is not maintained in this fork, so the command below installs it from upstream.
 Install it into an existing Git repository with:
@@ -155,6 +155,25 @@ the template once shipped (it drifted), but a value the project set itself in
 reads the manifest at run time and passes model and effort explicitly;
 `--model` and a `CODEX_MODEL` environment variable still override it per call.
 
+| Role | Manifest key | What it does |
+|------|--------------|--------------|
+| Main agent | `claude.main` | User interaction, routing, integration |
+| Default subagent | `claude.subagent_default` | Any subagent or teammate spawned without an agent type |
+| `general-purpose-standard` | `claude.agents.general-purpose-standard` | Routine, well-scoped implementation |
+| `general-purpose-deep` | `claude.agents.general-purpose-deep` | Research, large-scale analysis, difficult implementation, design judgment |
+| `codex-debugger` | `claude.agents.codex-debugger` | Root-cause analysis through Codex |
+| `fable-advisor` | `claude.agents.fable-advisor` | Independent fresh-context judgment (escalation) |
+| Codex CLI | `codex.model`, `codex.reasoning_effort` | Design, planning, complex implementation |
+
+This README, like every other document here, names roles and never models: the
+current assignment is whatever the manifest says, and
+`python3 .claude/skills/_shared/models.py get claude.main` (or any key above)
+prints it. In this template `scripts/check.sh` also runs
+`.claude/skills/_shared/models_lint.py`, which fails on a model name in any file
+git tracks or would add, outside the manifest and a short list of reasoned
+exemptions (history, test fixtures, the tools that define the names), so a
+model change stays a one-file edit with no stale text left behind.
+
 `scripts/update.sh` runs the same `apply` in an installed project, so a model
 change reaches it on its next update. In the two project-owned files a key is
 advanced only when it is absent or still holds a value the template once
@@ -177,26 +196,26 @@ below is a non-normative overview of the default setup.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│       Claude Code (Orchestrator — Fable)                    │
+│       Claude Code (Orchestrator)                            │
 │       → Context conservation is top priority                │
 │       → Handles user interaction, coordination, concise edits│
 │                          │                                  │
 │  ┌───────────────────────┼──────────────────────────────┐   │
 │  │  Tier 1 — Default     │                              │   │
 │  │  ┌────────────────────┴─────────────────────────┐    │   │
-│  │  │ general-purpose-sonnet: routine impl.        │    │   │
-│  │  │ general-purpose-opus: research / hard impl.  │    │   │
+│  │  │ general-purpose-standard: routine impl.      │    │   │
+│  │  │ general-purpose-deep: research / hard impl.  │    │   │
 │  │  │ codex-debugger: error analysis               │    │   │
 │  │  └──────────────────────────────────────────────┘    │   │
 │  │                       │                              │   │
 │  │  ┌────────────────────┴─────────────────────────┐    │   │
 │  │  │ Tier 2 — Sol                                 │    │   │
-│  │  │ Codex CLI  (model, effort: models.json)     │    │   │
+│  │  │ Codex CLI  (model, effort: models.json)      │    │   │
 │  │  │ → Design, planning, complex code, debugging  │    │   │
 │  │  └──────────────────────────────────────────────┘    │   │
 │  │                       │                              │   │
 │  │  ┌────────────────────┴─────────────────────────┐    │   │
-│  │  │ Tier 3 — Fable  (rare escalation authority)  │    │   │
+│  │  │ Tier 3 — Fable  (independent judgment)       │    │   │
 │  │  │ → Arbitration, stuck problems, final review  │    │   │
 │  │  │ → May land the resolution; notes to reviews/ │    │   │
 │  │  └──────────────────────────────────────────────┘    │   │
@@ -260,7 +279,8 @@ reached through a symlink.
 └── scripts/
     ├── check.sh                # Contract, bootstrap, model, and tier coherence checker
     ├── install.sh              # Conflict-aware installer for existing projects
-    └── update.sh               # Template update script
+    ├── update.sh               # Template update script
+    └── rename-roles.py         # Template maintenance only (never installed): the role-rename codemod (check / --apply)
 ```
 
 Every CLI runtime auto-loads root `AGENTS.md`, which is self-contained: response
@@ -289,8 +309,8 @@ The main workflow executes two skills in sequence.
 ```
 
 1. **Mode determination**: existing (Codex-direct design) or greenfield (Agent Teams research & design)
-2. **Opus subagent** analyzes the codebase (1M context) + **Claude** conducts requirements gathering with the user
-3. Existing mode: **Codex** designs, plans, and validates. Greenfield mode: **Agent Teams** — Researcher (Opus) and Architect (Codex) work in parallel
+2. **`general-purpose-deep` subagent** analyzes the codebase in its own context + **Claude** conducts requirements gathering with the user
+3. Existing mode: **Codex** designs, plans, and validates. Greenfield mode: **Agent Teams** — Researcher and Architect (Codex-driven) work in parallel
 4. **Claude** integrates research and design, then presents the plan to the user
 5. After approval, `/team-execute` runs parallel implementation by module, then parallel review for security, quality, and testing (`--review-only` skips implementation)
 
@@ -316,8 +336,8 @@ One entry point for feature work, with two modes (merger of the old `/add-featur
 ```
 
 **Modes:**
-- **existing** (formerly `/add-feature`) — Codex-first addition to an established codebase: Opus subagent + Codex scope & impact analysis, then Codex architecture design, implementation plan, and validation
-- **greenfield** (formerly `/start-feature`) — large/new feature requiring external research: Opus subagent codebase analysis, then Agent Teams (Researcher [Opus] + Architect [Codex]) perform parallel research & design
+- **existing** (formerly `/add-feature`) — Codex-first addition to an established codebase: `general-purpose-deep` subagent + Codex scope & impact analysis, then Codex architecture design, implementation plan, and validation
+- **greenfield** (formerly `/start-feature`) — large/new feature requiring external research: `general-purpose-deep` subagent codebase analysis, then Agent Teams (Researcher + Architect [Codex]) perform parallel research & design
 
 **Shared complexity-based routing:**
 - SIMPLE (1-3 files, <50 LOC) → Direct Codex implementation
@@ -353,7 +373,7 @@ A Codex-first, time-boxed technical investigation. Produces a **decision documen
 
 **Workflow:**
 1. **Claude + Codex** → Frame investigation questions & define constraints
-2. **Agent Teams** → Researcher (Opus external research) and Feasibility Analyst (Codex deep analysis) investigate in parallel
+2. **Agent Teams** → Researcher (external research) and Feasibility Analyst (Codex deep analysis) investigate in parallel
 3. **Codex** → Synthesize into go/no-go recommendation & produce research report
 
 > After a GO decision, proceed to implementation with `/feature`
@@ -400,8 +420,8 @@ Diagnoses errors and creates fix plans through multi-agent coordination centered
 ```
 
 **Workflow:**
-1. **Opus subagent + Codex** → Error reproduction & context collection
-2. **Agent Teams** → Root Cause Analyst (Codex-driven) and Impact Investigator (Opus + Codex) diagnose in parallel
+1. **`general-purpose-deep` subagent + Codex** → Error reproduction & context collection
+2. **Agent Teams** → Root Cause Analyst (Codex-driven) and Impact Investigator (Codex-assisted) diagnose in parallel
 3. **Claude + Codex** → Fix plan integration & user approval
 
 ### Agent Delegation
@@ -514,6 +534,39 @@ rm -rf "$template_dir"
   print a reminder when this applies (updating from v0.2.0 does not, so run
   twice when upgrading to v0.3.0)
 
+#### Upgrading to 1.1.0
+
+1.1.0 moves every model choice into `.claude/skills/_shared/models.json` and
+renames two subagent roles after what they do. Their old names ended in a model
+family; the routine-implementation role is now
+`general-purpose-standard`, and the research / analysis / difficult-implementation
+role is `general-purpose-deep`. After the update:
+
+- The old agent definitions are gone and the renamed ones are in place. The
+  rename itself has no opt-out. Rename any reference to an old role name in
+  files your project owns (`.claude/STATE.md`, `.claude/docs/DESIGN.md`, your
+  own prompts and scripts): a delegation to an old name fails, because that
+  agent no longer exists.
+- The main-agent model and the default subagent model now follow the manifest,
+  unless your project had set them itself. If your `scripts/update.sh` predates
+  the manifest this happens on the second update run (see above).
+- `.claude/settings.json` now carries a `model` key, and a project setting
+  outranks each developer's own `/model` default. A developer who wants another
+  main model sets it in `.claude/settings.local.json`; a project that does not
+  want the key managed puts `{"schema_version": 1, "claude": {"main": null}}`
+  in `.claude/models.local.json`, or opts both settings files out with
+  `"manage_native_settings": false` there.
+- To choose your own models, create `.claude/models.local.json` (see the model
+  section above). An override that still uses an old role name as a key is
+  refused, and one such key blocks the whole apply: no model is written
+  anywhere, the agent definitions keep the template's models, and the rest of
+  your override is not in effect. The message names the key; rename it (for
+  example `"general-purpose-deep"` in place of the old deep-role name) and run
+  `python3 .claude/skills/_shared/models.py apply`.
+
+The full release note, with the old → new name table, is in
+[`TEMPLATE_DESIGN_LOG.md`](TEMPLATE_DESIGN_LOG.md#110-2026-11-18).
+
 ### Tech Stack
 
 | Tool | Purpose |
@@ -549,7 +602,7 @@ Automation hooks execute agent coordination and quality checks at the appropriat
 
 | Hook | Trigger | Action |
 |--------|----------|------|
-| `agent-router.py` | User input | Suggests routing to Codex / Opus subagent |
+| `agent-router.py` | User input | Suggests routing to Codex, `general-purpose-deep`, or `fable-advisor` |
 | `lint-on-save.py` | File save | Auto-runs lint |
 | `check-codex-before-write.py` | Before file write | Suggests consulting Codex |
 | `check-codex-after-plan.py` | After Task execution | Suggests Codex review after planning/design tasks |

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -62,6 +64,48 @@ def test_detect_agent_with_two_character_japanese_prompt_still_routes():
     """The deleted `len(prompt) < 3` gate skipped exactly this prompt."""
     agent, trigger = agent_router.detect_agent("設計")
     assert (agent, trigger) == ("codex", "設計")
+
+
+def router_hint(prompt: str) -> str:
+    """Run the hook as Claude Code does and return the hint it injects."""
+    result = subprocess.run(
+        [sys.executable, str(HOOKS_DIR / "agent-router.py")],
+        input=json.dumps({"prompt": prompt}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_research_ask_is_routed_to_the_deep_role_by_name():
+    """The hint is what the routing agent reads, so it names the role to
+    spawn. Which model that role runs on is the manifest's business."""
+    agent, trigger = agent_router.detect_agent("research the retry library")
+    assert (agent, trigger) == ("deep-research", "research")
+
+    hint = router_hint("research the retry library")
+
+    assert hint.startswith("[Deep Research] ")
+    assert "subagent_type='general-purpose-deep'" in hint
+
+
+def test_escalation_hint_describes_the_advisor_as_the_tier_defines_it():
+    """The hint used to call the advisor read-only, contradicting its tier
+    definition, and "rare" as if the model behind it were the scarce part."""
+    agent, trigger = agent_router.detect_agent("we are stuck, settle this")
+    assert agent == "fable"
+
+    hint = router_hint("we are stuck, settle this")
+
+    assert "fable-advisor" in hint
+    assert "independent, fresh-context judgment" in hint
+    assert "may land the resolution" in hint
+    assert "verified like any other tier" in hint
+    assert "read-only" not in hint
+    assert "never" not in hint
+    assert "rare" not in hint
 
 
 # --- check-codex-before-write.py -------------------------------------------

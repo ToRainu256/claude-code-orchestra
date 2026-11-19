@@ -76,8 +76,8 @@ default is to delegate, and working alone is the exception. Before the first
 1. Does the whole task fall on the **Self-Handle List** (answer from loaded
    context · one known file, ~20 lines or fewer · a named gate or a
    skill-bundled lead script · user interaction)? If yes, do it directly.
-2. Otherwise name the route from the rule's table — `general-purpose-sonnet`,
-   `general-purpose-opus`, `codex-debugger`, Codex, `fable-advisor` — or the
+2. Otherwise name the route from the rule's table — `general-purpose-standard`,
+   `general-purpose-deep`, `codex-debugger`, Codex, `fable-advisor` — or the
    skill that owns the workflow, and delegate with all six elements of the
    Subagent Prompt Contract.
 3. Split independent units and launch them **in one message** so they run in

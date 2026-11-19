@@ -186,6 +186,57 @@ check_model_coherence() {
 check "Model coherence" check_model_coherence
 
 # --------------------------------------------------------------------------
+# 3b) A model is named in the manifest and nowhere else. `models_lint.py`
+#     scans every file git tracks or would add and fails on a model ID, a
+#     versioned model name, a bare model-family word, or a retired role name
+#     outside its reasoned exemptions, so prose cannot keep a second, stale
+#     copy of what the manifest says.
+#
+#     This is a gate on the text this repository authors, so it runs in the
+#     template only. In an installed project the template-owned files are
+#     copies that already passed it here, and everything else (README, design
+#     docs, state) is the project's own to word as it likes.
+#
+#     What tells the two apart is .claude/orchestra-version, which the
+#     installer writes. Committed to the template by mistake, that file would
+#     switch this check and the strict half of check 3 off without a word, so
+#     its presence beside a file that is never installed (the design log or
+#     the rename codemod) fails this check instead.
+# --------------------------------------------------------------------------
+check_model_names() {
+    local lint="${ROOT}/.claude/skills/_shared/models_lint.py"
+    if [[ ! -f "${lint}" ]]; then
+        echo "  .claude/skills/_shared/models_lint.py not found"
+        return 1
+    fi
+    if ! command -v python3 > /dev/null 2>&1; then
+        echo "  python3 is required to lint for model names"
+        return 1
+    fi
+
+    local report status=0
+    report="$(python3 "${lint}" --project-root "${ROOT}" 2>&1 > /dev/null)" ||
+        status=$?
+    local line
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] || echo "  ${line}"
+    done <<< "${report}"
+    ((status == 0))
+}
+check_template_is_not_marked_installed() {
+    echo "  .claude/orchestra-version exists in the template repository;"
+    echo "  it marks an installed project and turns the template-only checks off."
+    echo "  Remove it: git rm -f .claude/orchestra-version"
+    return 1
+}
+if [[ ! -e "${ROOT}/.claude/orchestra-version" ]]; then
+    check "Model names only in the manifest" check_model_names
+elif [[ -e "${ROOT}/TEMPLATE_DESIGN_LOG.md" ||
+    -e "${ROOT}/scripts/rename-roles.py" ]]; then
+    check "Model names only in the manifest" check_template_is_not_marked_installed
+fi
+
+# --------------------------------------------------------------------------
 # 4) Template-owned runtime subdirectories are listed in SAFE_DIRS
 # --------------------------------------------------------------------------
 check_safe_dirs() {

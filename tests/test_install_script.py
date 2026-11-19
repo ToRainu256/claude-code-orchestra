@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -40,6 +41,28 @@ def run_install(
     )
 
 
+def copy_local_excludes(template: Path) -> None:
+    """Carry this checkout's `.git/info/exclude` over to the scratch template.
+
+    The copy below takes the whole working directory, including files a
+    developer keeps here but excludes locally (notes, plans). They are not
+    template content, and the real repository would never commit them; without
+    the same excludes the scratch one would, and the gates would judge them.
+    """
+    located = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--git-path", "info/exclude"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    source = REPO_ROOT / located.stdout.strip()
+    if located.returncode != 0 or not source.is_file():
+        return
+    target = template / ".git" / "info" / "exclude"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
 def build_template_repo(tmp_path: Path, name: str = "template") -> Path:
     """Copy this repository into a fresh git repo so scripts under test can
     be run against a template source distinct from the live checkout."""
@@ -57,6 +80,7 @@ def build_template_repo(tmp_path: Path, name: str = "template") -> Path:
         ),
     )
     subprocess.run(["git", "init", "-q", str(template)], check=True)
+    copy_local_excludes(template)
     subprocess.run(
         ["git", "-C", str(template), "config", "user.email", "test@example.com"],
         check=True,
@@ -400,7 +424,7 @@ def test_force_install_backs_up_existing_native_subagents_and_skills(
     ) == "user's own subagent\n"
     assert (target / ".claude/agents").is_dir()
     assert not (target / ".claude/agents").is_symlink()
-    assert (target / ".claude/agents/general-purpose-opus.md").is_file()
+    assert (target / ".claude/agents/general-purpose-deep.md").is_file()
 
 
 def test_install_retires_a_legacy_claude_md_symlink(tmp_path: Path) -> None:
@@ -1027,6 +1051,130 @@ def test_the_template_gate_rejects_what_only_a_project_may_have(
     assert run_gate(template).returncode == 0
 
 
+def test_the_template_gate_rejects_a_model_name_in_prose(tmp_path: Path) -> None:
+    """A sentence that names a model is a copy of the manifest nobody updates.
+    The gate reports it by file and line, in the template only: once installed,
+    a project's README is its own to word."""
+    template, target = install_from_template(tmp_path)
+    readme = template / "README.md"
+    pristine = readme.read_text(encoding="utf-8")
+    readme.write_text(pristine + "\nBuilt for Opus 4.6.\n", encoding="utf-8")
+    line_number = pristine.count("\n") + 2
+
+    in_template = run_gate(template)
+    readme.write_text(pristine, encoding="utf-8")
+
+    assert in_template.returncode == 1, in_template.stdout
+    assert "FAIL: Model names only in the manifest" in in_template.stdout
+    assert f"lint: README.md:{line_number}: versioned-name" in in_template.stdout
+    assert run_gate(template).returncode == 0
+
+    (target / "README.md").write_text("Built for Opus 4.6.\n", encoding="utf-8")
+    in_project = run_gate(target)
+
+    assert in_project.returncode == 0, in_project.stdout + in_project.stderr
+    assert "Model names only in the manifest" not in in_project.stdout
+
+
+def test_the_template_is_not_marked_as_an_installed_project() -> None:
+    """`.claude/orchestra-version` is how `scripts/check.sh` tells an installed
+    project from the template, and so what switches the template-only checks
+    off. Committed here, it would turn them off for the template itself."""
+    assert not (REPO_ROOT / ".claude/orchestra-version").exists()
+    assert not os.path.lexists(REPO_ROOT / ".claude/orchestra-version")
+
+
+def test_the_gate_fails_a_template_that_carries_the_install_marker(
+    tmp_path: Path,
+) -> None:
+    """The marker must not be able to switch the gate off quietly: with it,
+    a model name in the template's own prose would otherwise pass."""
+    template = build_template_repo(tmp_path)
+    readme = template / "README.md"
+    readme.write_text(
+        readme.read_text(encoding="utf-8") + "\nBuilt for Opus 4.6.\n",
+        encoding="utf-8",
+    )
+    (template / ".claude/orchestra-version").write_text("1.1.0\n", encoding="utf-8")
+
+    result = run_gate(template)
+
+    assert result.returncode == 1, result.stdout
+    assert "FAIL: Model names only in the manifest" in result.stdout
+    assert ".claude/orchestra-version exists in the template repository" in (
+        result.stdout
+    )
+
+
+def test_update_replaces_the_renamed_role_definitions(
+    tmp_path: Path, models_module: ModuleType, resolved_models: dict[str, Any]
+) -> None:
+    """A project installed before the rename holds the two definitions under
+    their old names. After an update they must be gone, not left beside the
+    new ones: two definitions of one role would split routing between them."""
+    template, target = install_from_template(tmp_path)
+    renames = models_module.LEGACY_AGENT_NAMES
+    agents = target / ".claude/agents"
+    for old, new in renames.items():
+        (agents / f"{new}.md").rename(agents / f"{old}.md")
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    assert sorted(path.stem for path in agents.glob("*.md")) == sorted(
+        resolved_models["claude"]["agents"]
+    )
+    for old, new in renames.items():
+        assert not (agents / f"{old}.md").exists()
+        definition = (agents / f"{new}.md").read_text(encoding="utf-8")
+        assert f"\nname: {new}\n" in definition
+        assigned = resolved_models["claude"]["agents"][new]
+        assert f"\nmodel: {assigned}\n" in definition
+    assert run_gate(target).returncode == 0
+    # The codemod that performed the rename is a template tool, never shipped.
+    assert (template / "scripts/rename-roles.py").is_file()
+    assert not (target / "scripts/rename-roles.py").exists()
+
+
+def test_update_refuses_an_override_that_still_uses_an_old_role_name(
+    tmp_path: Path, models_module: ModuleType
+) -> None:
+    """The override names an agent that no longer exists. Ignoring the entry
+    would drop the project's model choice without a word, so the update says
+    which key to rename, applies nothing, and the project's gate stays red
+    until it is fixed."""
+    template, target = install_from_template(tmp_path)
+    old, new = next(iter(models_module.LEGACY_AGENT_NAMES.items()))
+    override_model = "haiku"
+    override_path = target / MODELS_LOCAL_REL
+    override_path.write_text(
+        json.dumps({"schema_version": 1, "claude": {"agents": {old: override_model}}}),
+        encoding="utf-8",
+    )
+
+    update_result = run_update(target, template)
+
+    assert update_result.returncode == 0, update_result.stderr
+    assert f"the agent {old} was renamed to {new}" in update_result.stdout
+    assert f'rename the key "{old}"' in update_result.stdout
+    assert "models.local.json is not in effect" in update_result.stdout
+    definition = target / ".claude/agents" / f"{new}.md"
+    assert f"\nmodel: {override_model}\n" not in definition.read_text(encoding="utf-8")
+    gate = run_gate(target)
+    assert gate.returncode == 1
+    assert "FAIL: Model coherence" in gate.stdout
+    assert f"renamed to {new}" in gate.stdout
+
+    # Renaming the key, as the message says, is the whole fix.
+    override_path.write_text(
+        json.dumps({"schema_version": 1, "claude": {"agents": {new: override_model}}}),
+        encoding="utf-8",
+    )
+    assert run_update(target, template).returncode == 0
+    assert f"\nmodel: {override_model}\n" in definition.read_text(encoding="utf-8")
+    assert run_gate(target).returncode == 0
+
+
 def test_install_ignores_the_model_tools_temporary_files(tmp_path: Path) -> None:
     """A run that is killed outright leaves a temporary copy of a settings
     file behind. It must not be one `git add -A` away from a commit."""
@@ -1195,7 +1343,7 @@ def test_install_creates_real_runtime_directories(tmp_path: Path) -> None:
         assert not any(path.is_symlink() for path in (target / directory).iterdir())
     for legacy in ("rules", "skills", "agents", "hooks", "docs"):
         assert not (target / ".agents" / legacy).exists()
-    assert (target / ".claude/agents/general-purpose-opus.md").is_file()
+    assert (target / ".claude/agents/general-purpose-deep.md").is_file()
     assert (target / ".claude/skills/context-loader/SKILL.md").is_file()
     assert not any(path.is_symlink() for path in (target / ".codex").iterdir())
     assert ".claude/hooks/" in (target / ".claude/settings.json").read_text(
