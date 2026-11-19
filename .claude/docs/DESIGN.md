@@ -60,7 +60,7 @@
 | Performance | | |
 | Availability | A new model release reaches installed projects quickly without hand-editing | One manifest edit, re-applied by the updater |
 | Security | No secrets in the repository; delegated runs are verified before they are trusted; a target project is never committed to by automation | Guardrails in root `AGENTS.md`; `verify_delegation.py` on every delegated change |
-| Maintainability | A model is named in exactly one place, and the gate fails when prose or code names one elsewhere | `models_lint.py` exit 0 inside `bash scripts/check.sh` (10 checks passed) |
+| Maintainability | A model is named in exactly one place, and the gate fails when prose or code names one elsewhere | `models_lint.py` exit 0 inside `bash scripts/check.sh` |
 | Portability | Scripts run with the system tools of both macOS (BSD) and Linux (GNU); bundled Python scripts use the standard library only | Both required CI gates (ubuntu, macos) green on `main` |
 
 ## アーキテクチャ (Architecture)
