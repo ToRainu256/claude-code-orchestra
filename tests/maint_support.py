@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import hashlib
 import json
 import os
 import pty
@@ -78,22 +79,28 @@ SEED_IN_SCAFFOLD = "scripts/scaffold/STATE.md"
 if str(MAINT_DIR) not in sys.path:
     sys.path.insert(0, str(MAINT_DIR))
 
+import adopt  # noqa: E402
 import bump  # noqa: E402
 import common  # noqa: E402
+import distribute  # noqa: E402
 import gh  # noqa: E402
 import model_watch  # noqa: E402
 import promote  # noqa: E402
 import report  # noqa: E402
 import run as maint_run  # noqa: E402
+import targets  # noqa: E402
 
 MODULES: tuple[ModuleType, ...] = (
+    adopt,
     bump,
     common,
+    distribute,
     gh,
     promote,
     model_watch,
     report,
     maint_run,
+    targets,
 )
 
 # The git stand-in. `{real}` is the real git, `{bare}` the scratch fork.
@@ -521,6 +528,35 @@ def run_models(root: Path, args: list[str]) -> dict:
     return json.loads(done.stdout)
 
 
+JUNK = shutil.ignore_patterns("__pycache__", ".DS_Store", "*.pyc")
+REAL_UPDATER = REPO_ROOT / "scripts" / "update.sh"
+INSTALLER = REPO_ROOT / "scripts" / "install.sh"
+PROJECT_IGNORE = "__pycache__/\n*.pyc\n.DS_Store\n"
+
+
+def shipped_by_the_real_updater() -> list[str]:
+    """Every path the real ``scripts/update.sh`` copies or compares."""
+    text = REAL_UPDATER.read_text(encoding="utf-8")
+    found: list[str] = []
+    for name in promote.SHIPPED_ARRAYS:
+        found.extend(promote.parse_bash_array(text, name) or ())
+    return found
+
+
+def _seed_real_template(seed: Path) -> None:
+    """The template as this checkout ships it: every path the real updater
+    reads from a template, the seeds, the version and the maintenance code."""
+    for rel in [*shipped_by_the_real_updater(), "scripts/scaffold", "VERSION"]:
+        source, target = REPO_ROOT / rel, seed / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, ignore=JUNK)
+        else:
+            shutil.copy2(source, target)
+    shutil.copytree(MAINT_DIR, seed / "scripts" / "maint", ignore=JUNK)
+    (seed / "README.md").write_text("# scratch fork\n", encoding="utf-8")
+
+
 def _seed_tree(seed: Path, with_code: bool, updater_seed: str) -> None:
     """A minimal template: the real model locations, moved to a fixture slug."""
     for rel in (MANIFEST_REL, ".claude/settings.json", CONFIG_REL):
@@ -562,7 +598,9 @@ def init_job_clone(clone: Path) -> None:
 
 
 @functools.cache
-def _template_world(with_code: bool, updater_seed: str) -> Path:
+def _template_world(
+    with_code: bool, updater_seed: str, real_template: bool = False
+) -> Path:
     """The three repositories of a scratch world, built once per layout."""
     root = Path(tempfile.mkdtemp(prefix="maint-world-")) / "world"
     atexit.register(shutil.rmtree, str(root.parent), ignore_errors=True)
@@ -576,7 +614,10 @@ def _template_world(with_code: bool, updater_seed: str) -> Path:
     subprocess.run([REAL_GIT, "init", "--quiet", str(seed)], check=True)
     git(seed, "checkout", "--quiet", "-b", "main")
     git(seed, "remote", "add", "origin", str(bare))
-    _seed_tree(seed, with_code, updater_seed)
+    if real_template:
+        _seed_real_template(seed)
+    else:
+        _seed_tree(seed, with_code, updater_seed)
     git(seed, "add", "-A")
     git(seed, "commit", "--quiet", "-m", "seed")
     git(seed, "push", "--quiet", "origin", "HEAD:main")
@@ -585,10 +626,15 @@ def _template_world(with_code: bool, updater_seed: str) -> Path:
 
 
 def make_fork(
-    tmp_path: Path, with_code: bool = False, updater_seed: str = SEED_IN_SCAFFOLD
+    tmp_path: Path,
+    with_code: bool = False,
+    updater_seed: str = SEED_IN_SCAFFOLD,
+    real_template: bool = False,
 ) -> Fork:
     """Build the scratch world. The clone is approved at the fork's first
-    commit, and the catalog lists the current slug only."""
+    commit, and the catalog lists the current slug only. With
+    ``real_template`` the fork carries the template this checkout ships and
+    the real updater, instead of the minimal stand-ins."""
     root = tmp_path / "world"
     bare = root / "fork.git"
     seed = root / "seed"
@@ -596,7 +642,8 @@ def make_fork(
     bin_dir = root / "bin"
     # Building the repositories costs a dozen processes, so each layout is
     # built once per session and copied; only the absolute paths are rewired.
-    shutil.copytree(_template_world(with_code, updater_seed), root, symlinks=True)
+    world = _template_world(with_code, updater_seed, real_template)
+    shutil.copytree(world, root, symlinks=True)
     bin_dir.mkdir()
     git(seed, "remote", "set-url", "origin", str(bare))
     paths = common.Paths(state_root)
@@ -708,3 +755,48 @@ def plant_shadow_tag(fork: Fork, commit: str, in_clone: bool) -> None:
     if in_clone:
         refspec = "refs/tags/origin/main:refs/tags/origin/main"
         git(fork.paths.clone, "fetch", "--quiet", str(fork.bare), refspec)
+
+
+@functools.cache
+def _installed_project() -> Path:
+    """A project the real installer put the template into, with everything
+    committed. Built once per session and copied."""
+    root = Path(tempfile.mkdtemp(prefix="maint-project-"))
+    atexit.register(shutil.rmtree, str(root), ignore_errors=True)
+    project = root / "project"
+    project.mkdir()
+    subprocess.run([REAL_GIT, "init", "--quiet", str(project)], check=True)
+    git(project, "checkout", "--quiet", "-b", "main")
+    (project / "README.md").write_text("# a project\n", encoding="utf-8")
+    (project / ".gitignore").write_text(PROJECT_IGNORE, encoding="utf-8")
+    done = subprocess.run(
+        ["/bin/bash", str(INSTALLER), "--yes", str(project)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    git(project, "add", "-A")
+    git(project, "commit", "--quiet", "-m", "install the template")
+    return project
+
+
+def make_project(directory: Path) -> Path:
+    """A clean project with the template installed, at ``directory``."""
+    shutil.copytree(_installed_project(), directory, symlinks=True)
+    return directory
+
+
+def tree_digest(root: Path) -> dict[str, str]:
+    """Every path below ``root``, the repository's own files included, with
+    what it holds: two equal digests are a byte-identical tree."""
+    found: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        rel = str(path.relative_to(root))
+        if path.is_symlink():
+            found[rel] = f"link:{os.readlink(path)}"
+        elif path.is_file():
+            found[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            found[rel] = "dir"
+    return found

@@ -54,8 +54,12 @@ Merging and promoting are separate.
   command output are shown with every character that is not printable ASCII
   replaced by a visible escape (`\x1b`, `‮`; `?` in the shell files), so
   nothing merged into the fork can redraw the screen above a prompt.
-- **Approvals are typed at a terminal.** `install` and `promote` refuse a
-  piped answer.
+- **Approvals are typed at a terminal.** `install`, `promote` and `adopt`
+  refuse a piped answer.
+- **A project is somebody's repository, and nothing of it is executed.** The
+  job reads a project with five git subcommands that only read, refuses one
+  whose own git configuration holds anything but inert keys, and runs the
+  updater on a private copy, never in the project. See Distribution.
 - No token is stored anywhere. The plist carries a `PATH`, a locale and one
   Python flag.
 
@@ -72,8 +76,14 @@ Merging and promoting are separate.
 | `~/.claude/orchestra/state/last-run.json` | Summary that `status` prints | each run |
 | `~/.claude/orchestra/state/last-good-rev` | Last revision the launcher could check out | launcher |
 | `~/.claude/orchestra/state/bump-records.json` | The model bumps this Mac built and tested | `model-watch` |
+| `~/.claude/orchestra/state/distribution.json` | The projects adopted for updates, and what the last run found for each listed one | `adopt`, `distribute` |
+| `~/.claude/orchestra/logs/maint/<UTC stamp>.adopt.log` | Every path one `adopt` screen stood for, one per line; pruned with the run logs | `adopt` |
 | `~/.claude/orchestra/state/launcher-failure` | Present only while the launcher is failing | launcher |
 | `~/.claude/orchestra/run/` | `maint.lock`, scratch worktrees (removed after use) | each run |
+
+`~/.claude/orchestra/targets.txt` is not created here. It is the owner's list
+of installed projects (the `sync-orche` skill keeps it), and the job only
+reads it.
 
 The job itself writes nothing into the developer checkout, `~/.codex`,
 `~/.config/gh` or a shell profile. It does run the `gh` and `codex` programs,
@@ -90,11 +100,13 @@ next wake. The launcher makes three attempts at the fetch, 20 seconds apart.
 |------|-----------|------------------------|
 | launcher | The clone: fetch of the default branch, forced checkout of the approved SHA (or, for `promote` and `status` only, of the last one that could be checked out), `git clean`; `last-good-rev`, `launcher-failure` | — |
 | `promote` | `state/approved-rev`, in the two automatic cases only | — |
+| `distribute` | In each adopted project: the template's own paths, the model keys of its two settings files, a missing seed file; always left uncommitted. A scratch worktree and copies under `run/distribute-<pid>/`; `state/distribution.json` | — |
 | `model-watch` | A scratch worktree and scratch directories under `run/`; `bump-records.json` | Branch `bot/models-<slug>`, one pull request with auto-merge (or auto-merge withdrawn from one whose branch changed), `automation:needs-owner` issues, that label when missing |
 | `report` | — | Its own comment in the open issue labeled `automation:status`; that label when missing |
 | every run | Its log, `last-run.json`, the lock | — |
 
-A later distribution step is added as one more entry in `STEPS` in `run.py`.
+`adopt` (the owner's command) writes into one project the same way, after
+showing what it would change.
 
 ## Promotion
 
@@ -156,6 +168,87 @@ ask.
 
 After an automatic promotion the run restarts once through the launcher, so
 the remaining steps execute the revision that was just approved.
+
+## Distribution
+
+`distribute` brings the approved revision into the projects listed in
+`~/.claude/orchestra/targets.txt`: one absolute path per line, `#` comments
+and blank lines skipped, duplicates dropped. It runs right after promotion, so
+a revision reaches a project only after it was approved; since approval is
+automatic only for an inert range and for this Mac's own model bump, a model
+bump is the only change to what a project holds that travels unattended.
+
+The rules, each enforced in code:
+
+- **Approved only.** The source is a scratch worktree made from the SHA in
+  `state/approved-rev`. The default branch is not read by this step. What the
+  updater produced is compared with that worktree before any of it is written.
+- **Adopted first.** A listed project is not touched, not even looked at,
+  until the owner ran `launchd.sh adopt <project>` for it. The adoption is
+  recorded in `state/distribution.json`, outside the project, together with
+  the file system's numbers for the directory and its repository: another
+  clone at the same path is not the adopted one.
+- **Clean only.** A project with a staged, unstaged or untracked-and-not-
+  ignored change is skipped and looked at again on the next run.
+- **Never a commit.** Nothing is committed, staged, stashed, reset or checked
+  out in a project. The update is left as uncommitted changes for the owner
+  to commit. **Until then the project is not clean, so the next approved
+  revision waits for it**: that is `waiting-dirty`, shown by `status` with the
+  revision that waits and since when. It is a state, not a failure.
+- **Its own output only.** A scheduled run replaces template-owned files only
+  while they are byte for byte what the job left there, and beyond them
+  changes nothing but the model keys of the two settings files and a missing
+  seed file. A local edit to a template file, a retired path that came back,
+  a file the template newly claims: all of these send the project back to
+  `adopt` (`local-changes`).
+- **Nothing of a project is executed.** The updater (`scripts/update.sh` of
+  the approved revision, and the manifest tool it calls) runs on a private
+  copy of the paths it manages, inside a scratch repository the job created.
+  The difference between that copy before and after is then written into the
+  project with plain file operations, each path first compared with what the
+  copy was taken from. In the project itself git runs five subcommands, all
+  of which only read (`rev-parse`, `config --list`, `status`, `ls-files`,
+  `for-each-ref`), with the job's hardened options, no optional index refresh
+  and no transport; the code refuses to start any other. A project whose own git
+  configuration sets a key outside a list of inert ones (a filter, a diff
+  driver, an include, a promisor remote, …) is refused with the key named. A
+  link, or a repository of its own, on the way to a template path is refused
+  too. `HEAD`, every ref and the index are compared before and after a write.
+
+`adopt` is typed at a terminal. It needs the project listed in `targets.txt`,
+the template already installed there (it updates; `scripts/install.sh`
+installs), and the tree clean. It shows the project, the revision and the installed
+version; what typing `yes` would create, change and delete, counted per
+directory, with every path in a private file; and, one line each, every file
+that would be deleted or overwritten while git does not track it, since git
+could not bring that content back. The list is the difference the approved
+updater made on the private copy, not a prediction, and exactly that
+difference is what gets written. It is also the migration an old installation
+needs: a tracked path the updater would remove with `git rm` ends up as an
+unstaged deletion instead.
+
+Limits worth knowing:
+
+- The job's git does not read the owner's global configuration. Files ignored
+  only through `core.excludesFile` there count as untracked here; patterns in
+  `~/.config/git/ignore` or in the project are honoured. Content filters from
+  the global configuration (LFS) do not run either, so a file git would have
+  to read through one can make a project look not clean.
+- "Clean" is what `git status` reports. An index told to hide changes
+  (assume-unchanged, skip-worktree, a sparse checkout) passes as clean. What
+  bounds the consequence is the rule above: only paths compared byte for byte
+  are ever replaced.
+- Changes inside a submodule's own work tree are not looked at: looking would
+  run git inside it. The updater's paths never lie in one.
+- The job cannot lock a project. Something else writing there between the
+  comparison and the write is not detected; the write is a rename per file,
+  and every path is verified afterwards.
+- The updater's standard output is dropped, because it prints the difference
+  between the project's settings and the template's. Its errors go to the run
+  log.
+- The project's own `scripts/check.sh` is not run afterwards: that would be
+  executing the project.
+- To stop distributing to a project, take its line out of `targets.txt`.
 
 ## Model watch
 
@@ -240,6 +333,36 @@ test compares these tables with the lists in the code).
 | `no-approved-revision` | 1 | `state/approved-rev` is missing or not a SHA (the launcher normally stops before this) | Run `launchd.sh install` |
 | `git-failed` | 3 | The range could not be read, or the branch moved mid-run | Retried |
 
+### distribute
+
+The step's result is the worst of its projects; its counts are the number of
+listed projects (`targets`) and how many are in each state of the next table.
+
+| Outcome | Exit | Means | What to do |
+|---------|------|-------|------------|
+| `no-targets` | 0 | `targets.txt` is missing or lists nothing | — |
+| `up-to-date` | 0 | Every listed project holds the approved revision's files | — |
+| `distributed` | 0 | At least one project was updated; the changes are uncommitted there | Review and commit them in the project |
+| `waiting` | 0 | Nothing was written, and at least one project waits (`waiting-dirty`, `busy`) | Commit in the project when you want the update |
+| `needs-owner` | 2 | A project is `not-adopted`, `local-changes` or `refused` | See that project's line in `launchd.sh status` |
+| `target-failed` | 3 | The update of a project failed (`failed`); the others were still visited | Read the newest log |
+| `source-failed` | 3 | The approved revision could not be laid out in a scratch worktree, or its updater's path lists cannot be read; no project was touched | Retried; if it repeats, read the newest log |
+| `no-approved-revision` | 1 | `state/approved-rev` is missing or not a SHA | Run `launchd.sh install` |
+
+### distribute, per project
+
+| Outcome | Exit | Means | What to do |
+|---------|------|-------|------------|
+| `up-to-date` | 0 | Holds the approved revision's files; tree clean | — |
+| `uncommitted` | 0 | Holds the approved revision's files; the tree is not clean, usually because the last update is not committed yet | Commit, or the next revision will wait |
+| `updated` | 0 | Updated in this run; left uncommitted | Review and commit |
+| `waiting-dirty` | 0 | A revision waits because the tree is not clean. `status` shows which, and since when | Commit or clean the tree |
+| `busy` | 0 | git is in the middle of a rebase, merge, pick, revert or bisect there (or holds the index lock), or a Claude Code session wrote in the project within the hour | — |
+| `not-adopted` | 2 | Listed, never adopted, or another directory or repository is at the path now. No file there was read and no git ran there | `launchd.sh adopt <project>` |
+| `local-changes` | 2 | Template-owned files are not what the job left, the update would change something a scheduled run does not change by itself, or an earlier write stopped half-way | `launchd.sh adopt <project>` shows it and asks |
+| `refused` | 2 | Not an absolute real path to a directory with its own repository; overlaps the job's directory; a git configuration key outside the inert list; a link or nested repository on a template path; no commit yet; or model settings the manifest tool will not bring in line | Fix what the line names |
+| `failed` | 3 | The updater failed on the private copy (the project was not written), the project changed between the rehearsal and the write (not written), or a write did not verify | Read the newest log; an unverified write goes to `local-changes` next |
+
 ### model-watch
 
 | Outcome | Exit | Means | What to do |
@@ -297,6 +420,7 @@ bash scripts/maint/launchd.sh print       # the rendered plist and every path; c
 bash scripts/maint/launchd.sh install     # show the plan, probe tools and login, ask; create the repository, show the revision for review, ask; copy the launcher, lint and load the agent
 bash scripts/maint/launchd.sh status      # launcher failure, loaded?, plist and launcher drift, tool and login probes, approved vs main, last run per step with its age
 bash scripts/maint/launchd.sh promote     # show the waiting range, ask, advance the approved revision
+bash scripts/maint/launchd.sh adopt DIR   # show what updating the project DIR would change, ask, update it, and let scheduled runs keep it updated
 bash scripts/maint/launchd.sh run-now     # start one run now through launchd
 bash scripts/maint/launchd.sh uninstall   # unload the agent, remove the plist and the launcher; clone, logs and state are listed, not deleted
 ```
@@ -373,9 +497,14 @@ with `run.py`'s code. `launchd.sh` exits `0` or `1`.
 | `bump.py` | What one model bump is, entries that are not plain files, and the single-use records of the bumps this Mac tested |
 | `model_watch.py` | Candidate rule and the resumable bump |
 | `report.py` | The public status comment |
+| `distribute.py` | The distribution step: the approved source, the rehearsal on a private copy, the record of adoptions, one state per project |
+| `targets.py` | Everything that touches a project: the registry, the reading-only git and its configuration list, what counts as clean, and the one function that writes |
+| `adopt.py` | The owner's screen and prompt for one project |
 
 Tests: `tests/test_maint_promote.py`, `tests/test_maint_model_watch.py`,
-`tests/test_maint_launchd.py`, with fakes in `tests/maint_support.py`. They
-use scratch repositories, a fake `gh`, `codex` and `launchctl`, a `git`
-stand-in that redirects the fork URL to a scratch repository, and a temp
-`HOME`; none reaches the network or the real home directory.
+`tests/test_maint_launchd.py`, `tests/test_maint_distribute.py`, with fakes in
+`tests/maint_support.py`. They use scratch repositories, a fake `gh`, `codex`
+and `launchctl`, a `git` stand-in that redirects the fork URL to a scratch
+repository, and a temp `HOME`; none reaches the network or the real home
+directory. The distribution tests install the template into scratch
+repositories with the real installer and update them with the real updater.
