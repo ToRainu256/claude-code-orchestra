@@ -203,6 +203,9 @@ def test_subagent_schema_directories_hold_no_runtime_content() -> None:
         "docs",
         "logs",
         "checkpoints",
+        # Claude Code's checkouts for worktree-isolated agents: git-ignored
+        # runtime state, allowed by check.sh for the same reason.
+        "worktrees",
     }
     # Nothing in the runtime layout is reached through a link.
     for directory in (".claude", ".agents", ".codex"):
@@ -233,6 +236,7 @@ def test_shared_runtime_docs_use_canonical_claude_paths() -> None:
     violations: list[str] = []
     reviews_dir = REPO_ROOT / ".claude" / "docs" / "reviews"
     logs_dir = REPO_ROOT / ".claude" / "logs"
+    worktrees_dir = REPO_ROOT / ".claude" / "worktrees"
     checker = REPO_ROOT / "scripts" / "check.sh"
     for path in list((REPO_ROOT / ".agents").rglob("*")) + list(
         (REPO_ROOT / ".claude").rglob("*")
@@ -255,6 +259,11 @@ def test_shared_runtime_docs_use_canonical_claude_paths() -> None:
         # reason: a migration inventory has to quote the paths it migrated away
         # from.
         if logs_dir in path.parents:
+            continue
+        # An agent worktree is a second checkout of this repository, not part
+        # of this one's runtime documentation; its copy is checked from inside
+        # that checkout.
+        if worktrees_dir in path.parents:
             continue
         content = path.read_text(encoding="utf-8")
         if any(stale_path in content for stale_path in stale_paths):
