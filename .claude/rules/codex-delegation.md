@@ -98,6 +98,25 @@ Detailed templates: `@.claude/docs/CODEX_HANDOFF_PLAYBOOK.md`
 
 Exec syntax, subagent/direct patterns, implementation calls, and the sandbox-modes table: see the **codex-system skill** (`.claude/skills/codex-system/SKILL.md`) — this rule covers only *when* to delegate.
 
+## When Codex Is Unavailable
+
+Codex is unavailable when `codex` is not on `PATH` —
+`.claude/skills/_shared/codex_consult.py` exits `2` — as in a cloud session
+or an install without Codex. Do not retry and do not skip the step:
+substitute, and say so.
+
+| Codex step | Substitute |
+|------------|------------|
+| Planning, design, trade-offs, plan validation | `general-purpose-deep` |
+| Code review; the reviewer's deep-logic pass | `general-purpose-deep`, or the reviewer itself |
+| Root-cause analysis | `codex-debugger` diagnoses on its own, without the Codex call |
+| Complex implementation | `general-purpose-deep` |
+
+A hook hint that names Codex follows the same table. Record
+`Codex unavailable: substituted <agent>` in the work log or PR body, so a
+reader knows no second model reviewed the change. Exit `3` (Codex failed or
+timed out) is a failure to report, not unavailability.
+
 ## Codex Plugin for Claude Code (codex-plugin-cc)
 
 Plugin slash commands (`/codex:review`, `/codex:rescue`, job management) and plugin-vs-CLI guidance: see the codex-system skill.
