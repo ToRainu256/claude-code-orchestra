@@ -454,10 +454,12 @@ check_native_boundaries() {
         fi
     done
 
+    # worktrees/ is where Claude Code checks out worktree-isolated agents. It is
+    # runtime state like logs/ and checkpoints/, git-ignored, never shipped.
     check_allowed_entries "${ROOT}/.claude" \
         settings.json settings.local.json settings.orchestra.json orchestra-version \
         models.local.json \
-        agents skills rules hooks docs logs checkpoints STATE.md || ok=false
+        agents skills rules hooks docs logs checkpoints worktrees STATE.md || ok=false
     check_allowed_entries "${ROOT}/.codex" \
         config.toml config.orchestra.toml AGENTS.md || ok=false
     # .agents/ is Antigravity's native directory and holds exactly one thing:

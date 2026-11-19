@@ -69,3 +69,6 @@ logs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Claude Code worktrees (isolated agent checkouts; each is a full copy of the repo)
+.claude/worktrees/
