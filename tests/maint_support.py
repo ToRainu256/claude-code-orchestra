@@ -26,6 +26,7 @@ import json
 import os
 import pty
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,10 @@ MODULES: tuple[ModuleType, ...] = (
 # A file named `<this script>.stall` holding one word makes any command with
 # that word as an argument hang, for the deadline tests; `<this script>.fail`
 # makes it fail, printing `<this script>.said` when there is one.
+# `<this script>.linger` makes it hang like a fetch whose remote helper is
+# stuck on the network: a background child keeps git's own stdout and stderr
+# open and outlives git when the deadline ends it. Every pid it starts is
+# appended to `<this script>.lingering`, so a test can reap them.
 FAKE_GIT = """#!/bin/sh
 GIT_ALLOW_PROTOCOL=file
 export GIT_ALLOW_PROTOCOL
@@ -107,6 +112,8 @@ stall=""
 [ -f "$0.stall" ] && stall="$(cat "$0.stall")"
 fail=""
 [ -f "$0.fail" ] && fail="$(cat "$0.fail")"
+linger=""
+[ -f "$0.linger" ] && linger="$(cat "$0.linger")"
 network=no
 for arg in "$@"; do
     if [ -n "$fail" ] && [ "$arg" = "$fail" ]; then
@@ -116,6 +123,13 @@ for arg in "$@"; do
     fi
     if [ -n "$stall" ] && [ "$arg" = "$stall" ]; then
         sleep 20 > /dev/null 2>&1
+    fi
+    if [ -n "$linger" ] && [ "$arg" = "$linger" ]; then
+        sleep 30 &
+        echo "$!" >> "$0.lingering"
+        sleep 30 > /dev/null 2>&1 &
+        echo "$!" >> "$0.lingering"
+        wait
     fi
     case "$arg" in
         fetch | push | ls-remote) network=yes ;;
@@ -416,6 +430,26 @@ class Fork:
         (self.bin_dir / "git.fail").write_text(word, encoding="utf-8")
         if said:
             (self.bin_dir / "git.said").write_text(said, encoding="utf-8")
+
+    def linger_git(self, word: str) -> None:
+        """Make every git command with ``word`` as an argument hang while a
+        child that keeps git's output open outlives it."""
+        (self.bin_dir / "git.linger").write_text(word, encoding="utf-8")
+
+    def reap_lingering(self) -> list[int]:
+        """End every child ``linger_git`` started; return the ones still
+        alive when asked."""
+        record = self.bin_dir / "git.lingering"
+        if not record.exists():
+            return []
+        alive: list[int] = []
+        for pid in [int(word) for word in record.read_text().split()]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        return alive
 
     def stall_git(self, word: str | None) -> None:
         """Make every git command with ``word`` as an argument hang."""

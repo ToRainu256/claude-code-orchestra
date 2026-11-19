@@ -2248,6 +2248,90 @@ def test_launcher_without_a_lock_keeps_the_network_message_for_a_failed_fetch(
     assert "killed" not in done.stderr
 
 
+LINGER_BOUND_SEC = 20  # the lingering child lives 30 s; a hang outlasts this
+
+
+def launch_with_short_deadline(fork: support.Fork) -> tuple[int, str, float]:
+    """One `run` with a one-second git deadline: (exit code, stderr, seconds).
+    A launcher that is still running after LINGER_BOUND_SEC fails the test."""
+    env = {
+        **fork.env,
+        "ORCHESTRA_MAINT_FETCH_PAUSE_SEC": "0",
+        "ORCHESTRA_MAINT_GIT_DEADLINE_SEC": "1",
+    }
+    started = time.monotonic()
+    try:
+        done = subprocess.run(
+            ["/bin/bash", str(fork.paths.launcher), "run"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=LINGER_BOUND_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"the launcher was still running after {LINGER_BOUND_SEC} s")
+    return done.returncode, done.stderr, time.monotonic() - started
+
+
+def test_launcher_ends_a_fetch_whose_helper_outlives_git(
+    installed: support.Fork,
+) -> None:
+    # git-remote-https stuck on the network keeps git's output open after the
+    # deadline ended git: reading that output must not wait for it.
+    installed.linger_git("fetch")
+    try:
+        code, stderr, seconds = launch_with_short_deadline(installed)
+    finally:
+        installed.reap_lingering()
+
+    assert code == common.EXIT_FAILED
+    assert stderr.endswith(
+        "orchestra-maint: cannot fetch the fork. Next: check the network, "
+        "then: bash scripts/maint/launchd.sh run-now\n"
+    )
+    assert seconds < LINGER_BOUND_SEC
+    assert installed.gh_state()["calls"] == []
+
+
+def test_launcher_ends_a_checkout_whose_child_outlives_git(
+    installed: support.Fork,
+) -> None:
+    installed.linger_git("checkout")
+    try:
+        code, stderr, seconds = launch_with_short_deadline(installed)
+    finally:
+        installed.reap_lingering()
+
+    assert code == common.EXIT_FAILED
+    assert "cannot check out the approved revision" in stderr
+    assert "merge a fix" in stderr
+    assert seconds < LINGER_BOUND_SEC
+    assert installed.gh_state()["calls"] == []
+
+
+def test_launcher_reads_a_bounded_part_of_a_huge_git_message(
+    installed: support.Fork,
+) -> None:
+    # Far more than the launcher reads back, every name a lock that is not
+    # the job's own: looking at them must stay cheap.
+    noise = "".join(
+        f"error: Unable to create '/nowhere/{index:06d}.lock': File exists.\n"
+        for index in range(20000)
+    )
+    installed.fail_git("checkout", said=noise)
+    started = time.monotonic()
+
+    done = launch(installed, "run")
+
+    assert time.monotonic() - started < 30
+    assert done.returncode == common.EXIT_FAILED
+    assert "merge a fix, then: bash scripts/maint/launchd.sh promote" in done.stderr
+    assert "killed" not in done.stderr
+    assert len(done.stderr) < 2 * 65536  # what git said is shown cut short
+
+
 def test_launcher_ends_a_checkout_that_stalls_while_it_reads_what_git_said(
     installed: support.Fork,
 ) -> None:
