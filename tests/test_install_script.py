@@ -77,6 +77,8 @@ def build_template_repo(tmp_path: Path, name: str = "template") -> Path:
             ".pytest_cache",
             ".ruff_cache",
             "__pycache__",
+            # Live agent worktrees are full copies of the repository.
+            "worktrees",
         ),
     )
     subprocess.run(["git", "init", "-q", str(template)], check=True)
@@ -1012,6 +1014,31 @@ def test_update_to_a_template_without_the_manifest_warns_and_succeeds(
     assert "models were not applied" in update_result.stdout.split("Update Summary")[1]
     assert (target / SETTINGS_REL).read_bytes() == settings_before
     assert (target / CONFIG_REL).read_bytes() == config_before
+
+
+def test_the_gate_accepts_agent_worktrees_and_rejects_other_strays(
+    tmp_path: Path,
+) -> None:
+    """Claude Code checks out worktree-isolated agents under .claude/worktrees/.
+    That directory is runtime state: the boundary check must allow it and the
+    model-name lint must not read the repository copies inside it. Any other
+    unknown entry under .claude/ still fails."""
+    template = build_template_repo(tmp_path)
+    worktree = template / ".claude/worktrees/agent-example"
+    worktree.mkdir(parents=True)
+    (worktree / "notes.md").write_text("Use Sonnet 5.5 here.\n", encoding="utf-8")
+
+    with_worktree = run_gate(template)
+
+    assert with_worktree.returncode == 0, with_worktree.stdout + with_worktree.stderr
+
+    (template / ".claude/strays").mkdir()
+    (template / ".claude/strays/keep.txt").write_text("x\n", encoding="utf-8")
+
+    with_stray = run_gate(template)
+
+    assert with_stray.returncode == 1, with_stray.stdout
+    assert "Unexpected .claude entry: strays" in with_stray.stdout
 
 
 def test_the_template_gate_rejects_what_only_a_project_may_have(
