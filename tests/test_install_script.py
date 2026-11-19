@@ -77,6 +77,8 @@ def build_template_repo(tmp_path: Path, name: str = "template") -> Path:
             ".pytest_cache",
             ".ruff_cache",
             "__pycache__",
+            # Live agent worktrees are full copies of the repository.
+            "worktrees",
         ),
     )
     subprocess.run(["git", "init", "-q", str(template)], check=True)
@@ -1014,6 +1016,31 @@ def test_update_to_a_template_without_the_manifest_warns_and_succeeds(
     assert (target / CONFIG_REL).read_bytes() == config_before
 
 
+def test_the_gate_accepts_agent_worktrees_and_rejects_other_strays(
+    tmp_path: Path,
+) -> None:
+    """Claude Code checks out worktree-isolated agents under .claude/worktrees/.
+    That directory is runtime state: the boundary check must allow it and the
+    model-name lint must not read the repository copies inside it. Any other
+    unknown entry under .claude/ still fails."""
+    template = build_template_repo(tmp_path)
+    worktree = template / ".claude/worktrees/agent-example"
+    worktree.mkdir(parents=True)
+    (worktree / "notes.md").write_text("Use Sonnet 5.5 here.\n", encoding="utf-8")
+
+    with_worktree = run_gate(template)
+
+    assert with_worktree.returncode == 0, with_worktree.stdout + with_worktree.stderr
+
+    (template / ".claude/strays").mkdir()
+    (template / ".claude/strays/keep.txt").write_text("x\n", encoding="utf-8")
+
+    with_stray = run_gate(template)
+
+    assert with_stray.returncode == 1, with_stray.stdout
+    assert "Unexpected .claude entry: strays" in with_stray.stdout
+
+
 def test_the_template_gate_rejects_what_only_a_project_may_have(
     tmp_path: Path,
 ) -> None:
@@ -1593,3 +1620,241 @@ def test_a_freshly_installed_project_passes_its_own_consistency_check(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "FAIL" not in result.stdout
+
+
+# "<destination in a project>": "<pristine seed in the template>".
+SEEDED_PROJECT_FILES = {
+    ".claude/STATE.md": "scripts/scaffold/STATE.md",
+    ".claude/docs/DESIGN.md": "scripts/scaffold/DESIGN.md",
+}
+LIVE_SENTINEL = b"\n<!-- sentinel: the template repository's own working state -->\n"
+SEED_SENTINEL = b"\n<!-- sentinel: the pristine seed -->\n"
+PROJECT_SENTINEL = b"\n<!-- sentinel: written by the project itself -->\n"
+
+
+def append_bytes(path: Path, content: bytes) -> None:
+    path.write_bytes(path.read_bytes() + content)
+
+
+def commit_template(template: Path, message: str) -> None:
+    subprocess.run(["git", "-C", str(template), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(template), "commit", "-qm", message], check=True)
+
+
+def diverge_template_state(template: Path) -> dict[str, bytes]:
+    """Make the template's own state and design differ from the seeds.
+
+    That is what the template repository looks like once it is developed with
+    its own orchestration. Both sides get a different marker, so a test can
+    tell which file a project received and not merely that two files differ.
+    Returns the seed bytes, keyed by the destination they belong at.
+    """
+    seeds: dict[str, bytes] = {}
+    for destination, seed in SEEDED_PROJECT_FILES.items():
+        append_bytes(template / destination, LIVE_SENTINEL)
+        append_bytes(template / seed, SEED_SENTINEL)
+        seeds[destination] = (template / seed).read_bytes()
+    return seeds
+
+
+def test_install_seeds_a_new_project_from_the_scaffold_not_the_template_s_state(
+    tmp_path: Path,
+) -> None:
+    """The leak this pins: the installer used to copy the template repository's
+    own `.claude/STATE.md` and `.claude/docs/DESIGN.md`, so whatever that
+    repository recorded about its own development shipped to every project."""
+    template = build_template_repo(tmp_path)
+    seeds = diverge_template_state(template)
+    target = tmp_path / "project"
+    init_git_repo(target)
+
+    result = run_install(target, script=template / "scripts/install.sh")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for destination, seed_bytes in seeds.items():
+        installed = (target / destination).read_bytes()
+        assert installed == seed_bytes, destination
+        assert LIVE_SENTINEL not in installed
+        assert f"Installed {destination}" in result.stdout
+    # The seeds reach a project only as the two files they seed.
+    assert not (target / "scripts/scaffold").exists()
+    assert run_gate(target).returncode == 0
+
+
+def test_install_leaves_a_project_s_own_state_and_design_untouched(
+    tmp_path: Path,
+) -> None:
+    template = build_template_repo(tmp_path)
+    diverge_template_state(template)
+    target = tmp_path / "project"
+    init_git_repo(target)
+    own: dict[str, bytes] = {}
+    for destination in SEEDED_PROJECT_FILES:
+        path = target / destination
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"# Project-owned {destination}\n".encode() + PROJECT_SENTINEL)
+        own[destination] = path.read_bytes()
+
+    result = run_install(target, script=template / "scripts/install.sh")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for destination, content in own.items():
+        assert (target / destination).read_bytes() == content, destination
+        assert f"Preserved existing {destination}" in result.stdout
+
+
+@pytest.mark.parametrize("seed", sorted(SEEDED_PROJECT_FILES.values()))
+def test_install_refuses_a_template_that_lacks_a_seed(
+    tmp_path: Path, seed: str
+) -> None:
+    """A missing seed is an incomplete template, found before anything is
+    written. It is never papered over with the template's own state."""
+    template = build_template_repo(tmp_path)
+    diverge_template_state(template)
+    (template / seed).unlink()
+    target = tmp_path / "project"
+    init_git_repo(target)
+
+    result = run_install(target, script=template / "scripts/install.sh")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"Template source is incomplete: {seed} is missing." in result.stderr
+    assert not (target / ".claude").exists()
+    assert not (target / "AGENTS.md").exists()
+
+
+def test_install_refuses_a_symlinked_parent_of_a_seeded_destination(
+    tmp_path: Path,
+) -> None:
+    """The escape check reads the destination half of each
+    "<destination>:<seed>" entry. `.claude/docs/research/` is managed through
+    no other list, so only that half can catch a link planted there."""
+    target = tmp_path / "project"
+    outside = tmp_path / "outside"
+    init_git_repo(target)
+    outside.mkdir()
+    (target / ".claude/docs").mkdir(parents=True)
+    (target / ".claude/docs/research").symlink_to(outside, target_is_directory=True)
+
+    result = run_install(target)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    # The whole line: an entry passed through unsplit would be named here as
+    # "<destination>:<seed>", which a substring match would still accept.
+    assert (
+        "[ERROR] Refusing symlinked parent for managed path: "
+        ".claude/docs/research/.gitkeep"
+    ) in result.stderr.splitlines()
+    assert list(outside.iterdir()) == []
+    assert not (target / "AGENTS.md").exists()
+
+
+def test_update_seeds_missing_project_files_from_the_scaffold(tmp_path: Path) -> None:
+    template, target = install_from_template(tmp_path)
+    seeds = diverge_template_state(template)
+    commit_template(template, "the template records its own state")
+    for destination in SEEDED_PROJECT_FILES:
+        (target / destination).unlink()
+
+    result = run_update(target, template)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for destination, seed_bytes in seeds.items():
+        restored = (target / destination).read_bytes()
+        assert restored == seed_bytes, destination
+        assert LIVE_SENTINEL not in restored
+    assert not (target / "scripts/scaffold").exists()
+    assert run_gate(target).returncode == 0
+
+
+def test_update_never_touches_a_project_s_own_state_and_design(tmp_path: Path) -> None:
+    template, target = install_from_template(tmp_path)
+    diverge_template_state(template)
+    commit_template(template, "the template records its own state")
+    own: dict[str, bytes] = {}
+    for destination in SEEDED_PROJECT_FILES:
+        append_bytes(target / destination, PROJECT_SENTINEL)
+        own[destination] = (target / destination).read_bytes()
+
+    # Twice: the first run replaces scripts/update.sh, the second runs it.
+    for attempt in ("first", "second"):
+        result = run_update(target, template)
+
+        assert result.returncode == 0, attempt + result.stdout + result.stderr
+        for destination, content in own.items():
+            assert (target / destination).read_bytes() == content, (
+                attempt,
+                destination,
+            )
+    assert run_gate(target).returncode == 0
+
+
+def test_update_from_a_template_without_a_scaffold_uses_the_canonical_paths(
+    tmp_path: Path,
+) -> None:
+    """A template ref from before the seeds moved (an older tag, or another
+    repository through ORCHESTRA_TEMPLATE_REPO) keeps the pristine files at the
+    destination paths. Updating to it is supported, not an error."""
+    template, target = install_from_template(tmp_path)
+    shutil.rmtree(template / "scripts/scaffold")
+    legacy: dict[str, bytes] = {}
+    for destination in SEEDED_PROJECT_FILES:
+        append_bytes(template / destination, SEED_SENTINEL)
+        legacy[destination] = (template / destination).read_bytes()
+    commit_template(template, "a template from before the scaffold")
+    for destination in SEEDED_PROJECT_FILES:
+        (target / destination).unlink()
+
+    result = run_update(target, template)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for destination, content in legacy.items():
+        assert (target / destination).read_bytes() == content, destination
+    assert run_gate(target).returncode == 0
+
+
+@pytest.mark.parametrize(("destination", "seed"), sorted(SEEDED_PROJECT_FILES.items()))
+def test_update_refuses_a_scaffold_that_lacks_a_seed(
+    tmp_path: Path, destination: str, seed: str
+) -> None:
+    """The fallback to the canonical path is for a template with no scaffold at
+    all. Where the scaffold exists, that path holds the template repository's
+    own state, so a missing seed stops the update instead of shipping it."""
+    template, target = install_from_template(tmp_path)
+    diverge_template_state(template)
+    (template / seed).unlink()
+    commit_template(template, "a scaffold with a seed missing")
+    (target / destination).unlink()
+
+    result = run_update(target, template)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"Template has no seed for {destination}: {seed} is missing." in (
+        result.stderr
+    )
+    assert not (target / destination).exists()
+
+
+def test_update_refuses_a_scaffold_path_that_is_not_a_directory(
+    tmp_path: Path,
+) -> None:
+    """Only a template with nothing at `scripts/scaffold` predates the seeds.
+    A file there is a broken scaffold, not an old template, and must not send
+    the update back to the canonical paths."""
+    template, target = install_from_template(tmp_path)
+    diverge_template_state(template)
+    shutil.rmtree(template / "scripts/scaffold")
+    (template / "scripts/scaffold").write_text("not a directory\n", encoding="utf-8")
+    commit_template(template, "a file where the scaffold belongs")
+    for destination in SEEDED_PROJECT_FILES:
+        (target / destination).unlink()
+
+    result = run_update(target, template)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (
+        "Template has no seed for .claude/STATE.md: "
+        "scripts/scaffold/STATE.md is missing."
+    ) in result.stderr
+    for destination in SEEDED_PROJECT_FILES:
+        assert not (target / destination).exists()
