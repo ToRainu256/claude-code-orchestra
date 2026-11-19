@@ -695,3 +695,65 @@ def test_install_under_a_hostile_git_configuration_runs_none_of_it(
     assert support.git(evil, "for-each-ref") == ""
     installed_hooks = mac.base / "fork" / ".git" / "hooks"
     assert not (installed_hooks / "reference-transaction").exists()
+
+
+def test_install_says_how_much_of_a_long_change_it_does_not_show(
+    tmp_path: Path,
+) -> None:
+    # More commits and more changed paths than the screen lists, and one
+    # subject longer than a line: each cut must be announced, with the
+    # command that shows everything.
+    fork = scratch_fork(tmp_path)
+    checkout = tmp_path / "reviewed-checkout"
+    subprocess.run(
+        [support.REAL_GIT, "clone", "--quiet", str(fork.bare), str(checkout)],
+        check=True,
+    )
+    reviewed = support.git(checkout, "rev-parse", "HEAD")
+    for index in range(34):
+        (fork.seed / "README.md").write_text(f"# step {index}\n", encoding="utf-8")
+        support.git(fork.seed, "commit", "--quiet", "-am", f"docs: step {index}")
+    for index in range(45):
+        (fork.seed / "docs").mkdir(exist_ok=True)
+        (fork.seed / "docs" / f"page-{index:02d}.md").write_text(
+            "x\n", encoding="utf-8"
+        )
+    support.git(fork.seed, "add", "-A")
+    support.git(fork.seed, "commit", "--quiet", "-m", "docs: " + "many pages " * 40)
+    support.git(fork.seed, "push", "--quiet", "origin", "HEAD:main")
+    head = support.git(fork.seed, "rev-parse", "HEAD")
+    mac = Mac(tmp_path, bare=fork.bare)
+    clone = mac.base / "fork"
+
+    done = mac.run(
+        "install",
+        answers="yes\nyes\n",
+        script=checkout / "scripts" / "maint" / "launchd.sh",
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    shown = done.stdout
+    assert "35 commits are on the fork that this checkout" in shown
+    assert (
+        f"(5 more lines are not shown; all of them: git -C {clone} log {reviewed}..{head})"
+        in shown
+    )
+    # 45 pages and the README, plus the summary line: 47 lines, 40 shown.
+    assert (
+        "(7 more lines are not shown; all of them: "
+        f"git -C {clone} diff --stat {reviewed} {head})" in shown
+    )
+    assert " [line cut]" in shown  # the long subject, cut and marked
+
+
+def test_install_fails_closed_when_the_refs_cannot_be_listed(mac: Mac) -> None:
+    # A list that cannot be read must not pass for a list with nothing wrong.
+    (mac.fakebin / "git.fail").write_text("for-each-ref", encoding="utf-8")
+
+    done = mac.install()
+
+    assert done.returncode == 1
+    assert "cannot list the refs" in done.stderr
+    assert not (mac.base / "state" / "approved-rev").exists()
+    assert not mac.plist.exists()
+    assert mac.launchctl_calls("bootstrap") == []

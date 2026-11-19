@@ -8,17 +8,20 @@ at the range from that commit to ``refs/remotes/origin/main`` and advances the
 file by itself in exactly two cases:
 
 * **Inert range.** No changed path is one the Mac executes or ships: nothing
-  under ``scripts/``, no ``VERSION``, nothing the approved ``scripts/update.sh``
-  copies into a project (its ``SAFE_DIRS``, ``SAFE_FILES``, ``SETTINGS_FILES``
-  and every literal ``${TEMPLATE_DIR}/…`` source), and no file git itself
-  interprets at checkout.
+  under ``scripts/``, no ``VERSION``, no model override file, nothing the
+  approved ``scripts/update.sh`` copies into a project (its ``SAFE_DIRS``,
+  ``SAFE_FILES``, ``SETTINGS_FILES`` and every literal ``${TEMPLATE_DIR}/…``
+  source), and no file git itself interprets at checkout.
 * **This Mac's own model bump.** The executed-or-shipped changes are exactly
-  the model manifest and the Codex configuration file, both regular files,
-  differing only by one newer slug of the same family
-  (:func:`bump_problem_between`), **and** the two resulting files are the ones
-  this Mac's model watch built and made a live call with
-  (:func:`recorded_bump`). The same change merged by any other means has no
-  such record and waits.
+  one model bump (``bump.bump_problem_between``), **and** it is the merge of
+  the pull request this Mac's model watch opened for it, from the commit it
+  tested (``bump.recorded_bump_problem``). The record is used once. The same
+  change merged by any other means waits.
+
+In both cases every entry the range adds or changes must be a plain file. A
+link or a gitlink is never promoted without the owner, wherever it is: it can
+make the tree impossible to check out, which would leave the Mac running an
+older revision than the one recorded as approved.
 
 Everything else waits for the owner to run ``launchd.sh promote``. There is no
 setting that relaxes this: the rule is code in the approved revision, and a
@@ -37,13 +40,12 @@ Exit codes: see ``common.py``.
 
 from __future__ import annotations
 
-import json
 import re
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
+import bump
 import common
 
 STEP = "promote"
@@ -60,25 +62,19 @@ OUTCOMES: dict[str, tuple[int, ...]] = {
     "awaiting-promotion": (common.EXIT_OK, common.EXIT_NEEDS_OWNER),
 }
 
-MANIFEST_REL = ".claude/skills/_shared/models.json"
-CODEX_CONFIG_REL = ".codex/config.toml"
 UPDATE_SCRIPT_REL = "scripts/update.sh"
-MODEL_KEY = "codex.model"
-MODEL_SECTION, MODEL_LEAF = MODEL_KEY.split(".")
-SUPERSEDED = "superseded"
-BUMP_RELS = (MANIFEST_REL, CODEX_CONFIG_REL)
-BUMP_PATHS = frozenset(BUMP_RELS)
-REGULAR_ENTRY = ("100644", "blob")
-
+LOCAL_OVERRIDE_REL = ".claude/models.local.json"
 # Executed or shipped whatever the updater's lists say: the maintenance code
-# and installers, the shared scripts the job runs, the version stamp, and the
-# two settings files every project receives a merge candidate of.
+# and installers, the shared scripts the job runs, the version stamp, the two
+# settings files every project receives a merge candidate of, and the model
+# override file the approved manifest tool reads when it is present.
 ALWAYS_RELEVANT = (
     "scripts",
     "VERSION",
     ".claude/skills",
     ".claude/settings.json",
-    CODEX_CONFIG_REL,
+    LOCAL_OVERRIDE_REL,
+    bump.CODEX_CONFIG_REL,
 )
 # Files git itself interprets, in any directory. They are not shipped by name,
 # but they decide what a checkout writes for the files that are: an attribute
@@ -96,13 +92,7 @@ SOURCE_CANARY = "VERSION"
 PROMOTION_OVERDUE_DAYS = 7
 RELEVANT_SHOWN = 10
 COMMITS_SHOWN = 50
-DIVERGED_SHOWN = 20
 STAT_LINES_SHOWN = 60
-RECORDS_KEPT = 20
-TOML_TABLE_RE = re.compile(r"^[ \t]*\[")
-TOML_MULTILINE = ('"""', "'''")
-TOML_MODEL_RE = re.compile(r'(model[ \t]*=[ \t]*")([^"\\\r\n]*)("[ \t]*(?:#[^\r\n]*)?)')
-PULL_REFERENCE_RE = re.compile(r"\(#([1-9][0-9]{0,8})\)\s*$")
 CONFIRM_WORD = "yes"
 
 REASON_INERT = "inert-paths"
@@ -155,259 +145,12 @@ def write_approved(paths: common.Paths, sha: str) -> None:
     common.write_text_atomic(paths.approved_file, sha + "\n")
 
 
-# --------------------------------------------------------------------------
-# The shape of one model bump
-# --------------------------------------------------------------------------
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    keys = [key for key, _ in pairs]
-    if len(keys) != len(set(keys)):
-        raise ValueError("duplicate key")
-    return dict(pairs)
-
-
-def _parse_manifest(text: str) -> dict[str, Any] | None:
-    """The manifest as an object, refusing a duplicated key: a parser that
-    keeps the last one would compare a different document than the tool
-    reads."""
-    try:
-        parsed = json.loads(text, object_pairs_hook=_unique_object)
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def manifest_model(text: str | None) -> str | None:
-    """The model slug a manifest text names, or None."""
-    document = _parse_manifest(text or "")
-    section = document.get(MODEL_SECTION) if document else None
-    value = section.get(MODEL_LEAF) if isinstance(section, dict) else None
-    return value if isinstance(value, str) else None
-
-
-def _canonical(document: dict[str, Any]) -> str:
-    return json.dumps(document, sort_keys=True, ensure_ascii=True)
-
-
-def _history(document: dict[str, Any]) -> list[Any] | None:
-    section = document.get(SUPERSEDED)
-    if not isinstance(section, dict):
-        return None
-    entries = section.get(MODEL_KEY, [])
-    return list(entries) if isinstance(entries, list) else None
-
-
-def _manifest_problem(
-    old_text: str, new_text: str
-) -> tuple[str | None, common.Slug | None, common.Slug | None]:
-    """Why the manifest change is not one model bump, with the two slugs."""
-    old_doc = _parse_manifest(old_text)
-    new_doc = _parse_manifest(new_text)
-    if old_doc is None or new_doc is None:
-        return "the manifest is not a JSON object with unique keys", None, None
-    old_section = old_doc.get(MODEL_SECTION)
-    new_section = new_doc.get(MODEL_SECTION)
-    if not isinstance(old_section, dict) or not isinstance(new_section, dict):
-        return f"the manifest has no {MODEL_SECTION} section", None, None
-    old = common.parse_slug(old_section.get(MODEL_LEAF))
-    new = common.parse_slug(new_section.get(MODEL_LEAF))
-    if old is None or new is None:
-        return f"{MODEL_KEY} is not a <vendor>-<version>-<family> slug", old, new
-    if not new.same_line(old):
-        return f"{MODEL_KEY} changes family: {old.text} -> {new.text}", old, new
-    if new.version <= old.version:
-        return f"{MODEL_KEY} does not move forward: {old.text} -> {new.text}", old, new
-
-    old_history = _history(old_doc)
-    new_history = _history(new_doc)
-    if old_history is None or new_history is None:
-        return f"{SUPERSEDED} has no list for {MODEL_KEY}", old, new
-    kept = [entry for entry in old_history if entry != new.text]
-    added = new_history[len(kept) :]
-    if new_history[: len(kept)] != kept or old.text not in new_history:
-        return f"{SUPERSEDED} does not record {old.text}", old, new
-    if len(set(added)) != len(added):
-        return f"{SUPERSEDED} repeats an entry", old, new
-    for entry in added:
-        step = common.parse_slug(entry)
-        if step is None or not step.same_line(old):
-            return f"{SUPERSEDED} gains a value of another family", old, new
-        if not old.version <= step.version < new.version:
-            return f"{SUPERSEDED} gains a value outside the bump", old, new
-
-    expected = {
-        **old_doc,
-        MODEL_SECTION: {**old_section, MODEL_LEAF: new.text},
-        SUPERSEDED: {**old_doc[SUPERSEDED], MODEL_KEY: new_history},
-    }
-    # Compared as text: as objects, `true` equals `1` and `1.0` equals `1`.
-    if _canonical(expected) != _canonical(new_doc):
-        return "the manifest changes more than the model and its history", old, new
-    return None, old, new
-
-
-def _toml_problem(old_text: str, new_text: str, old: str, new: str) -> str | None:
-    """Why the configuration change is not the one top-level model line.
-
-    Lines are split at line feeds only and compared byte for byte, so a
-    carriage return added anywhere is a change like any other: it cannot
-    hide inside a line that "only" changed its model.
-    """
-    old_lines = old_text.split("\n")
-    new_lines = new_text.split("\n")
-    if len(old_lines) != len(new_lines):
-        return f"{CODEX_CONFIG_REL} gains or loses lines"
-    changed = [
-        index for index in range(len(old_lines)) if old_lines[index] != new_lines[index]
-    ]
-    if len(changed) != 1:
-        return f"{CODEX_CONFIG_REL} changes {len(changed)} lines, not one"
-    index = changed[0]
-    if any(TOML_TABLE_RE.match(line) for line in old_lines[:index]):
-        return f"{CODEX_CONFIG_REL} changes a line inside a table"
-    # A multi-line string above the line could contain it: text that looks
-    # like the model key and is not one. Refused rather than tokenized.
-    if any(quote in line for line in old_lines[:index] for quote in TOML_MULTILINE):
-        return f"{CODEX_CONFIG_REL} has a multi-line string above the changed line"
-    before = TOML_MODEL_RE.fullmatch(old_lines[index])
-    after = TOML_MODEL_RE.fullmatch(new_lines[index])
-    if before is None or after is None:
-        return f"{CODEX_CONFIG_REL} changes a line that is not the model"
-    if (before.group(1), before.group(3)) != (after.group(1), after.group(3)):
-        return f"{CODEX_CONFIG_REL} changes more than the model value"
-    if before.group(2) != old or after.group(2) != new:
-        return f"{CODEX_CONFIG_REL} does not follow the manifest"
-    return None
-
-
-def model_bump_problem(
-    old_manifest: str,
-    new_manifest: str,
-    old_config: str,
-    new_config: str,
-    expected: str | None = None,
-) -> str | None:
-    """None when the four texts are exactly one model bump, else the reason.
-
-    A bump changes ``codex.model`` to a strictly newer slug of the same vendor
-    and family, appends the outgoing value to that key's ``superseded`` list,
-    and rewrites the one top-level ``model`` line of the configuration file.
-    Several bumps in a row count as one. ``expected`` pins the new slug.
-    """
-    problem, old, new = _manifest_problem(old_manifest, new_manifest)
-    if problem is not None or old is None or new is None:
-        return problem
-    if expected is not None and new.text != expected:
-        return f"{MODEL_KEY} is {new.text}, not {expected}"
-    return _toml_problem(old_config, new_config, old.text, new.text)
-
-
-def changed_paths(git: common.Git, base: str, head: str) -> list[str] | None:
-    result = git.run(["diff", "--name-only", "-z", "--no-renames", base, head])
-    if not result.ok:
-        return None
-    return [path for path in result.stdout.split("\0") if path]
-
-
-def tree_entry(git: common.Git, revision: str, rel: str) -> tuple[str, str, str] | None:
-    """(mode, type, object id) of one path at a revision, or None."""
-    listed = git.text(["ls-tree", revision, "--", rel])
-    if not listed or "\n" in listed or "\t" not in listed:
-        return None
-    fields = listed.split("\t", 1)[0].split()
-    return (fields[0], fields[1], fields[2]) if len(fields) == 3 else None
-
-
-def bump_problem_between(
-    git: common.Git,
-    base: str,
-    head: str,
-    expected: str | None = None,
-    only: bool = True,
-) -> str | None:
-    """None when ``head`` differs from ``base`` by exactly one model bump.
-
-    The one check behind every decision that treats a change as "only the
-    model": the promotion rule, the bump the model watch is about to push, and
-    a bump branch found on the fork. Both files must be regular files (mode
-    100644) at both commits: ``git show`` returns a blob's bytes whatever the
-    entry is, and a link whose target text reads like the new file would pass
-    a comparison of contents alone. With ``only``, no other path may differ.
-    """
-    if only:
-        names = changed_paths(git, base, head)
-        if names is None:
-            return "cannot list the changed paths"
-        if set(names) != BUMP_PATHS:
-            touched = ", ".join(sorted(names)) or "(nothing)"
-            return f"the change touches: {touched}"
-    texts: list[str] = []
-    for rel in BUMP_RELS:
-        for revision in (base, head):
-            entry = tree_entry(git, revision, rel)
-            if entry is None or entry[:2] != REGULAR_ENTRY:
-                return f"{rel} is not a regular file with mode {REGULAR_ENTRY[0]}"
-            text = git.show(revision, rel)
-            if text is None:
-                return f"cannot read {rel}"
-            texts.append(text)
-    old_manifest, new_manifest, old_config, new_config = texts
-    return model_bump_problem(
-        old_manifest, new_manifest, old_config, new_config, expected
-    )
-
-
-# --------------------------------------------------------------------------
-# What this Mac's model watch vouched for
-# --------------------------------------------------------------------------
-
-
-def _read_records(paths: common.Paths) -> list[dict[str, Any]]:
-    try:
-        parsed = json.loads(paths.bump_records_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return [item for item in parsed if isinstance(item, dict)]
-
-
-def record_bump(ctx: common.Context, slug: str, commit: str) -> bool:
-    """Remember that this Mac built ``commit`` as the bump to ``slug`` and made
-    a live call with it: the slug and the two resulting file objects. False
-    when the commit's files cannot be read."""
-    blobs: dict[str, str] = {}
-    for rel in BUMP_RELS:
-        entry = tree_entry(ctx.git, commit, rel)
-        if entry is None or entry[:2] != REGULAR_ENTRY:
-            return False
-        blobs[rel] = entry[2]
-    record = {
-        "slug": slug,
-        "commit": commit,
-        "blobs": blobs,
-        "recorded": common.utc_stamp(ctx.now),
-    }
-    others = [item for item in _read_records(ctx.paths) if item.get("slug") != slug]
-    kept = [*others, record][-RECORDS_KEPT:]
-    common.write_text_atomic(ctx.paths.bump_records_file, json.dumps(kept, indent=2))
-    return True
-
-
-def recorded_bump_problem(ctx: common.Context, target: str) -> str | None:
-    """None when the two model files at ``target`` are byte for byte the ones
-    this Mac's model watch recorded for that slug, else why not."""
-    slug = manifest_model(ctx.git.show(target, MANIFEST_REL))
-    records = [item for item in _read_records(ctx.paths) if item.get("slug") == slug]
-    if slug is None or not records:
-        return "no model watch on this Mac tested this bump"
-    blobs = records[-1].get("blobs")
-    for rel in BUMP_RELS:
-        entry = tree_entry(ctx.git, target, rel)
-        if entry is None or not isinstance(blobs, dict) or blobs.get(rel) != entry[2]:
-            return f"{rel} is not the file the model watch tested"
-    return None
+def _advance(ctx: common.Context, target: str) -> None:
+    """Record ``target`` as approved, and forget the bump record it used up:
+    a record is for one merge and is never good for a second."""
+    write_approved(ctx.paths, target)
+    slug = bump.manifest_model(ctx.git.show(target, bump.MANIFEST_REL))
+    bump.drop_record(ctx.paths, slug)
 
 
 # --------------------------------------------------------------------------
@@ -470,7 +213,11 @@ def relevant_paths(changed: list[str], shipped: tuple[str, ...] | None) -> list[
 
 @dataclass(frozen=True)
 class Decision:
-    """What the range ``approved..target`` amounts to."""
+    """What the change from ``approved`` to ``target`` amounts to.
+
+    ``relevant`` are the changed paths the Mac executes or ships; ``special``
+    are the entries added or changed that are not plain files.
+    """
 
     action: str  # up-to-date | promote | await | diverged | unconfigured | failed
     approved: str | None = None
@@ -479,6 +226,7 @@ class Decision:
     relevant: tuple[str, ...] = ()
     commits: int = 0
     oldest: float | None = None
+    special: tuple[str, ...] = ()
 
 
 def waiting_range(
@@ -498,9 +246,23 @@ def waiting_range(
     return len(values), float(min(values)) if values else None
 
 
+def _tree_change(
+    ctx: common.Context, approved: str, target: str
+) -> tuple[tuple[str, ...] | None, tuple[str, ...], tuple[str, ...]] | None:
+    """(shipped lists, relevant paths, special entries) for the change between
+    two trees; None when git cannot compare them. Needs no shared history."""
+    changed = bump.changed_paths(ctx.git, approved, target)
+    special = bump.special_entries(ctx.git, approved, target)
+    if changed is None or special is None:
+        return None
+    shipped = shipped_paths(ctx.git.show(approved, UPDATE_SCRIPT_REL))
+    return shipped, tuple(relevant_paths(changed, shipped)), tuple(special)
+
+
 def evaluate(ctx: common.Context) -> Decision:
     """Classify the range from the approved revision to the default branch.
-    Reads only; decides nothing else."""
+    Reads git, and for a model bump asks GitHub about its pull request;
+    changes nothing but a bump record whose pull request was closed."""
     approved = read_approved(ctx.paths)
     if approved is None:
         return Decision("unconfigured", reason="no approved revision recorded")
@@ -511,35 +273,43 @@ def evaluate(ctx: common.Context) -> Decision:
         return Decision("up-to-date", approved, target)
 
     ancestry = ctx.git.run(["merge-base", "--is-ancestor", approved, target])
-    if ancestry.returncode == 1:
-        return Decision(
-            "diverged",
-            approved,
-            target,
-            reason=f"the approved revision is not an ancestor of {common.MAIN_REF}",
-        )
-    if not ancestry.ok:
+    if ancestry.returncode not in (0, 1):
         return Decision("failed", approved, target, reason=ancestry.failure())
+    change = _tree_change(ctx, approved, target)
+    if change is None:
+        return Decision("failed", approved, target, reason="cannot compare the trees")
+    shipped, relevant, special = change
+    if ancestry.returncode == 1:
+        why = f"the approved revision is not an ancestor of {common.MAIN_REF}"
+        return Decision("diverged", approved, target, why, relevant, special=special)
 
-    changed = changed_paths(ctx.git, approved, target)
     size = waiting_range(ctx.git, approved, target)
-    if changed is None or size is None:
+    if size is None:
         return Decision("failed", approved, target, reason="cannot read the range")
-    shipped = shipped_paths(ctx.git.show(approved, UPDATE_SCRIPT_REL))
-    relevant = tuple(relevant_paths(changed, shipped))
-    if not relevant:
-        return Decision("promote", approved, target, REASON_INERT, (), *size)
+    commits, oldest = size
 
-    waiting = "changes what the Mac executes or ships"
+    def decide(action: str, reason: str) -> Decision:
+        return Decision(
+            action, approved, target, reason, relevant, commits, oldest, special
+        )
+
+    if special:
+        return decide(
+            "await", f"adds or changes what is not a plain file: {special[0]}"
+        )
+    if not relevant:
+        return decide("promote", REASON_INERT)
     if shipped is None:
-        waiting = f"cannot read the shipped lists from {UPDATE_SCRIPT_REL}"
-    elif set(relevant) == BUMP_PATHS:
-        problem = bump_problem_between(ctx.git, approved, target, only=False)
-        problem = problem or recorded_bump_problem(ctx, target)
-        if problem is None:
-            return Decision("promote", approved, target, REASON_BUMP, relevant, *size)
-        waiting = f"not a model bump this Mac tested: {problem}"
-    return Decision("await", approved, target, waiting, relevant, *size)
+        return decide(
+            "await", f"cannot read the shipped lists from {UPDATE_SCRIPT_REL}"
+        )
+    if set(relevant) != bump.BUMP_PATHS:
+        return decide("await", "changes what the Mac executes or ships")
+    problem = bump.bump_problem_between(ctx.git, approved, target, only=False)
+    problem = problem or bump.recorded_bump_problem(ctx, approved, target)
+    if problem is not None:
+        return decide("await", f"not a model bump this Mac tested: {problem}")
+    return decide("promote", REASON_BUMP)
 
 
 def _result(
@@ -564,7 +334,7 @@ def auto_promote(ctx: common.Context) -> common.StepResult:
         # while the default branch still names it.
         if ctx.git.commit_of(common.MAIN_REF) != decision.target:
             return _result("git-failed", common.EXIT_FAILED, "the default branch moved")
-        write_approved(ctx.paths, decision.target)
+        _advance(ctx, decision.target)
         moved = (
             f"{common.short_sha(decision.approved)} -> "
             f"{common.short_sha(decision.target)} ({decision.reason})"
@@ -576,7 +346,7 @@ def auto_promote(ctx: common.Context) -> common.StepResult:
     if decision.oldest is not None:
         age_days = max(ctx.now - decision.oldest, 0.0) / common.SECONDS_PER_DAY
     overdue = age_days > PROMOTION_OVERDUE_DAYS
-    shown = ", ".join(decision.relevant[:RELEVANT_SHOWN])
+    shown = ", ".join([*decision.special, *decision.relevant][:RELEVANT_SHOWN])
     detail = (
         f"awaiting promotion: {decision.commits} changes, oldest "
         f"{age_days:.1f} days; {decision.reason}; {shown}"
@@ -604,37 +374,42 @@ def awaiting_summary(ctx: common.Context) -> tuple[str | None, str | None, int |
 # The owner's command
 # --------------------------------------------------------------------------
 
+Say = Callable[[str], None]
 
-def _show_range(
-    ctx: common.Context, decision: Decision, say: Callable[[str], None]
-) -> None:
-    """Print the range for review. Records are split at NUL, never at a line
-    break a commit subject could carry, and every line passes ``say``."""
+
+def _show_commits(ctx: common.Context, revisions: str, say: Say) -> None:
+    """List commits with a link to each. Records are split at NUL, never at a
+    line break a subject could carry. The link is built from the commit's own
+    SHA: a subject can claim any pull-request number it likes."""
+    limit = ["-n", str(COMMITS_SHOWN)]
+    listed = ctx.git.text(["log", "-z", "--format=%H%x09%s", *limit, revisions])
+    total = ctx.git.text(["rev-list", "--count", revisions])
+    records = [record for record in (listed or "").split("\0") if "\t" in record]
+    for record in records:
+        sha, subject = record.strip().split("\t", 1)
+        say(f"  {common.short_sha(sha)} {subject}")
+        say(f"    {common.FORK_WEB_URL}/commit/{sha}")
+    count = int(total) if total is not None and total.isdigit() else len(records)
+    if count > len(records):
+        say(f"  ({count - len(records)} more commits are not listed)")
+
+
+def _show_change(ctx: common.Context, decision: Decision, say: Say) -> None:
+    """What differs between the approved tree and the target: the changed
+    paths, anything that is not a plain file, and what the Mac would execute
+    or ship of it. Works for any two commits, related or not."""
     approved, target = str(decision.approved), str(decision.target)
-    span = f"{approved}..{target}"
-    listed = ctx.git.text(
-        ["log", "-z", "--format=%h%x09%s", "-n", str(COMMITS_SHOWN), span]
-    )
-    subjects = [record for record in (listed or "").split("\0") if record.strip()]
-    total = ctx.git.text(["rev-list", "--count", span]) or "?"
-    say(f"{total} commits in {common.short_sha(approved)}..{common.short_sha(target)}:")
-    for record in subjects:
-        say(f"  {record.strip()}")
-        reference = PULL_REFERENCE_RE.search(record)
-        if reference is not None:
-            say(f"    {common.FORK_WEB_URL}/pull/{reference.group(1)}")
-    if len(subjects) >= COMMITS_SHOWN:
-        say(f"  (the first {COMMITS_SHOWN}; the rest are in the diff)")
-    say("")
     stat = ctx.git.text(["diff", "--stat=100", approved, target]) or "(no diff stat)"
     lines = stat.split("\n")
     for line in lines[:STAT_LINES_SHOWN]:
         say(line)
     if len(lines) > STAT_LINES_SHOWN:
-        say(f"  (+{len(lines) - STAT_LINES_SHOWN} more lines)")
+        say(f"  ({len(lines) - STAT_LINES_SHOWN} more lines are not shown)")
     say("")
     say(f"Inspect: git -C {ctx.paths.clone} diff {approved} {target}")
     say("")
+    for entry in decision.special:
+        say(f"  NOT A PLAIN FILE (a link or another repository): {entry}")
     if decision.action == "promote":
         say(f"The next scheduled run would promote this by itself ({decision.reason}).")
         return
@@ -643,10 +418,8 @@ def _show_range(
         say(f"  executed or shipped: {path}")
 
 
-def manual_promote(
-    ctx: common.Context, ask: Callable[[str], str], out: Callable[[str], None]
-) -> int:
-    """The owner's command: show the range, ask for a typed word, advance."""
+def manual_promote(ctx: common.Context, ask: Callable[[str], str], out: Say) -> int:
+    """The owner's command: show the change, ask for a typed word, advance."""
 
     def say(text: str) -> None:
         out(common.safe_text(text))
@@ -656,45 +429,34 @@ def manual_promote(
         say(f"promote: {decision.reason}")
         unconfigured = decision.action == "unconfigured"
         return common.EXIT_USAGE if unconfigured else common.EXIT_FAILED
-    if decision.action == "up-to-date" or decision.target is None:
-        say(
-            f"promote: {common.short_sha(decision.approved)} is already the default branch"
-        )
+    approved, target = decision.approved, decision.target
+    if decision.action == "up-to-date" or approved is None or target is None:
+        say(f"promote: {common.short_sha(approved)} is already the default branch")
         return common.EXIT_OK
     if decision.action == "diverged":
         say(f"WARNING: {decision.reason}.")
         say("The history of the default branch was rewritten, or the approved")
-        say("revision was never on it. No range can be shown.")
-        listed = ctx.git.text(
-            [
-                "log",
-                "-z",
-                "--format=%h%x09%s",
-                "-n",
-                str(DIVERGED_SHOWN),
-                decision.target,
-            ]
-        )
-        for record in (listed or "").split("\0"):
-            say(f"  {record.strip()}")
+        say("revision was never on it. Its newest commits, then everything that")
+        say("differs between the approved tree and it:")
+        _show_commits(ctx, target, say)
     else:
-        _show_range(ctx, decision, say)
+        say(f"Commits in {common.short_sha(approved)}..{common.short_sha(target)}:")
+        _show_commits(ctx, f"{approved}..{target}", say)
+    say("")
+    _show_change(ctx, decision, say)
     say("")
     answer = ask(
-        f"Type {CONFIRM_WORD} to let this Mac execute and distribute "
-        f"{decision.target}: "
+        f"Type {CONFIRM_WORD} to let this Mac execute and distribute {target}: "
     )
     if answer.strip() != CONFIRM_WORD:
         say("promote: not confirmed; the approved revision is unchanged")
         return common.EXIT_OK
-    if ctx.git.commit_of(common.MAIN_REF) != decision.target:
+    if ctx.git.commit_of(common.MAIN_REF) != target:
         say("promote: the default branch moved while you were reading; run it again")
         return common.EXIT_FAILED
-    write_approved(ctx.paths, decision.target)
-    ctx.log.line(
-        f"promote: {common.short_sha(decision.approved)} -> "
-        f"{common.short_sha(decision.target)} (owner)"
-    )
-    say(f"promote: approved revision is now {decision.target}")
+    _advance(ctx, target)
+    owner = f"{common.short_sha(approved)} -> {common.short_sha(target)} (owner)"
+    ctx.log.line(f"promote: {owner}")
+    say(f"promote: approved revision is now {target}")
     say("The next scheduled run executes it; `launchd.sh run-now` runs one now.")
     return common.EXIT_OK

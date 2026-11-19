@@ -23,11 +23,13 @@ from maint_support import (
     FAMILY,
     NEWER,
     OTHER_FAMILY,
+    bump,
     common,
     entry,
     gh,
     maint_run,
     model_watch,
+    promote,
     report,
 )
 
@@ -326,20 +328,33 @@ def test_watch_with_unusable_catalog_fails(
     assert_clone_left_clean(bumpable)
 
 
-def test_watch_with_manifest_the_approved_tool_cannot_read_waits(
-    bumpable: support.Fork,
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "{ not json",
+        json.dumps({"codex": {"model": "has a space", "reasoning_effort": EFFORT}}),
+        json.dumps(
+            {"codex": {"model": f"{CURRENT}\n# title", "reasoning_effort": EFFORT}}
+        ),
+        json.dumps({"codex": {"model": CURRENT, "reasoning_effort": "x; rm -rf ~"}}),
+        json.dumps({"codex": {"reasoning_effort": EFFORT}}),
+        json.dumps(["not", "an", "object"]),
+    ],
+    ids=[
+        "not-json",
+        "model-with-space",
+        "model-with-newline",
+        "effort",
+        "no-model",
+        "list",
+    ],
+)
+def test_watch_with_a_manifest_it_cannot_read_waits(
+    bumpable: support.Fork, broken: str
 ) -> None:
-    manifest = json.loads(
-        (bumpable.seed / support.MANIFEST_REL).read_text(encoding="utf-8")
-    )
-    bumpable.commit(
-        {
-            support.MANIFEST_REL: json.dumps(
-                {**manifest, "schema_version": 99}, indent=2
-            )
-        },
-        "a newer manifest schema",
-    )
+    # The values come from a file on the fork and end up in titles and logs:
+    # anything but the plain shape is not read at all.
+    bumpable.commit({support.MANIFEST_REL: broken}, "a manifest of another shape")
     bumpable.fetch()
 
     result = watch(bumpable)
@@ -348,6 +363,7 @@ def test_watch_with_manifest_the_approved_tool_cannot_read_waits(
         "manifest-unreadable",
         common.EXIT_NEEDS_OWNER,
     )
+    assert bumpable.gh_state()["issues"] == []
     assert_nothing_published(bumpable)
     assert_clone_left_clean(bumpable)
 
@@ -1370,6 +1386,7 @@ def test_watch_records_the_bump_it_vouched_for(bumpable: support.Fork) -> None:
     records = json.loads(bumpable.paths.bump_records_file.read_text(encoding="utf-8"))
     head = support.git(bumpable.bare, "rev-parse", BRANCH)
     assert [(record["slug"], record["commit"]) for record in records] == [(NEWER, head)]
+    assert records[0]["pull"] == 10  # tied to the pull request it opened
     for rel in (support.MANIFEST_REL, support.CONFIG_REL):
         assert records[0]["blobs"][rel] == support.git(
             bumpable.bare, "rev-parse", f"{BRANCH}:{rel}"
@@ -1630,7 +1647,8 @@ def test_promote_at_a_terminal_advances_the_approved_revision(
 
     assert done.returncode == common.EXIT_OK, done.stdout + done.stderr
     assert "hook (#7)" in done.stdout
-    assert f"{common.FORK_WEB_URL}/pull/7" in done.stdout
+    assert f"{common.FORK_WEB_URL}/commit/{head}" in done.stdout
+    assert "/pull/7" not in done.stdout  # a subject's claim is not linked
     assert f"Inspect: git -C {installed.paths.clone} diff" in done.stdout
     assert installed.approved() == head
 
@@ -1834,38 +1852,45 @@ def unusable_commit(fork: support.Fork) -> str:
     return support.git(fork.seed, "rev-parse", "HEAD")
 
 
-def test_launcher_when_the_approved_revision_cannot_be_checked_out_says_so_everywhere(
+def test_launcher_when_the_approved_revision_cannot_be_checked_out_runs_nothing(
     installed: support.Fork,
 ) -> None:
+    # A good run first, so there is an older revision to fall back to. Then
+    # the approved revision becomes one that cannot be checked out, while an
+    # inert change and a newer model both wait: exactly what an older
+    # revision's own rules would promote and open a pull request for.
     assert launch(installed, "run").returncode == common.EXIT_OK
     good = installed.approved()
+    summary = installed.paths.last_run_file.read_text(encoding="utf-8")
     broken = unusable_commit(installed)
     installed.approve(broken)
+    installed.commit({"README.md": "# inert, and waiting\n"}, "docs")
+    installed.set_catalog(entry(CURRENT), entry(NEWER))
     installed.set_gh(
         issues=[
             {"number": 3, "state": "OPEN", "body": "", "labels": [common.LABEL_STATUS]}
         ]
     )
+    calls = len(installed.gh_state()["calls"])
 
     done = launch(installed, "run")
-    status = launch(installed, "status")
 
-    # The run happened on the last revision that could be checked out, and
-    # the failure is in the exit code, the summary, the public comment, the
-    # failure record and the status output.
     assert done.returncode == common.EXIT_FAILED
     assert "cannot check out the approved revision" in done.stderr
-    assert "launchd.sh promote" in done.stderr
-    assert step_results(installed)["launcher"] == "checkout-failed"
-    assert (
-        "| launcher | checkout-failed | 3 |"
-        in installed.gh_state()["comments"][0]["body"]
-    )
+    assert "nothing was run" in done.stderr and "Next:" in done.stderr
+    assert installed.approved() == broken  # nothing promoted
+    assert installed.remote_branches() == ["main"]  # no bump branch
+    assert len(installed.gh_state()["calls"]) == calls  # no pull request, no comment
+    assert installed.paths.last_run_file.read_text(encoding="utf-8") == summary
     assert broken in installed.paths.launcher_failure_file.read_text(encoding="utf-8")
+
+    # `status` and `promote` still work, on the last revision that did check
+    # out, and say what is wrong.
+    status = launch(installed, "status")
+    assert status.returncode == common.EXIT_OK
     assert "LAUNCHER FAILURE" in status.stdout
     assert support.git(installed.paths.clone, "rev-parse", "HEAD") == good
 
-    # `promote` still works, and after it the failure is gone from view.
     support.git(
         installed.seed, "rm", "--quiet", "--cached", "-r", "scripts/" + "a" * 300
     )
@@ -1882,7 +1907,41 @@ def test_launcher_when_the_approved_revision_cannot_be_checked_out_says_so_every
     assert installed.approved() == fixed
     assert after.returncode == common.EXIT_OK, after.stderr
     assert not installed.paths.launcher_failure_file.exists()
-    assert "launcher" not in step_results(installed)
+    assert step_results(installed)["model-watch"] == "pr-opened"
+
+
+def test_run_on_a_fallback_revision_promotes_nothing_and_opens_nothing(
+    installed: support.Fork,
+) -> None:
+    # The dispatcher's own refusal, for a `run` that reaches it on a revision
+    # the launcher marked as a fallback.
+    assert launch(installed, "run").returncode == common.EXIT_OK
+    approved = installed.approved()
+    installed.commit({"README.md": "# inert, and waiting\n"}, "docs")
+    installed.fetch()
+    installed.set_catalog(entry(CURRENT), entry(NEWER))
+    calls = len(installed.gh_state()["calls"])
+    env = {**installed.env, common.CHECKOUT_FAILED_ENV: "f" * 40}
+
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(installed.paths.clone / "scripts" / "maint" / "run.py"),
+            "run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert done.returncode == common.EXIT_FAILED
+    assert installed.approved() == approved
+    assert installed.remote_branches() == ["main"]
+    assert len(installed.gh_state()["calls"]) == calls
+    assert step_results(installed) == {"launcher": "checkout-failed"}
+    assert last_run(installed)["exit_code"] == common.EXIT_FAILED
 
 
 def test_launcher_with_no_revision_it_can_check_out_stops_with_a_next_step(
@@ -1955,4 +2014,137 @@ def test_launcher_ends_a_git_command_that_stalls(installed: support.Fork) -> Non
     assert done.returncode == common.EXIT_FAILED
     assert "cannot fetch the fork" in done.stderr
     assert time.monotonic() - started < 15  # three attempts of one second each
+    assert installed.gh_state()["calls"] == []
+
+
+# --------------------------------------------------------------------------
+# Round 3
+# --------------------------------------------------------------------------
+
+
+def test_watch_with_a_model_override_file_on_the_fork_is_not_steered_by_it(
+    bumpable: support.Fork,
+) -> None:
+    # The file a project uses to override the manifest, merged on the fork and
+    # naming a model the catalog does not list. Read through the manifest
+    # tool it would become "the current model".
+    override = {"schema_version": 1, "codex": {"model": f"gpt-1-{FAMILY}"}}
+    bumpable.commit(
+        {promote.LOCAL_OVERRIDE_REL: json.dumps(override) + "\n"}, "chore: override"
+    )
+    bumpable.fetch()
+
+    result = watch(bumpable)
+
+    assert (result.result, result.exit_code) == (
+        "override-in-tree",
+        common.EXIT_NEEDS_OWNER,
+    )
+    assert bumpable.gh_state()["issues"] == []  # no "model not listed" notice
+    assert bumpable.codex_calls("exec") == []
+    assert_nothing_published(bumpable)
+    assert_clone_left_clean(bumpable)
+
+
+def test_watch_reads_the_current_model_from_the_manifest_at_the_branch(
+    bumpable: support.Fork,
+) -> None:
+    ctx = bumpable.context()
+    main = str(ctx.git.commit_of(common.MAIN_REF))
+
+    assert model_watch._manifest_values(ctx, main) == (CURRENT, EFFORT)
+    assert bumpable.codex_state()["calls"] == []  # by reading one blob, no tool
+
+
+def prepared_elsewhere(fork: support.Fork) -> str:
+    """A bump branch of exactly the right shape that this Mac did not build:
+    the manifest is serialized differently and its history gains an entry."""
+    support.git(fork.seed, "checkout", "--quiet", "-b", "prepared")
+    for args in (["set", "codex.model", NEWER], ["apply"]):
+        support.run_models(fork.seed, args)
+    path = fork.seed / support.MANIFEST_REL
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["superseded"]["codex.model"].append(f"gpt-7.1.5-{FAMILY}")
+    path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
+    support.git(fork.seed, "commit", "--quiet", "-am", "prepared elsewhere")
+    support.git(fork.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
+    head = support.git(fork.seed, "rev-parse", "HEAD")
+    support.git(fork.seed, "checkout", "--quiet", "main")
+    return head
+
+
+def test_watch_does_not_vouch_for_a_bump_branch_someone_else_prepared(
+    bumpable: support.Fork,
+) -> None:
+    head = prepared_elsewhere(bumpable)
+    ctx = bumpable.context()
+    main = str(ctx.git.commit_of(common.MAIN_REF))
+
+    result = watch(bumpable)
+
+    # It is a well-formed bump to the right slug...
+    assert shape_problem(bumpable, main, head) is None
+    # ...and still not this Mac's: no live call, no record, no pull request.
+    assert (result.result, result.exit_code) == (
+        "unknown-branch",
+        common.EXIT_NEEDS_OWNER,
+    )
+    assert "not with the files this Mac builds" in result.detail
+    assert bumpable.codex_calls("exec") == []
+    assert not bumpable.paths.bump_records_file.exists()
+    assert bumpable.gh_calls("pr", "create") == []
+    assert support.git(bumpable.bare, "rev-parse", BRANCH) == head  # left as it is
+    assert_clone_left_clean(bumpable)
+
+
+def shape_problem(fork: support.Fork, base: str, head: str) -> str | None:
+    """The shape verdict for a commit the watch has fetched."""
+    return bump.bump_problem_between(fork.context().git, base, head, NEWER)
+
+
+def test_watch_withdraws_auto_merge_from_an_open_pull_request_with_other_bytes(
+    bumpable: support.Fork,
+) -> None:
+    # The Mac's own pull request, then its branch is replaced by a bump of the
+    # same shape that the Mac did not build.
+    open_bump(bumpable)
+    support.git(bumpable.bare, "update-ref", "-d", f"refs/heads/{BRANCH}")
+    prepared_elsewhere(bumpable)
+
+    result = watch(bumpable)
+
+    assert (result.result, result.exit_code) == (
+        "unknown-branch",
+        common.EXIT_NEEDS_OWNER,
+    )
+    assert "auto-merge withdrawn" in result.detail
+    assert len(bumpable.gh_state()["merges"]) == 1
+    assert len(bumpable.gh_state()["disabled"]) == 1
+
+
+def test_watch_forgets_its_record_when_the_owner_closes_the_pull_request(
+    bumpable: support.Fork,
+) -> None:
+    open_bump(bumpable)
+    pulls = bumpable.gh_state()["pulls"]
+    pulls[-1]["state"] = "CLOSED"
+    bumpable.set_gh(pulls=pulls)
+
+    result = watch(bumpable)
+
+    assert (result.result, result.exit_code) == ("rejected-by-owner", common.EXIT_OK)
+    records = json.loads(bumpable.paths.bump_records_file.read_text(encoding="utf-8"))
+    assert records == []
+
+
+def test_launcher_fails_closed_when_the_refs_cannot_be_listed(
+    installed: support.Fork,
+) -> None:
+    installed.fail_git("for-each-ref")
+
+    done = launch(installed, "run")
+
+    assert done.returncode == common.EXIT_USAGE
+    assert "cannot list the refs" in done.stderr
+    assert list(installed.paths.clone.iterdir()) == [installed.paths.clone / ".git"]
     assert installed.gh_state()["calls"] == []

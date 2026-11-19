@@ -37,6 +37,8 @@ MIN_PYTHON="(3, 11)"
 COMMAND_DEADLINE_SEC=120
 PROBE_DEADLINE_SEC=60
 COMMITS_SHOWN=30
+NEWEST_SHOWN=10
+STAT_LINES_SHOWN=40
 LINE_WIDTH=200
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,9 +111,26 @@ with_deadline() {
 }
 
 # Text from the fork, made safe to show: every byte that is not printable
-# ASCII becomes `?`, and a line is cut at LINE_WIDTH.
+# ASCII becomes `?`, and a line longer than LINE_WIDTH is cut and says so.
 sanitize() {
-    LC_ALL=C tr -c '[:print:]\n' '?' | cut -c "1-${LINE_WIDTH}"
+    LC_ALL=C tr -c '[:print:]\n' '?' |
+        LC_ALL=C awk -v width="${LINE_WIDTH}" '{
+            if (length($0) > width) print substr($0, 1, width) " [line cut]"
+            else print
+        }'
+}
+
+# Print at most LIMIT lines of stdin. When there are more, say how many were
+# left out and which command shows all of them: nothing is cut silently.
+show_limited() {
+    local limit="$1" all_of_it="$2" text total
+    text="$(cat)"
+    [[ -n "${text}" ]] || return 0
+    total="$(wc -l <<< "${text}" | tr -d ' ')"
+    head -n "${limit}" <<< "${text}"
+    if [[ "${total}" -gt "${limit}" ]]; then
+        echo "  ($((total - limit)) more lines are not shown; all of them: ${all_of_it})"
+    fi
 }
 
 render_plist() {
@@ -232,13 +251,17 @@ cmd_print() {
 # `approved` and the fork's remote-tracking refs. A tag named origin/main
 # would otherwise stand in for the branch wherever a short name was used.
 require_expected_refs() {
-    local ref
+    # A list that cannot be read is not an empty list: the check fails closed.
+    local refs ref
+    if ! refs="$(g -C "${CLONE}" for-each-ref --format='%(refname)')"; then
+        die "cannot list the refs of ${CLONE}"
+    fi
     while IFS= read -r ref; do
         case "${ref}" in
-            refs/heads/approved | refs/remotes/origin/*) ;;
+            "" | refs/heads/approved | refs/remotes/origin/*) ;;
             *) die "${CLONE} holds a ref the job never creates; list them with: git -C ${CLONE} for-each-ref" ;;
         esac
-    done < <(g -C "${CLONE}" for-each-ref --format='%(refname)')
+    done <<< "${refs}"
 }
 
 ensure_clone() {
@@ -288,17 +311,20 @@ show_for_review() {
         local count
         count="$(g -C "${CLONE}" rev-list --count "${reviewed}..${rev}")"
         echo "${count} commits are on the fork that this checkout (${reviewed}) does not have:"
-        g -C "${CLONE}" log --format='  %h %s' -n "${COMMITS_SHOWN}" "${reviewed}..${rev}" | sanitize
+        g -C "${CLONE}" log --format='  %h %s' "${reviewed}..${rev}" | sanitize |
+            show_limited "${COMMITS_SHOWN}" "git -C ${CLONE} log ${reviewed}..${rev}"
         echo "Changed paths:"
-        g -C "${CLONE}" diff --stat=100 "${reviewed}" "${rev}" | sanitize | tail -n 40
+        g -C "${CLONE}" diff --stat=100 "${reviewed}" "${rev}" | sanitize |
+            show_limited "${STAT_LINES_SHOWN}" "git -C ${CLONE} diff --stat ${reviewed} ${rev}"
         echo "Inspect: git -C ${CLONE} diff ${reviewed} ${rev}"
         return
     fi
     echo "This checkout's commit is not in the fork's history, so no range can be shown."
-    echo "The newest commits there:"
-    g -C "${CLONE}" log --format='  %h %s' -n 10 "${rev}" | sanitize
+    echo "The newest ${NEWEST_SHOWN} commits there:"
+    g -C "${CLONE}" log --format='  %h %s' -n "${NEWEST_SHOWN}" "${rev}" | sanitize
     echo "Changed paths in the newest commit:"
-    g -C "${CLONE}" show --stat=100 --format= "${rev}" | sanitize | tail -n 40
+    g -C "${CLONE}" show --stat=100 --format= "${rev}" | sanitize |
+        show_limited "${STAT_LINES_SHOWN}" "git -C ${CLONE} show --stat ${rev}"
     echo "Inspect: git -C ${CLONE} log --stat ${rev}"
 }
 

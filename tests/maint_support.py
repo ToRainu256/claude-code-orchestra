@@ -78,6 +78,7 @@ SEED_IN_SCAFFOLD = "scripts/scaffold/STATE.md"
 if str(MAINT_DIR) not in sys.path:
     sys.path.insert(0, str(MAINT_DIR))
 
+import bump  # noqa: E402
 import common  # noqa: E402
 import gh  # noqa: E402
 import model_watch  # noqa: E402
@@ -85,18 +86,33 @@ import promote  # noqa: E402
 import report  # noqa: E402
 import run as maint_run  # noqa: E402
 
-MODULES: tuple[ModuleType, ...] = (common, gh, promote, model_watch, report, maint_run)
+MODULES: tuple[ModuleType, ...] = (
+    bump,
+    common,
+    gh,
+    promote,
+    model_watch,
+    report,
+    maint_run,
+)
 
 # The git stand-in. `{real}` is the real git, `{bare}` the scratch fork.
 # A file named `<this script>.stall` holding one word makes any command with
-# that word as an argument hang, for the deadline tests.
+# that word as an argument hang, for the deadline tests; `<this script>.fail`
+# makes it fail.
 FAKE_GIT = """#!/bin/sh
 GIT_ALLOW_PROTOCOL=file
 export GIT_ALLOW_PROTOCOL
 stall=""
 [ -f "$0.stall" ] && stall="$(cat "$0.stall")"
+fail=""
+[ -f "$0.fail" ] && fail="$(cat "$0.fail")"
 network=no
 for arg in "$@"; do
+    if [ -n "$fail" ] && [ "$arg" = "$fail" ]; then
+        echo "fake git: forced failure of $arg" >&2
+        exit 1
+    fi
     if [ -n "$stall" ] && [ "$arg" = "$stall" ]; then
         sleep 20 > /dev/null 2>&1
     fi
@@ -165,6 +181,12 @@ if group == "pr list":
         and option("--author") in (None, p["author"]["login"])
     ]
     finish(0, json.dumps(found))
+if group == "pr view":
+    found = [p for p in state["pulls"] if str(p["number"]) == args[4]]
+    if not found:
+        sys.stderr.write("fake gh: no such pull request\n")
+        finish(1)
+    finish(0, json.dumps(found[0]))
 if group == "pr create":
     number = state["next_number"]
     state["next_number"] += 1
@@ -180,6 +202,7 @@ if group == "pr create":
         "number": number, "state": "OPEN", "url": url, "headRefOid": head,
         "headRefName": option("--head"), "baseRefName": option("--base"),
         "author": {"login": state["login"]}, "isCrossRepository": False,
+        "mergeCommit": None,
         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "title": option("--title"), "body": option("--body"),
     })
@@ -386,6 +409,10 @@ class Fork:
     def codex_calls(self, first: str) -> list[list[str]]:
         return [call for call in self.codex_state()["calls"] if call[:1] == [first]]
 
+    def fail_git(self, word: str) -> None:
+        """Make every git command with ``word`` as an argument fail."""
+        (self.bin_dir / "git.fail").write_text(word, encoding="utf-8")
+
     def stall_git(self, word: str | None) -> None:
         """Make every git command with ``word`` as an argument hang."""
         marker = self.bin_dir / "git.stall"
@@ -419,15 +446,25 @@ class Fork:
         git(self.seed, "push", "--quiet", "origin", "HEAD:main")
         return git(self.seed, "rev-parse", "HEAD")
 
-    def squash_merge(self, branch: str) -> str:
-        """What GitHub does when the bump pull request merges: one new commit
-        on the default branch with the branch's changes."""
+    def squash_merge(self, branch: str, by_pull_request: bool = True) -> str:
+        """One new commit on the default branch with the branch's changes.
+
+        With ``by_pull_request`` this is GitHub merging the open pull request
+        of that branch, which then says so. Without, the same content reaches
+        the default branch by some other means and no pull request changes.
+        """
         git(self.seed, "checkout", "--quiet", "main")
         git(self.seed, "fetch", "--quiet", "origin", branch)
         git(self.seed, "merge", "--quiet", "--squash", "FETCH_HEAD")
         git(self.seed, "commit", "--quiet", "-m", f"merge {branch} (#10)")
         git(self.seed, "push", "--quiet", "origin", "HEAD:main")
-        return git(self.seed, "rev-parse", "HEAD")
+        merged = git(self.seed, "rev-parse", "HEAD")
+        pulls = self.gh_state()["pulls"]
+        mine = [p for p in pulls if p["headRefName"] == branch and p["state"] == "OPEN"]
+        if by_pull_request and mine:
+            mine[0].update(state="MERGED", mergeCommit={"oid": merged})
+            self.set_gh(pulls=pulls)
+        return merged
 
     def fetch(self) -> str:
         """What the launcher does before every run: fetch exactly the default

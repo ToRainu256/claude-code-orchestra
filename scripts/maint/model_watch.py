@@ -29,8 +29,15 @@ opens a second pull request. Whatever is found there is verified again by
 this run before it is acted on: auto-merge is only ever asked for on a commit
 this run has itself found to be exactly the bump.
 
-Every bump this step vouches for is recorded locally
-(``promote.record_bump``); the promotion rule accepts no other.
+The bump is always built here, by this run. A branch found on the fork is
+used only when its two files are byte for byte the ones this run built; this
+step never vouches for a bump someone else prepared. Every bump it does vouch
+for is recorded locally (``bump.record_bump``) and tied to the pull request
+opened for it; the promotion rule accepts no other.
+
+What the default branch names now is read from the manifest file at that
+commit itself. A project override file on the fork is not consulted, and the
+step does nothing while one is there.
 
 Outcomes and exit codes: ``OUTCOMES`` below, explained in
 ``scripts/maint/README.md``.
@@ -46,6 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import bump
 import common
 import promote
 
@@ -54,12 +62,10 @@ BRANCH_PREFIX = "bot/models-"
 WORKTREE_NAME = "model-watch"
 MODELS_TOOL = ".claude/skills/_shared/models.py"
 CONSULT_TOOL = ".claude/skills/_shared/codex_consult.py"
-EFFORT_KEY = "codex.reasoning_effort"
 EFFORT_CONFIG_KEY = "model_reasoning_effort"
 
 PREFLIGHT_TIMEOUT_SEC = 30
 CATALOG_TIMEOUT_SEC = 120
-MANIFEST_TIMEOUT_SEC = 30
 PREPARE_TIMEOUT_SEC = 60
 SMOKE_CALL_TIMEOUT_SEC = 600
 # The wrapper enforces its own timeout; this is the backstop around it.
@@ -90,6 +96,7 @@ OUTCOMES: dict[str, tuple[int, ...]] = {
     "git-failed": (_FAILED,),
     "github-failed": (_FAILED,),
     "manifest-unreadable": (_OWNER,),
+    "override-in-tree": (_OWNER,),
     RESULT_UNPARSEABLE: (_OWNER,),
     RESULT_UP_TO_DATE: (_OK,),
     RESULT_NOT_LISTED: (_OK, _OWNER),
@@ -247,16 +254,27 @@ def _models_tool(
     return result
 
 
-def _manifest_value(ctx: common.Context, tree: Path, key: str) -> str | None:
-    result = _models_tool(ctx, tree, ["get", key], MANIFEST_TIMEOUT_SEC)
-    if not result.ok:
+def _manifest_values(ctx: common.Context, main: str) -> tuple[str, str] | None:
+    """(model, effort) as the manifest file at the default branch names them.
+
+    Read from that one blob, not through the manifest tool: the tool resolves
+    a project's own override file, and a file of that name on the fork must
+    not decide what this step believes the current model is. The values come
+    from the fork, so they are held to a strict shape before any use.
+    """
+    entry = bump.tree_entry(ctx.git, main, bump.MANIFEST_REL)
+    if entry is None or entry[:2] != bump.REGULAR_ENTRY:
         return None
-    try:
-        payload = json.loads(result.stdout)
-    except ValueError:
+    document = bump.parse_manifest(ctx.git.show(main, bump.MANIFEST_REL) or "")
+    section = document.get(bump.MODEL_SECTION) if document else None
+    if not isinstance(section, dict):
         return None
-    value = payload.get("value") if isinstance(payload, dict) else None
-    return value if isinstance(value, str) else None
+    model, effort = section.get(bump.MODEL_LEAF), section.get(bump.EFFORT_LEAF)
+    if not isinstance(model, str) or not common.MODEL_VALUE_RE.fullmatch(model):
+        return None
+    if not isinstance(effort, str) or not common.EFFORT_RE.fullmatch(effort):
+        return None
+    return model, effort
 
 
 def preflight(ctx: common.Context) -> str | None:
@@ -380,17 +398,20 @@ def _auto_merge(ctx: common.Context, url: object, sha: str, done: str) -> Outcom
     return Outcome(done, _OK, f"pull request {number}")
 
 
-def _verified_branch(ctx: common.Context, bump: Bump) -> tuple[str, str]:
-    """What the fork's bump branch is, checked by this run.
+def _verified_branch(ctx: common.Context, bump_: Bump, built: str) -> tuple[str, str]:
+    """What the fork's bump branch is, checked by this run against the bump
+    this run built (``built``).
 
     Returns ``("ok", commit)`` when the branch is exactly one commit on top of
-    the default branch's history and that commit is exactly this bump;
-    ``("absent", "")`` when there is no such branch; ``("other", why)`` when
-    it is anything else; ``("failed", why)`` when git could not tell, which
-    is a failure to retry and not a statement about the branch.
+    the default branch's history, that commit is exactly this bump, and its
+    two files are the very objects this run built; ``("absent", "")`` when
+    there is no such branch; ``("other", why)`` when it is anything else,
+    including a well-formed bump with other bytes; ``("failed", why)`` when
+    git could not tell, which is a failure to retry and not a statement about
+    the branch.
     """
-    branch_ref = f"refs/heads/{bump.branch}"
-    tracking = f"{common.TRACKING_PREFIX}{bump.branch}"
+    branch_ref = f"refs/heads/{bump_.branch}"
+    tracking = f"{common.TRACKING_PREFIX}{bump_.branch}"
     heads = ctx.git.run(["ls-remote", "--heads", common.REMOTE, branch_ref])
     if not heads.ok:
         return "failed", heads.failure()
@@ -402,11 +423,15 @@ def _verified_branch(ctx: common.Context, bump: Bump) -> tuple[str, str]:
     head = ctx.git.commit_of(tracking) if fetched.ok else None
     if head is None:
         return "failed", fetched.failure()
-    base = ctx.git.text(["merge-base", bump.main, head])
+    base = ctx.git.text(["merge-base", bump_.main, head])
     if base is None or ctx.git.commit_of(f"{head}^") != base:
         return "other", f"not one commit on top of {common.DEFAULT_BRANCH}"
-    problem = promote.bump_problem_between(ctx.git, base, head, bump.slug)
-    return ("other", problem) if problem is not None else ("ok", head)
+    problem = bump.bump_problem_between(ctx.git, base, head, bump_.slug)
+    if problem is not None:
+        return "other", problem
+    if bump.blobs_of(ctx.git, head) != bump.blobs_of(ctx.git, built):
+        return "other", "a bump, but not with the files this Mac builds"
+    return "ok", head
 
 
 def smoke_problem(ctx: common.Context, slug: str, effort: str) -> str | None:
@@ -478,63 +503,66 @@ def _pull_text(bump: Bump) -> tuple[str, str]:
 
 
 def _vouch_and_open(
-    ctx: common.Context, bump: Bump, head: str, push: Path | None
+    ctx: common.Context, bump_: Bump, head: str, push: Path | None
 ) -> Outcome:
     """The live call, the last shape check, the local record, the push (when
     the commit is still local) and the pull request, in that order, for a
-    commit already found to be exactly the bump."""
-    problem = smoke_problem(ctx, bump.slug, bump.effort)
+    commit already found to be exactly the bump this run built."""
+    problem = smoke_problem(ctx, bump_.slug, bump_.effort)
     if problem is not None:
         return Outcome("smoke-failed", _FAILED, problem)
     if push is not None:
         # Checked again against the default branch as it is fetched right
         # now, by its full name, immediately before anything leaves the Mac.
         main = ctx.git.commit_of(common.MAIN_REF)
-        problem = "the default branch moved" if main != bump.main else None
-        problem = problem or promote.bump_problem_between(
-            ctx.git, bump.main, head, bump.slug
+        problem = "the default branch moved" if main != bump_.main else None
+        problem = problem or bump.bump_problem_between(
+            ctx.git, bump_.main, head, bump_.slug
         )
         if problem is not None:
             return Outcome("unexpected-diff", _FAILED, problem)
     # From here on this Mac vouches for the commit: the promotion rule
-    # accepts a bump only when its two files are the ones recorded now.
-    if not promote.record_bump(ctx, bump.slug, head):
+    # accepts a bump only as the merge of the pull request opened below.
+    if not bump.record_bump(ctx, bump_.slug, head):
         return Outcome("git-failed", _FAILED, "cannot read the bump commit")
     if push is not None:
-        refspec = f"{head}:refs/heads/{bump.branch}"
+        refspec = f"{head}:refs/heads/{bump_.branch}"
         pushed = ctx.git.run(["push", "--quiet", common.REMOTE, refspec], cwd=push)
         if not pushed.ok:
             return Outcome("push-failed", _FAILED, pushed.failure())
-    title, body = _pull_text(bump)
-    created = ctx.github.create_pull(bump.branch, title, body)
+    title, body = _pull_text(bump_)
+    created = ctx.github.create_pull(bump_.branch, title, body)
     if not created.ok:
         return Outcome("pr-create-failed", _FAILED, created.failure())
-    lines = created.stdout.strip().split("\n")
-    return _auto_merge(ctx, lines[-1], head, "pr-opened")
+    url = created.stdout.strip().split("\n")[-1]
+    number = _pull_number(url)
+    if number is not None:
+        bump.attach_pull(ctx.paths, bump_.slug, head, number)
+    return _auto_merge(ctx, url, head, "pr-opened")
 
 
 def _prepare(
-    ctx: common.Context, tree: Path, bump: Bump
+    ctx: common.Context, tree: Path, bump_: Bump
 ) -> tuple[str | None, Outcome | None]:
     """Build the bump as one local commit and prove its shape. Nothing has
     left the Mac when this returns."""
     for args in (
-        ["set", promote.MODEL_KEY, bump.slug],
+        ["set", bump.MODEL_KEY, bump_.slug],
         ["apply"],
         ["check", "--strict"],
     ):
         done = _models_tool(ctx, tree, args, PREPARE_TIMEOUT_SEC)
         if not done.ok:
             return None, Outcome("apply-failed", _FAILED, done.failure())
-    title, _ = _pull_text(bump)
+    title, _ = _pull_text(bump_)
     for args in (["add", "--all"], ["commit", "--quiet", "--no-verify", "-m", title]):
         done = ctx.git.run(args, cwd=tree)
         if not done.ok:
             return None, Outcome("git-failed", _FAILED, done.failure())
     head = ctx.git.text(["rev-parse", "--verify", "HEAD^{commit}"], cwd=tree)
-    if head is None or ctx.git.commit_of(f"{head}^") != bump.main:
+    if head is None or ctx.git.commit_of(f"{head}^") != bump_.main:
         return None, Outcome("git-failed", _FAILED, "cannot read the new commit")
-    problem = promote.bump_problem_between(ctx.git, bump.main, head, bump.slug)
+    problem = bump.bump_problem_between(ctx.git, bump_.main, head, bump_.slug)
     if problem is not None:
         return None, Outcome("unexpected-diff", _FAILED, problem)
     return head, None
@@ -550,11 +578,14 @@ def _withdraw(ctx: common.Context, pull: dict[str, Any], why: str) -> Outcome:
     return Outcome("unknown-branch", _OWNER, f"open pull request: {why}; {note}")
 
 
-def _resume_open(ctx: common.Context, pull: dict[str, Any], bump: Bump) -> Outcome:
+def _resume_open(
+    ctx: common.Context, pull: dict[str, Any], bump_: Bump, built: str
+) -> Outcome:
     """An open pull request exists: keep auto-merge on for the commit this run
-    verified, and say so when it has waited too long for anything but a
-    person to fix. What GitHub reports as the head is never trusted."""
-    kind, value = _verified_branch(ctx, bump)
+    verified against its own build, and say so when it has waited too long
+    for anything but a person to fix. What GitHub reports as the head is
+    never trusted."""
+    kind, value = _verified_branch(ctx, bump_, built)
     if kind == "failed":
         return Outcome("git-failed", _FAILED, value)
     if kind != "ok":
@@ -569,44 +600,51 @@ def _resume_open(ctx: common.Context, pull: dict[str, Any], bump: Bump) -> Outco
     return outcome
 
 
-def _bump(ctx: common.Context, tree: Path, bump: Bump) -> Outcome:
-    """Let what is already on GitHub decide where to continue."""
-    pulls = ctx.github.pulls_for_head(bump.branch)
+def _bump(ctx: common.Context, tree: Path, bump_: Bump) -> Outcome:
+    """Let what is already on GitHub decide where to continue, after building
+    the bump here: whatever is found there is measured against that build."""
+    pulls = ctx.github.pulls_for_head(bump_.branch)
     if pulls is None:
         return Outcome("github-failed", _FAILED, "cannot list pull requests")
     states = {str(pull.get("state", "")).upper(): pull for pull in pulls}
     if "MERGED" in states:
-        return Outcome("already-merged", _OK, bump.branch)
-    if "OPEN" in states:
-        return _resume_open(ctx, states["OPEN"], bump)
-    if states:
-        return Outcome("rejected-by-owner", _OK, bump.branch)
+        return Outcome("already-merged", _OK, bump_.branch)
+    if states and "OPEN" not in states:
+        # The owner said no. The record made for that pull request must not
+        # promote the same files when they arrive some other way.
+        bump.drop_record(ctx.paths, bump_.slug)
+        return Outcome("rejected-by-owner", _OK, bump_.branch)
 
-    kind, value = _verified_branch(ctx, bump)
+    built, failure = _prepare(ctx, tree, bump_)
+    if failure is not None or built is None:
+        return failure or Outcome("git-failed", _FAILED, "no commit")
+    if "OPEN" in states:
+        return _resume_open(ctx, states["OPEN"], bump_, built)
+    kind, value = _verified_branch(ctx, bump_, built)
     if kind == "failed":
         return Outcome("git-failed", _FAILED, value)
     if kind == "other":
-        return Outcome("unknown-branch", _OWNER, f"{bump.branch}: {value}")
+        return Outcome("unknown-branch", _OWNER, f"{bump_.branch}: {value}")
     if kind == "ok":
-        # The branch is there without a pull request: a previous run stopped
-        # after the push, or someone else pushed it. Nothing proves which, so
-        # it was checked like a fresh one and the live call is made again.
-        return _vouch_and_open(ctx, bump, value, None)
-    head, failure = _prepare(ctx, tree, bump)
-    if failure is not None or head is None:
-        return failure or Outcome("git-failed", _FAILED, "no commit")
-    return _vouch_and_open(ctx, bump, head, tree)
+        # The branch is there without a pull request and holds exactly what
+        # this run built: a previous run stopped after its push. The live
+        # call is made again before anything is recorded.
+        return _vouch_and_open(ctx, bump_, value, None)
+    return _vouch_and_open(ctx, bump_, built, tree)
 
 
 def _watch(
     ctx: common.Context, tree: Path, main: str, catalog: object
 ) -> tuple[Outcome, int]:
     """The outcome, and how many informational notices could not be filed."""
-    current = _manifest_value(ctx, tree, promote.MODEL_KEY)
-    effort = _manifest_value(ctx, tree, EFFORT_KEY)
-    if current is None or effort is None or not common.EFFORT_RE.fullmatch(effort):
-        why = "the approved manifest tool could not read the default branch's manifest"
+    if bump.tree_entry(ctx.git, main, promote.LOCAL_OVERRIDE_REL) is not None:
+        why = f"the default branch carries {promote.LOCAL_OVERRIDE_REL}; remove it"
+        return Outcome("override-in-tree", _OWNER, why), 0
+    values = _manifest_values(ctx, main)
+    if values is None:
+        why = "the manifest at the default branch could not be read"
         return Outcome("manifest-unreadable", _OWNER, why), 0
+    current, effort = values
     try:
         selection = pick_candidate(catalog, current, effort)
     except CatalogError as exc:
@@ -623,8 +661,7 @@ def _watch(
     if selection.result in (RESULT_NOT_LISTED, RESULT_EFFORT):
         return _blocking_notice(ctx, selection, current, effort), unfiled
     if selection.result == RESULT_CANDIDATE and selection.slug is not None:
-        bump = Bump(main, current, selection.slug, effort)
-        return _bump(ctx, tree, bump), unfiled
+        return _bump(ctx, tree, Bump(main, current, selection.slug, effort)), unfiled
     return Outcome(RESULT_UP_TO_DATE, _OK, current), unfiled
 
 

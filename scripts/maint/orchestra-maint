@@ -126,13 +126,17 @@ main() {
     # Only the branch `approved` and the fork's remote-tracking refs belong
     # here. A tag named origin/main would be read in place of the branch by
     # anything that used the short name.
-    local ref
+    # A list that cannot be read is not an empty list: the check fails closed.
+    local refs ref
+    if ! refs="$(g -C "${clone}" for-each-ref --format='%(refname)')"; then
+        refuse "cannot list the refs of ${clone}"
+    fi
     while IFS= read -r ref; do
         case "${ref}" in
-            refs/heads/approved | refs/remotes/origin/*) ;;
+            "" | refs/heads/approved | refs/remotes/origin/*) ;;
             *) refuse "${clone} holds a ref the job never creates; list them with: git -C ${clone} for-each-ref" ;;
         esac
-    done < <(g -C "${clone}" for-each-ref --format='%(refname)')
+    done <<< "${refs}"
 
     local rev=""
     if [[ -f "${approved}" && ! -L "${approved}" ]]; then
@@ -163,13 +167,23 @@ main() {
     done
 
     # Execute exactly the approved revision, from a clean tree. If it cannot
-    # be checked out, fall back to the last revision that could, so the run
-    # can report the failure and `promote` stays usable.
+    # be checked out, nothing is run on any other revision: an older one would
+    # apply its own, older promotion rule and open pull requests by it. Only
+    # `promote` and `status` may then use the last revision that did check
+    # out, so the owner can see what waits and approve a fix.
     if put_tree "${rev}"; then
         printf '%s\n' "${rev}" > "${last_good}.tmp.$$"
         mv -f "${last_good}.tmp.$$" "${last_good}"
         rm -f "${failure}"
     else
+        case "${1:-}" in
+            promote | status) ;;
+            *)
+                note_failure "cannot check out the approved revision ${rev}; nothing was run" \
+                    "merge a fix, then: bash scripts/maint/launchd.sh promote"
+                exit 3
+                ;;
+        esac
         local good=""
         if [[ -f "${last_good}" && ! -L "${last_good}" ]]; then
             good="$(tr -d '[:space:]' < "${last_good}")"
@@ -179,7 +193,7 @@ main() {
                 "remove ${approved} and run launchd.sh install again"
             exit 3
         fi
-        note_failure "cannot check out the approved revision ${rev}; running ${good}, the last one that could" \
+        note_failure "cannot check out the approved revision ${rev}; showing ${good}, the last one that could" \
             "merge a fix, then: bash scripts/maint/launchd.sh promote"
         export ORCHESTRA_MAINT_CHECKOUT_FAILED="${rev}"
     fi

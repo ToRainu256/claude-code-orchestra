@@ -160,14 +160,15 @@ def promote_step(
 def launcher_result() -> list[common.StepResult]:
     """What the launcher had to do to get here, when it was not the plain
     case: the approved revision would not check out and this is the last one
-    that did. Reported like a step so it reaches the status comment."""
+    that did. The launcher itself stops a `run` in that state; this is the
+    same refusal for a `run` that reaches this file some other way."""
     failed = os.environ.get(common.CHECKOUT_FAILED_ENV, "")
     if not failed:
         return []
     detail = (
         f"the approved revision {common.short_sha(failed)} could not be checked "
-        "out; this run executes the last revision that could. Merge a fix, "
-        "then run launchd.sh promote."
+        "out, and nothing runs on an older one. Merge a fix, then run "
+        "launchd.sh promote."
     )
     return [
         common.checked_result(
@@ -188,6 +189,14 @@ def cmd_run(paths: common.Paths, after_promotion: str | None) -> int:
     ctx.log.line(f"run: start from {common.short_sha(promote.read_approved(paths))}")
 
     results = launcher_result()
+    if results:
+        # This is not the approved revision: the launcher fell back to an
+        # older one. That is enough to show the owner what waits (`promote`,
+        # `status`); it is never enough to promote or to open a pull request.
+        write_last_run(ctx, results, common.EXIT_FAILED)
+        print(common.one_line(f"run: {results[0].result}: {results[0].detail}"))
+        ctx.log.line("run: refused on a fallback revision; exit 3")
+        return common.EXIT_FAILED
     results.append(promote_step(ctx, lock, after_promotion))
     for name, step in STEPS:
         results.append(run_step(ctx, name, step))

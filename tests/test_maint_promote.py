@@ -18,6 +18,7 @@ from pathlib import Path
 import maint_support as support
 import pytest
 from maint_support import (
+    bump,
     common,
     maint_run,
     model_watch,
@@ -65,7 +66,7 @@ def bump_problem(
     new_history: tuple[str, ...] = ("gpt-7-astra", "gpt-7.1-astra"),
     expected: str | None = None,
 ) -> str | None:
-    return promote.model_bump_problem(
+    return bump.model_bump_problem(
         manifest_text(old, list(old_history)),
         manifest_text(new, list(new_history)),
         config_text(old),
@@ -127,7 +128,7 @@ def test_model_bump_problem_with_wrong_manifest_change_names_it(
 
 
 def test_model_bump_problem_with_another_manifest_key_changed_is_refused() -> None:
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         manifest_text("gpt-7.2-astra", ["gpt-7.1-astra"], effort="low"),
         config_text("gpt-7.1-astra"),
@@ -143,7 +144,7 @@ def test_model_bump_problem_with_a_value_that_only_compares_equal_is_refused() -
         '"schema_version": 1', '"schema_version": true'
     )
 
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         retyped,
         config_text("gpt-7.1-astra"),
@@ -158,7 +159,7 @@ def test_model_bump_problem_with_duplicate_manifest_key_is_refused() -> None:
         '"schema_version": 1', '"schema_version": 1, "schema_version": 1'
     )
 
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         doubled,
         config_text("gpt-7.1-astra"),
@@ -192,7 +193,7 @@ def test_model_bump_problem_with_duplicate_manifest_key_is_refused() -> None:
 def test_model_bump_problem_with_wrong_config_change_names_it(
     new_config: str, fragment: str
 ) -> None:
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         manifest_text("gpt-7.2-astra", ["gpt-7.1-astra"]),
         config_text("gpt-7.1-astra"),
@@ -208,7 +209,7 @@ def test_model_bump_problem_with_model_text_inside_a_string_is_refused() -> None
     old = 'note = """\nmodel = "gpt-7.1-astra"\n"""\nmodel = "gpt-7.1-astra"\n'
     new = 'note = """\nmodel = "gpt-7.2-astra"\n"""\nmodel = "gpt-7.1-astra"\n'
 
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         manifest_text("gpt-7.2-astra", ["gpt-7.1-astra"]),
         old,
@@ -222,7 +223,7 @@ def test_model_bump_problem_with_model_line_inside_a_table_is_refused() -> None:
     old = '[profiles.x]\nmodel = "gpt-7.1-astra"\n'
     new = '[profiles.x]\nmodel = "gpt-7.2-astra"\n'
 
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         manifest_text("gpt-7.2-astra", ["gpt-7.1-astra"]),
         old,
@@ -478,13 +479,13 @@ def test_auto_promote_with_own_bump_altered_before_the_merge_waits(
     result = promote.auto_promote(ctx)
 
     assert (
-        promote.bump_problem_between(
+        bump.bump_problem_between(
             ctx.git, str(before), str(ctx.git.commit_of(common.MAIN_REF)), only=False
         )
         is None
     )  # the shape alone would have passed
     assert result.result == "awaiting-promotion"
-    assert "is not the file the model watch tested" in result.detail
+    assert "the two files are not the ones the model watch tested" in result.detail
     assert fork.approved() == before
 
 
@@ -712,7 +713,9 @@ def test_manual_promote_shows_the_range_and_advances_on_yes(fork: support.Fork) 
 
     assert code == common.EXIT_OK
     assert "change a hook (#34)" in shown
-    assert f"{common.FORK_WEB_URL}/pull/34" in shown
+    # The link is to the commit itself. A subject can name any pull request.
+    assert f"{common.FORK_WEB_URL}/commit/{head}" in shown
+    assert "/pull/" not in shown
     assert f"executed or shipped: {support.HOOK_REL}" in shown
     assert head in prompts[0]
     assert fork.approved() == head
@@ -741,18 +744,54 @@ def test_manual_promote_with_nothing_waiting_does_not_ask(fork: support.Fork) ->
     assert "already" in shown
 
 
-def test_manual_promote_with_rewritten_history_warns_before_asking(
+def test_manual_promote_with_rewritten_history_shows_what_differs_before_asking(
     fork: support.Fork,
 ) -> None:
+    # The default branch was rewritten, and the new history also changes a
+    # hook and adds a file whose name tries to redraw the screen.
+    before = str(fork.approved())
     support.git(fork.seed, "commit", "--quiet", "--amend", "-m", "rewritten seed")
+    name = "zz\x1b[2J\x1b[HNothing changed."
+    for rel, text in ((support.HOOK_REL, "print('rewritten hook')\n"), (name, "x\n")):
+        (fork.seed / rel).write_text(text, encoding="utf-8")
+    support.git(fork.seed, "add", "-A")
+    support.git(fork.seed, "commit", "--quiet", "-m", "more, after the rewrite")
     support.git(fork.seed, "push", "--quiet", "--force", "origin", "HEAD:main")
     head = fork.fetch()
+    lines: list[str] = []
+    prompts: list[str] = []
 
-    code, shown, _ = run_manual(fork, "yes")
+    def ask(prompt: str) -> str:
+        prompts.append("\n".join(lines))  # what was on screen when asked
+        return "yes"
 
+    code = promote.manual_promote(fork.context(), ask, lines.append)
+
+    on_screen = prompts[0]
     assert code == common.EXIT_OK
-    assert "WARNING" in shown
+    assert "WARNING" in on_screen
+    # The diff stat of the two trees, which needs no shared history.
+    assert re.search(r"example-hook\.py +\| +\d", on_screen)
+    assert f"executed or shipped: {support.HOOK_REL}" in on_screen
+    assert f"Inspect: git -C {fork.paths.clone} diff {before} {head}" in on_screen
+    assert f"{common.FORK_WEB_URL}/commit/{head}" in on_screen
+    assert set(on_screen) <= PRINTABLE | {"\n"}
     assert fork.approved() == head
+
+
+def test_manual_promote_when_the_trees_cannot_be_compared_refuses(
+    fork: support.Fork,
+) -> None:
+    # An approved revision this clone no longer has: nothing can be shown,
+    # so nothing is asked.
+    fork.approve("0123456789abcdef0123456789abcdef01234567")
+    fork.commit({"README.md": "# new\n"}, "docs")
+    fork.fetch()
+
+    code, _, prompts = run_manual(fork, "yes")
+
+    assert (code, prompts) == (common.EXIT_FAILED, [])
+    assert fork.approved() == "0123456789abcdef0123456789abcdef01234567"
 
 
 # --------------------------------------------------------------------------
@@ -1206,12 +1245,12 @@ def test_bump_with_a_link_typed_entry_is_not_a_bump(fork: support.Fork) -> None:
     fork.fetch()
     ctx = fork.context(now=time.time())
 
-    problem = promote.bump_problem_between(ctx.git, before, target)
+    problem = bump.bump_problem_between(ctx.git, before, target)
     result = promote.auto_promote(ctx)
 
     assert "is not a regular file with mode 100644" in str(problem)
     assert result.result == "awaiting-promotion"
-    assert "is not a regular file" in result.detail
+    assert "not a plain file: .codex/config.toml (mode 120000)" in result.detail
     assert fork.approved() == before
 
 
@@ -1226,7 +1265,7 @@ def test_bump_with_a_mode_change_is_not_a_bump(fork: support.Fork) -> None:
     fork.fetch()
     ctx = fork.context()
 
-    problem = promote.bump_problem_between(
+    problem = bump.bump_problem_between(
         ctx.git, before, str(ctx.git.commit_of(common.MAIN_REF))
     )
 
@@ -1247,7 +1286,7 @@ def test_model_bump_problem_sees_a_change_of_line_endings(transform: object) -> 
     new_config = transform(config_text("gpt-7.2-astra"))
     assert new_config != config_text("gpt-7.2-astra")
 
-    problem = promote.model_bump_problem(
+    problem = bump.model_bump_problem(
         manifest_text("gpt-7.1-astra", []),
         manifest_text("gpt-7.2-astra", ["gpt-7.1-astra"]),
         config_text("gpt-7.1-astra"),
@@ -1271,7 +1310,7 @@ def test_bump_problem_between_reads_carriage_returns_from_git_unchanged(
     fork.fetch()
     ctx = fork.context()
 
-    problem = promote.bump_problem_between(
+    problem = bump.bump_problem_between(
         ctx.git, before, str(ctx.git.commit_of(common.MAIN_REF))
     )
 
@@ -1389,6 +1428,7 @@ def test_auto_promote_counts_a_merge_as_one_change_landed_when_it_was_merged(
         ".claude/skills/_shared/codex_consult.py",
         ".claude/settings.json",
         ".codex/config.toml",
+        ".claude/models.local.json",
         "scripts/maint/run.py",
     ],
 )
@@ -1473,3 +1513,266 @@ def test_readme_outcome_tables_match_what_the_code_can_report() -> None:
         section: {name: tuple(sorted(codes)) for name, codes in outcomes.items()}
         for section, outcomes in declared.items()
     }
+
+
+# --------------------------------------------------------------------------
+# Round 3: entries that are not plain files, override file, single-use records
+# --------------------------------------------------------------------------
+
+
+def add_entry(fork: support.Fork, mode: str, path: str, message: str) -> str:
+    """Commit one tree entry of the given mode on the fork's default branch:
+    a link with a target no file system can create, or another repository."""
+    target = str(fork.approved())
+    if mode == "120000":
+        target = (
+            subprocess.run(
+                [
+                    support.REAL_GIT,
+                    "-C",
+                    str(fork.seed),
+                    "hash-object",
+                    "-w",
+                    "--stdin",
+                ],
+                input=b"x" * 3000,
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+    support.git(
+        fork.seed, "update-index", "--add", "--cacheinfo", f"{mode},{target},{path}"
+    )
+    support.git(fork.seed, "commit", "--quiet", "-m", message)
+    support.git(fork.seed, "push", "--quiet", "origin", "HEAD:main")
+    return support.git(fork.seed, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize(
+    ("mode", "path"),
+    [("120000", "docs/notes.md"), ("160000", "docs/vendored")],
+    ids=["link", "gitlink"],
+)
+def test_auto_promote_with_an_inert_entry_that_is_not_a_plain_file_waits(
+    fork: support.Fork, mode: str, path: str
+) -> None:
+    # Nothing the Mac runs or ships, by its path. But a tree with it may not
+    # check out at all, and then the Mac would keep running an older revision
+    # than the one recorded as approved.
+    before = fork.approved()
+    add_entry(fork, mode, path, "docs: notes")
+    fork.fetch()
+    ctx = fork.context(now=time.time())
+
+    decision = promote.evaluate(ctx)
+    result = promote.auto_promote(ctx)
+
+    assert decision.relevant == ()  # inert by its path alone
+    assert decision.special == (f"{path} (mode {mode})",)
+    assert (result.result, result.exit_code) == ("awaiting-promotion", common.EXIT_OK)
+    assert f"{path} (mode {mode})" in result.detail
+    assert fork.approved() == before
+
+
+def test_auto_promote_with_an_executable_inert_file_still_promotes(
+    fork: support.Fork,
+) -> None:
+    (fork.seed / "tests").mkdir()
+    (fork.seed / "tests" / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    support.git(fork.seed, "add", "-A")
+    support.git(fork.seed, "update-index", "--chmod=+x", "tests/run.sh")
+    support.git(fork.seed, "commit", "--quiet", "-m", "tests: runner")
+    support.git(fork.seed, "push", "--quiet", "origin", "HEAD:main")
+    head = fork.fetch()
+
+    result = promote.auto_promote(fork.context())
+
+    assert result.result == "promoted"
+    assert fork.approved() == head
+
+
+def test_auto_promote_past_a_link_that_was_added_and_removed_again_promotes(
+    fork: support.Fork,
+) -> None:
+    add_entry(fork, "120000", "docs/notes.md", "docs: notes")
+    support.git(fork.seed, "rm", "--quiet", "--cached", "docs/notes.md")
+    head = fork.commit({"README.md": "# without the link\n"}, "docs: drop notes")
+    fork.fetch()
+
+    result = promote.auto_promote(fork.context())
+
+    assert result.result == "promoted"  # the tree at the end has no such entry
+    assert fork.approved() == head
+
+
+def test_manual_promote_names_entries_that_are_not_plain_files_before_asking(
+    fork: support.Fork,
+) -> None:
+    add_entry(fork, "120000", "docs/notes.md", "docs: notes")
+    fork.fetch()
+
+    code, shown, prompts = run_manual(fork, "no")
+
+    assert code == common.EXIT_OK and prompts
+    assert "NOT A PLAIN FILE" in shown
+    assert "docs/notes.md (mode 120000)" in shown
+    assert "would promote this by itself" not in shown
+
+
+def test_auto_promote_with_a_model_override_file_waits(fork: support.Fork) -> None:
+    # The approved manifest tool reads this file when it is in the tree.
+    before = fork.approved()
+    override = {"schema_version": 1, "codex": {"model": f"gpt-1-{support.FAMILY}"}}
+    fork.commit({promote.LOCAL_OVERRIDE_REL: json.dumps(override) + "\n"}, "override")
+    fork.fetch()
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert result.result == "awaiting-promotion"
+    assert promote.LOCAL_OVERRIDE_REL in result.detail
+    assert fork.approved() == before
+
+
+def open_own_bump(fork: support.Fork) -> str:
+    """This Mac's model watch opens the bump pull request. Returns its branch."""
+    fork.set_catalog(support.entry(support.CURRENT), support.entry(support.NEWER))
+    assert model_watch.run(fork.context()).result == "pr-opened"
+    return model_watch.BRANCH_PREFIX + support.NEWER
+
+
+def recorded_slugs(fork: support.Fork) -> list[str]:
+    try:
+        records = json.loads(fork.paths.bump_records_file.read_text(encoding="utf-8"))
+    except OSError:
+        return []
+    return [record["slug"] for record in records]
+
+
+def change_pull(fork: support.Fork, **changes: object) -> None:
+    pulls = fork.gh_state()["pulls"]
+    pulls[-1].update(changes)
+    fork.set_gh(pulls=pulls)
+
+
+def test_bump_record_is_tied_to_its_pull_request(fork: support.Fork) -> None:
+    branch = open_own_bump(fork)
+
+    records = json.loads(fork.paths.bump_records_file.read_text(encoding="utf-8"))
+
+    assert [(r["slug"], r["pull"]) for r in records] == [(support.NEWER, 10)]
+    assert records[0]["commit"] == support.git(fork.bare, "rev-parse", branch)
+
+
+def test_bump_record_is_used_once(fork: support.Fork) -> None:
+    merge_own_bump(fork)
+    assert recorded_slugs(fork) == [support.NEWER]
+
+    first = promote.auto_promote(fork.context())
+
+    assert first.result == "promoted"
+    assert recorded_slugs(fork) == []  # used up by the promotion
+
+
+def test_auto_promote_after_the_owner_closed_the_bump_pull_request_waits(
+    fork: support.Fork,
+) -> None:
+    # The owner said no. Later the same two files reach the default branch
+    # some other way: the record made for that pull request must not count.
+    before = fork.approved()
+    branch = open_own_bump(fork)
+    change_pull(fork, state="CLOSED")
+    fork.squash_merge(branch, by_pull_request=False)
+    fork.fetch()
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert (result.result, result.exit_code) == ("awaiting-promotion", common.EXIT_OK)
+    assert "pull request 10 was not merged" in result.detail
+    assert fork.approved() == before
+    assert recorded_slugs(fork) == []  # and it is forgotten
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({}, "pull request 10 was not merged"),
+        ({"state": "MERGED", "headRefOid": "a" * 40}, "was merged from another commit"),
+        ({"state": "MERGED"}, "names no merge commit"),
+        (
+            {"state": "MERGED", "mergeCommit": {"oid": "APPROVED"}},
+            "is not in this range",
+        ),
+        ({"state": "MERGED", "baseRefName": "release"}, "cannot ask GitHub"),
+        ({"state": "MERGED", "author": {"login": "someone"}}, "cannot ask GitHub"),
+    ],
+    ids=[
+        "still-open",
+        "other-head",
+        "no-merge-commit",
+        "merge-outside",
+        "base",
+        "author",
+    ],
+)
+def test_auto_promote_of_the_same_files_without_that_merge_waits(
+    fork: support.Fork, changes: dict, reason: str
+) -> None:
+    # The two files on the default branch are exactly the recorded ones, but
+    # they did not get there as the merge of the recorded pull request.
+    before = str(fork.approved())
+    branch = open_own_bump(fork)
+    fork.squash_merge(branch, by_pull_request=False)
+    fork.fetch()
+    if changes.get("mergeCommit") == {"oid": "APPROVED"}:
+        changes = {**changes, "mergeCommit": {"oid": before}}
+    change_pull(fork, **changes)
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert result.result == "awaiting-promotion"
+    assert reason in result.detail
+    assert fork.approved() == before
+
+
+def test_auto_promote_when_github_cannot_be_asked_about_the_bump_waits(
+    fork: support.Fork,
+) -> None:
+    before = fork.approved()
+    merge_own_bump(fork)
+    fork.set_gh(fail=["pr view"])
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert result.result == "awaiting-promotion"
+    assert "cannot ask GitHub about pull request 10" in result.detail
+    assert fork.approved() == before
+    assert recorded_slugs(fork) == [support.NEWER]  # kept for the next run
+
+
+def test_manual_promotion_uses_up_the_bump_record_too(fork: support.Fork) -> None:
+    merge_own_bump(fork)
+    fork.commit({support.HOOK_REL: "print('and a hook')\n"}, "hook")
+    fork.fetch()
+
+    code, _, _ = run_manual(fork, "yes")
+
+    assert code == common.EXIT_OK
+    assert recorded_slugs(fork) == []
+
+
+def test_special_entries_lists_only_added_or_changed_entries(
+    fork: support.Fork,
+) -> None:
+    before = str(fork.approved())
+    first = add_entry(fork, "120000", "docs/notes.md", "docs: notes")
+    support.git(fork.seed, "rm", "--quiet", "--cached", "docs/notes.md")
+    second = fork.commit({"README.md": "# drop\n"}, "drop")
+    fork.fetch()
+    git = fork.context().git
+
+    assert bump.special_entries(git, before, first) == ["docs/notes.md (mode 120000)"]
+    assert bump.special_entries(git, first, second) == []  # a deletion is not listed
+    assert bump.special_entries(git, before, second) == []
+    assert bump.special_entries(git, before, "f" * 40) is None

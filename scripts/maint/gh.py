@@ -110,14 +110,32 @@ class GitHub:
         found = self._listing("pr", PULL_FIELDS, PULL_LIST_LIMIT, *filters)
         if found is None:
             return None
-        return [
-            pull
-            for pull in found
-            if pull.get("isCrossRepository") is False
+        return [pull for pull in found if self._is_own_pull(pull)]
+
+    def pull(self, number: int) -> dict[str, Any] | None:
+        """One pull request of the fork by number: its state, the commit it
+        was opened from, and its merge commit. None when it cannot be read or
+        is not the owner's own pull request into the default branch."""
+        fields = f"{PULL_FIELDS},mergeCommit"
+        result = self._repo("pr", "view", str(number), "--json", fields)
+        if not result.ok:
+            return None
+        try:
+            found = json.loads(result.stdout)
+        except ValueError:
+            return None
+        if not isinstance(found, dict) or not self._is_own_pull(found):
+            return None
+        return found
+
+    @staticmethod
+    def _is_own_pull(pull: dict[str, Any]) -> bool:
+        return (
+            pull.get("isCrossRepository") is False
             and pull.get("baseRefName") == DEFAULT_BRANCH
             and isinstance(pull.get("author"), dict)
             and pull["author"].get("login") == FORK_OWNER
-        ]
+        )
 
     def create_pull(self, branch: str, title: str, body: str) -> CommandResult:
         target = ("--base", DEFAULT_BRANCH, "--head", branch)

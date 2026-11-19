@@ -153,6 +153,10 @@ SLUG_RE = re.compile(
     r"([a-z]{1,16})-([0-9]{1,4}(?:\.[0-9]{1,4}){0,3})-([a-z][a-z0-9]{0,31})"
 )
 EFFORT_RE = re.compile(r"[a-z]{1,16}")
+# Any model value the manifest may hold, slug-shaped or not. It is read from
+# a file on the fork and ends up in issue titles and log lines, so it is
+# held to the same characters the manifest tool itself allows.
+MODEL_VALUE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 
 class Refused(Exception):
