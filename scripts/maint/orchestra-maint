@@ -1,0 +1,195 @@
+#!/bin/bash
+# LaunchAgent entry point. Installed as a copy; source: scripts/maint/orchestra-maint.
+#
+# It lives outside the tree it checks out, so the code that decides what runs
+# is never the code being updated. It does three things: prove the clone is
+# the one this automation owns, put that clone at the approved revision, and
+# hand over to that revision's scripts/maint/run.py.
+#
+# The body is one function, helpers included, so bash has read all of it
+# before anything runs.
+#
+# Exit codes:
+#   1  not installed, not this job's clone, or no approved revision
+#   3  the fork could not be fetched, no approved revision could be checked
+#      out, or python3 is missing. The reason and the next step are printed
+#      and kept in state/launcher-failure, which `launchd.sh status` shows.
+#   otherwise whatever run.py exits with (0, 1, 2 or 3).
+set -euo pipefail
+
+main() {
+    local base="${ORCHESTRA_MAINT_HOME:-${HOME}/.claude/orchestra}"
+    local clone="${base}/fork"
+    local state="${base}/state"
+    local approved="${state}/approved-rev"
+    local last_good="${state}/last-good-rev"
+    local failure="${state}/launcher-failure"
+    local url="https://github.com/ToRainu256/claude-code-orchestra.git"
+    local main_ref="refs/remotes/origin/main"
+    local fetch_tries=3
+    local fetch_pause_sec="${ORCHESTRA_MAINT_FETCH_PAUSE_SEC:-20}"
+    local git_deadline_sec="${ORCHESTRA_MAINT_GIT_DEADLINE_SEC:-120}"
+    local sha_pattern='^[0-9a-f]{40}$'
+    umask 077
+    export PYTHONDONTWRITEBYTECODE=1
+    unset ORCHESTRA_MAINT_CHECKOUT_FAILED
+
+    # git sees nothing of the caller: no inherited GIT_* variable (GIT_DIR
+    # would aim every command below at another repository), no user or
+    # system configuration, no prompt.
+    local name
+    for name in $(compgen -A variable GIT_ || true); do
+        unset "${name}"
+    done
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+
+    # Every git call: a deadline, no hooks, no filesystem monitor, no attribute
+    # file, and the one credential helper a private fork would need.
+    g() {
+        with_deadline "${git_deadline_sec}" git \
+            -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+            -c core.attributesFile=/dev/null -c submodule.recurse=false \
+            -c advice.detachedHead=false -c credential.helper= \
+            -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"
+    }
+
+    # Run a command and end it when it takes longer than SECONDS. macOS has
+    # no timeout(1). The watchdog's own sleep is ended with it.
+    with_deadline() {
+        local seconds="$1"
+        shift
+        "$@" &
+        local pid=$!
+        (
+            sleeper=""
+            trap '[[ -n "${sleeper}" ]] && kill "${sleeper}" 2>/dev/null; exit 0' TERM
+            sleep "${seconds}" &
+            sleeper=$!
+            wait "${sleeper}"
+            kill -TERM "${pid}" 2>/dev/null
+        ) > /dev/null 2>&1 &
+        local watchdog=$!
+        local status=0
+        wait "${pid}" || status=$?
+        kill -TERM "${watchdog}" 2> /dev/null || true
+        wait "${watchdog}" 2> /dev/null || true
+        return "${status}"
+    }
+
+    refuse() {
+        echo "orchestra-maint: $1" >&2
+        exit 1
+    }
+
+    # Say what failed and what to do, and keep it where `status` reads it.
+    note_failure() {
+        local message="orchestra-maint: $1. Next: $2"
+        echo "${message}" >&2
+        if [[ -d "${state}" && ! -L "${state}" ]]; then
+            printf '%s %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "${message}" > "${failure}.tmp.$$"
+            mv -f "${failure}.tmp.$$" "${failure}"
+        fi
+    }
+
+    put_tree() {
+        g -C "${clone}" checkout --quiet --force -B approved "$1" &&
+            g -C "${clone}" clean --quiet -fdx
+    }
+
+    # The checkout and clean below are destructive, so they only ever run in
+    # the clone this automation owns: a real directory at this exact path (a
+    # link could lead to another checkout of the same repository), holding
+    # its own repository, marked by `launchd.sh install`, whose only remote
+    # fetches from and pushes to the fork, at its own top level.
+    if [[ -L "${clone}" || ! -d "${clone}" ]]; then
+        refuse "${clone} is not a directory; run launchd.sh install"
+    fi
+    if [[ -L "${clone}/.git" || ! -d "${clone}/.git" ]]; then
+        refuse "${clone} does not hold its own repository"
+    fi
+    if [[ "$(g -C "${clone}" config --get orchestra.maintclone 2> /dev/null || true)" != "true" ]]; then
+        refuse "${clone} was not created by launchd.sh install"
+    fi
+    local kind
+    for kind in "config --get remote.origin.url" "remote get-url --all origin" \
+        "remote get-url --push --all origin"; do
+        # shellcheck disable=SC2086
+        if [[ "$(g -C "${clone}" ${kind} 2> /dev/null || true)" != "${url}" ]]; then
+            refuse "${clone} is not a clone of ${url}"
+        fi
+    done
+    local top
+    top="$(cd "${clone}" && pwd -P)"
+    if [[ "$(g -C "${clone}" rev-parse --show-toplevel 2> /dev/null || true)" != "${top}" ]]; then
+        refuse "${clone} is not the top level of its own work tree"
+    fi
+    # Only the branch `approved` and the fork's remote-tracking refs belong
+    # here. A tag named origin/main would be read in place of the branch by
+    # anything that used the short name.
+    local ref
+    while IFS= read -r ref; do
+        case "${ref}" in
+            refs/heads/approved | refs/remotes/origin/*) ;;
+            *) refuse "${clone} holds a ref the job never creates; list them with: git -C ${clone} for-each-ref" ;;
+        esac
+    done < <(g -C "${clone}" for-each-ref --format='%(refname)')
+
+    local rev=""
+    if [[ -f "${approved}" && ! -L "${approved}" ]]; then
+        rev="$(tr -d '[:space:]' < "${approved}")"
+    fi
+    if [[ ! "${rev}" =~ ${sha_pattern} ]]; then
+        refuse "no approved revision; run launchd.sh install"
+    fi
+
+    # Nothing is created before this point: a launcher that is not installed
+    # properly leaves no trace.
+    mkdir -p "${base}/logs/maint" "${base}/run"
+
+    # The network may lag a wake from sleep, so the fetch gets three attempts.
+    # Exactly one ref is fetched, by its full name, and never a tag.
+    local try
+    for ((try = 1; try <= fetch_tries; try++)); do
+        if g -C "${clone}" fetch --quiet --no-tags --prune \
+            origin "+refs/heads/main:${main_ref}"; then
+            break
+        fi
+        if [[ "${try}" -eq "${fetch_tries}" ]]; then
+            note_failure "cannot fetch the fork" \
+                "check the network, then: bash scripts/maint/launchd.sh run-now"
+            exit 3
+        fi
+        sleep "${fetch_pause_sec}"
+    done
+
+    # Execute exactly the approved revision, from a clean tree. If it cannot
+    # be checked out, fall back to the last revision that could, so the run
+    # can report the failure and `promote` stays usable.
+    if put_tree "${rev}"; then
+        printf '%s\n' "${rev}" > "${last_good}.tmp.$$"
+        mv -f "${last_good}.tmp.$$" "${last_good}"
+        rm -f "${failure}"
+    else
+        local good=""
+        if [[ -f "${last_good}" && ! -L "${last_good}" ]]; then
+            good="$(tr -d '[:space:]' < "${last_good}")"
+        fi
+        if [[ ! "${good}" =~ ${sha_pattern} || "${good}" == "${rev}" ]] || ! put_tree "${good}"; then
+            note_failure "cannot check out the approved revision ${rev}" \
+                "remove ${approved} and run launchd.sh install again"
+            exit 3
+        fi
+        note_failure "cannot check out the approved revision ${rev}; running ${good}, the last one that could" \
+            "merge a fix, then: bash scripts/maint/launchd.sh promote"
+        export ORCHESTRA_MAINT_CHECKOUT_FAILED="${rev}"
+    fi
+
+    if ! command -v python3 > /dev/null 2>&1; then
+        note_failure "python3 is not on PATH" \
+            "install it or fix the PATH in the plist, then: bash scripts/maint/launchd.sh status"
+        exit 3
+    fi
+    ORCHESTRA_MAINT_HOME="${base}" exec python3 "${clone}/scripts/maint/run.py" "$@"
+}
+
+main "$@"
