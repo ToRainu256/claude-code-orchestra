@@ -383,19 +383,19 @@ stand-in that redirects the fork URL to a scratch repository, and a temp
 ## Upstream intake
 
 `fork_invariants.py` says what makes this repository a fork that still holds,
-and prepares the merge of upstream's `main` under those invariants. It is not
-a step of the local job: it is run by hand, or by the cloud routine whose
-prompt is `routines/upstream-intake.md`. It never pushes and contacts no
-remote; the caller fetches upstream first and pushes the branch afterwards.
+and prepares the merge of upstream's `main` under those invariants. It is a
+helper, run by hand: it is not a step of the local job, and **no routine that
+runs it unattended is defined yet**. It never pushes and contacts no remote;
+whoever runs it fetches upstream first and pushes the branch afterwards.
 
 ```bash
-python3 scripts/maint/fork_invariants.py check [--rev REV]
+python3 scripts/maint/fork_invariants.py check [--rev SHA]
 python3 scripts/maint/fork_invariants.py intake --fork-rev SHA --upstream-rev SHA [--resolve-in DIR]
 python3 scripts/maint/fork_invariants.py seal --fork-rev SHA --upstream-rev SHA --resolve-in DIR --resolutions FILE
 ```
 
 Stdout is one JSON object; findings and conflicts are repeated on stderr.
-Both revisions are full commit SHAs: a short name is resolved through tags
+Every revision is a full commit SHA: a short name is resolved through tags
 first.
 
 ### The invariants
@@ -405,13 +405,16 @@ first.
 | `roles-renamed` | No retired role name outside the allow-list | `scripts/rename-roles.py` (check mode) |
 | `model-names` | No model name outside the manifest | `models_lint.py` |
 | `manifest-applied` | Every rendered model value equals the manifest | `models.py check --strict` |
+| `manifest-needs-owner` | That tool does not refuse the tree. It refuses when the manifest names an agent the tree lacks, or the tree has one the manifest does not name. Rendering the manifest again cannot clear this, and the manifest is the owner's: the owner assigns the model | `models.py check --strict`, its `refused:` lines |
 | `seeds-pinned` | Each file under `scripts/scaffold/` has the SHA-256 that `tests/test_scaffold.py` pins | Read here, from that test file's `SEED_SHA256` |
-| `install-urls` | `scripts/update.sh` sets `TEMPLATE_REPO=` once, to the fork; no README command clones upstream's default branch | Read here |
+| `install-urls` | `scripts/update.sh` assigns `TEMPLATE_REPO` exactly once, whatever the indentation or keyword, and that line is the fork's default byte for byte; no README line clones upstream's default branch or fetches an installer from upstream (`curl`, `wget`, a raw URL) | Read here |
 | `no-claude-md` | None of the three files `scripts/check.sh` refuses exists | Read here, the same list |
+| `plain-entries` | (`check --rev` only) The commit holds no entry that is not checked out; see below | Read here |
 
-The first three are the repository's own checkers, run with `--project-root`
-on the tree in question. The last three have no checker that can be aimed at
-another tree without running that tree's code, so they are read as data.
+The first four come from the repository's own checkers, run with
+`--project-root` on the tree in question. The rest have no checker that can
+be aimed at another tree without running that tree's code, so they are read
+as data.
 
 ### How the merge is prepared
 
@@ -435,12 +438,41 @@ upstream's as a conflict. A changed `T` costs conflicts, never content.
 A conflict that survives `T` is a real one. It is reported with what git
 called it and is never resolved here. `--resolve-in DIR` leaves the automatic
 result in `DIR` (a scratch repository: markers included, on top of the fork's
-commit, with the branches `fork-main`, `upstream-main` and `merge-base` to
-read the sides from). `seal` builds the same two-parent commit from `DIR`
-once `--resolutions` names exactly the conflicted paths, each with a note, no
-marker is left in them, and the tree passes every check a clean merge
-passes. A marker scan alone is not accepted: a file deleted on one side, or a
-binary one, conflicts without a marker.
+commit, with the branches `fork-main`, `upstream-main`, `merge-base` and
+`auto-merge` to read from).
+
+`seal` builds the same two-parent commit from `DIR`. It believes nothing the
+directory says about itself: it builds the automatic merge again from the two
+commits, and then requires that `--resolutions` names exactly the paths that
+merge conflicts in, each with a note; that none of them still holds a marker
+line (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`); and that the tree passes
+every check a clean merge passes. A marker scan alone is not accepted: a file
+deleted on one side, or a binary one, conflicts without a marker. Edits
+outside the conflicted paths are accepted, because fixing an invariant needs
+them, and every one is reported in `edited_by_hand`.
+
+To check a pull request from outside, run `intake --resolve-in DIR` on the
+same two commits. A clean merge gives the same commit SHA as the pull
+request's, or the pull request is not the automatic merge. Otherwise
+`git -C DIR diff auto-merge <pull request commit>` is what was done by hand.
+
+### What the result carries
+
+Everything in the JSON that came from a tree, a tool or git is already inert:
+a path is given with every character outside `A-Za-z0-9._/+@-` as a `\xNN`
+escape, and a line of text with backticks, pipes, `#`, `@`, brackets and
+link-forming sequences escaped as well. It can be pasted into a shell or
+posted as Markdown under the owner's name without acting there.
+
+| Field | On | Holds |
+|-------|----|-------|
+| `upstream_log` | every outcome past the merge base | Upstream's commits, newest first, at most 100: full SHA and the subject in the inert form. The only form in which a subject should be shown |
+| `conflicts` | `intake` | Each conflicted path and what git called the conflict |
+| `conflicts_without_transform` | `intake` | How many paths a plain merge conflicts in; a measure, nothing more |
+| `findings` | `invariants-failed`, `violated`, `fork-not-clean` | Each failed invariant by name, with the checker's line |
+| `sensitive_changes` | `merged` | The paths this merge changes that define the required checks or that a later session executes or loads as instructions. It is the issue worker's stop-list (below), computed, so the list a reviewer reads first is not somebody's search |
+| `edited_by_hand` | `seal` | Every path that differs from the automatic merge |
+| `resolutions`, `seed_pins_changed`, `ignored_files_left_out` | `seal` | The notes as given; whether a seed's pin changed; files `git add` left out because they are ignored |
 
 ### What it holds upstream's content to
 
@@ -449,21 +481,29 @@ binary one, conflicts without a marker.
   the fork's commit into a private directory. A file of the same name in the
   tree being merged, or an edited one in the work tree, is never run.
 - **Some trees are not checked out at all** (`unsupported-entry`): one with a
-  link, another repository, a `.gitattributes` file, a name with a control
-  character, or two names that are one file on a case-insensitive file
-  system. `merge` attributes are switched off in the scratch repository as
-  well: `merge=union` alone turns a conflict into a silent mix of both sides.
-- **Four things leave an intake exactly as the fork has them**, compared
+  link, another repository, a `.gitattributes` file, a name with a character
+  outside `A-Za-z0-9._/+@-` or a component that starts with a dash, or two
+  names that are one file on a case-insensitive file system. The merge base
+  and upstream's tip are scanned, and so is the merged tree as a whole,
+  before it is checked out and again in `seal`: upstream's `scripts/Maint/`
+  beside the fork's `scripts/maint/` is clean on each side and one directory
+  on the owner's disk. `merge` attributes are switched off in the scratch
+  repository as well: `merge=union` alone turns a conflict into a silent mix
+  of both sides.
+- **Five things leave an intake exactly as the fork has them**, compared
   object by object in the final tree: everything under `.github/` (a pushed
-  workflow change would run), the model manifest, `.claude/STATE.md` and
+  workflow change would run), the model manifest, its override
+  `.claude/models.local.json` (absent stays absent), `.claude/STATE.md` and
   `.claude/docs/DESIGN.md`. `--owner-allows-workflow-changes` lifts the first,
-  for the owner at a terminal; the routine prompt forbids it.
+  for the owner at a terminal.
 - **A seed changes only with its pin.** `intake` holds the seeds to the
   digests the fork pins; `seal` accepts a new seed together with its new
   digest and reports `seed_pins_changed`.
 - **This repository changes once**, at the end: the finished commit is
-  fetched from the scratch repository into the new branch. No index, work
-  tree, configuration or other ref of this repository is touched.
+  fetched from the scratch repository into the new branch, read back, and
+  removed again if it is not the merge that was built. No index, work tree,
+  configuration, hook or other ref of this repository is used or touched,
+  and no inherited `GIT_*` variable is followed.
 
 ### Intake outcomes
 
@@ -476,7 +516,7 @@ compares these tables with `OUTCOMES` in `fork_invariants.py`).
 |---------|------|-------|------------|
 | `satisfied` | 0 | Every invariant holds | — |
 | `violated` | 2 | At least one finding; each names its invariant | Fix what it names |
-| `refused` | 1 | Not the top of a repository, git older than 2.40, a shallow clone, or `--rev` is not a commit | Fix the call |
+| `refused` | 1 | Not the top of a repository, git older than 2.40, or `--rev` is not a full SHA of a commit here | Fix the call |
 | `git-failed` | 3 | A git command failed | Read the message |
 | `tool-failed` | 3 | One of the fork's tools failed or exceeded 120 s | Read the message |
 | `crashed` | 3 | The helper itself raised an unexpected error; the traceback is on stderr | Report it |
@@ -486,60 +526,118 @@ compares these tables with `OUTCOMES` in `fork_invariants.py`).
 | Outcome | Exit | Means | What to do |
 |---------|------|-------|------------|
 | `up-to-date` | 0 | The fork already contains upstream's tip | — |
-| `merged` | 0 | The two-parent commit is on the local branch | Push the branch, open the pull request |
+| `merged` | 0 | The two-parent commit is on the local branch | Read `sensitive_changes`; push the branch, open the pull request |
 | `conflicts` | 2 | Paths conflict after `T`; nothing was committed | Resolve in `--resolve-in`, then `seal` |
-| `invariants-failed` | 2 | The merge is clean but a check fails, or a protected path changed; nothing was committed | Fix in `--resolve-in`, then `seal` |
+| `invariants-failed` | 2 | The merge is clean but a check fails, or a protected path changed; nothing was committed | Fix in `--resolve-in`, then `seal`; a `manifest-needs-owner` finding is the owner's |
 | `workflows-changed` | 2 | Upstream changed a file under `.github/`; nothing was merged | The owner decides, at a terminal |
 | `no-single-merge-base` | 2 | No common history, or more than one merge base | The owner merges by hand |
-| `unsupported-entry` | 2 | The merge base or upstream's tip holds an entry that is not checked out | Read the listed entries |
+| `unsupported-entry` | 2 | The merge base, upstream's tip or the merged tree holds an entry that is not checked out | Read the listed entries |
 | `transform-refused` | 2 | The codemod refused a file, or a tree has both seed layouts | Read the message |
 | `fork-not-clean` | 2 | The fork's own commit fails an invariant | Fix `main` first |
-| `branch-exists` | 2 | The local branch exists and is another commit | Delete it, or inspect it |
-| `refused` | 1 | As for `check`; a revision that is not a full SHA; `--resolve-in` exists | Fix the call |
-| `git-failed` | 3 | A git command failed, or the commit read back is not the one built | Read the message |
+| `branch-exists` | 2 | The local branch exists and is another commit; it is left as it is | Delete it, or inspect it |
+| `refused` | 1 | Not the top of a repository, git older than 2.40, a shallow clone, a revision that is not a full SHA, `--resolve-in` exists | Fix the call |
+| `git-failed` | 3 | A git command failed, or the branch read back was not the merge that was built (it is removed again) | Read the message |
 | `tool-failed` | 3 | One of the fork's tools failed, or left a file behind | Read the message |
 | `crashed` | 3 | The helper itself raised an unexpected error; nothing was committed | Report it |
 
 #### `seal`
 
+`seal` builds the automatic merge again, so what stops `intake` before a
+merge exists can stop it too.
+
 | Outcome | Exit | Means | What to do |
 |---------|------|-------|------------|
-| `merged` | 0 | The two-parent commit is on the local branch | Push the branch, open the pull request |
-| `unresolved` | 2 | `--resolutions` does not name exactly the conflicted paths, or a marker is left | Finish the paths it lists |
+| `merged` | 0 | The two-parent commit is on the local branch | Read `edited_by_hand` and `sensitive_changes`; push the branch, open the pull request |
+| `unresolved` | 2 | `--resolutions` does not name exactly the conflicted paths, or a marker line is left in one of them | Finish the paths it lists |
 | `invariants-failed` | 2 | The finished tree fails a check, or changes a protected path | Fix what it names, seal again |
-| `branch-exists` | 2 | The local branch exists and is another commit | Delete it, or inspect it |
-| `refused` | 1 | `--resolve-in` was not prepared by `intake`, or for other commits; a damaged `--resolutions` | Fix the call |
-| `git-failed` | 3 | A git command failed | Read the message |
+| `unsupported-entry` | 2 | The finished tree, the merge base or upstream's tip holds an entry that is not checked out | Remove the entry it lists |
+| `workflows-changed` | 2 | As for `intake` | As for `intake` |
+| `no-single-merge-base` | 2 | As for `intake` | As for `intake` |
+| `transform-refused` | 2 | As for `intake` | As for `intake` |
+| `fork-not-clean` | 2 | As for `intake` | As for `intake` |
+| `branch-exists` | 2 | The local branch exists and is another commit; it is left as it is | Delete it, or inspect it |
+| `refused` | 1 | As for `intake`; `--resolve-in` was not prepared by `intake`, or for other commits; a damaged `--resolutions` | Fix the call |
+| `git-failed` | 3 | A git command failed, or the branch read back was not the merge that was built | Read the message |
 | `tool-failed` | 3 | One of the fork's tools failed | Read the message |
 | `crashed` | 3 | The helper itself raised an unexpected error; nothing was committed | Report it |
 
-### Cloud routines
+### Issue worker
 
-`routines/upstream-intake.md` and `routines/issue-worker.md` are the prompts
-two scheduled cloud sessions receive, kept here so a change to them is
-reviewed like code. Each starts from a fresh clone with no other context,
-loads the repository's rules through the `context-loader` skill, and reports
-its result in its own comment on the `automation:status` issue
-(`<!-- job:upstream-intake -->`, `<!-- job:issue-worker -->`).
+`routines/issue-worker.md` is the prompt of one cloud routine, kept here so a
+change to it is reviewed like code. A session starts from a fresh clone with
+no other context, loads the repository's rules through the `context-loader`
+skill, takes one open issue the owner wrote and labeled `agent:ready`, and
+ends by reporting in its own comment on the `automation:status` issue
+(`<!-- job:issue-worker -->`). A test pins every hard rule of the prompt as
+an exact sentence, and their number: an edit to a rule has to change the test
+in the same diff. Creating or changing the routine itself is the owner's.
 
-- **Upstream intake** opens the pull request and never merges it. It runs
-  nothing from upstream's tree: only `git`, `gh` and the fork's tools above.
-- **Issue worker** acts on open issues the owner wrote and labeled
-  `agent:ready`, one per run. Its pull request is merged by a REST squash
-  call only after both required checks succeeded on the exact commit.
+A cloud session acts under the owner's GitHub account. Three things follow,
+and the prompt is built on them:
 
-A test pins each prompt's hard rules, so an edit cannot drop one silently.
-Creating or changing the routines themselves is done by the owner.
+- **An author proves nothing.** Jobs open issues and post comments as the
+  owner, quoting text the owner did not write. Every body a job writes
+  starts with `<!-- job:` (`common.JOB_MARKER_PREFIX`; the local job's issues
+  and status comment too). The worker drops an issue whose body starts with
+  it or that carries an `automation:` label, never reads a comment, and
+  checks in the issue's events that the owner's account applied the label.
+- **Whether a pull request may merge is not the session's to judge.** The
+  worker runs `worker_gate.py` as it is on `main`
+  (`git show refs/remotes/origin/main:scripts/maint/worker_gate.py`), never
+  as it is in the pull request, and merges only on exit 0. Everything else
+  stays open for the owner.
+- **The merge is pinned.** One REST squash call, at the commit the review
+  read, the gate allowed and both required checks, produced by GitHub
+  Actions, succeeded on.
+
+`worker_gate.py --base SHA --head SHA [--project-root DIR]` judges the change
+between the merge base of the two commits and `--head`, which must be the
+commit checked out, with nothing beside it. It is one file with no import
+from the repository, so that it can be read out of a commit and run; the
+verifier it starts, `verify_delegation.py`, is read out of `--base` the same
+way (it needs Python 3.11; under an older one the gate fails closed with
+`tool-failed`).
+
+The stop-list, any path below or equal to one of these, in any letter case:
+`.github/`, `.claude/hooks/`, `.claude/rules/`, `.claude/skills/`,
+`.claude/agents/`, `.agents/`, `.codex/`, `scripts/`, `tests/`,
+`.claude/settings.json`, `.mcp.json`, `pyproject.toml`, `uv.lock`, and any
+`AGENTS.md`, `CLAUDE.md` or `CLAUDE.local.md`, in whatever directory. These
+define the required checks, or are what a
+later session executes or loads as instructions: a pull request that changes
+one would certify itself, or instruct whoever merges the next one.
+
+#### `worker_gate`
+
+| Outcome | Exit | Means | What to do |
+|---------|------|-------|------------|
+| `self-merge-allowed` | 0 | No changed path is on the stop-list, every one is a plain file with a supported name, no test file is deleted, and the verifier reports no weakened test and no placeholder | The worker may send its merge call |
+| `needs-owner` | 2 | At least one of those does not hold; `reasons` lists each | The pull request stays open; the owner merges or closes it |
+| `refused` | 1 | A revision is not a full SHA of a commit here, `--head` is not what is checked out, or the work tree holds anything else | Fix the call; the worker does not merge |
+| `git-failed` | 3 | A git command failed | The worker does not merge |
+| `tool-failed` | 3 | The verifier is not in `--base`, failed, or did not report | The worker does not merge |
+| `crashed` | 3 | The gate itself raised an unexpected error | The worker does not merge; report it |
+
+**Trigger and schedule.** The prompt does not depend on what starts it.
+Recommended: a schedule, daily at `37 18 * * *` UTC, which is 03:37 the next
+day in Asia/Tokyo (UTC+9, no daylight saving), away from the local job's
+08:40 and 20:40. An issue-event trigger on `labeled` can be added to the same
+routine later: the prompt works out by itself whether an issue is eligible.
+For an intake run by hand or by a later routine, upstream's cadence suggests
+weekly: `7 0 * * 1` UTC is Monday 09:07 in Asia/Tokyo.
 
 ### Files and tests
 
 | File | Role |
 |------|------|
 | `fork_invariants.py` | The invariants, `check`, and the command line for all three commands |
-| `upstream_intake.py` | `T`, the merge, the protected paths, `intake` and `seal` |
-| `scratch_repo.py` | git cut off from the user's configuration; the scratch repository; which trees are not checked out |
-| `routines/upstream-intake.md`, `routines/issue-worker.md` | The cloud routine prompts |
+| `upstream_intake.py` | `T`, the merge, the protected paths, what is reported, `intake` |
+| `intake_seal.py` | `seal`: the automatic merge built again, the answers, the finished tree |
+| `scratch_repo.py` | git cut off from the user's configuration; the scratch repository; which trees are not checked out; the inert forms of a path and of text |
+| `worker_gate.py` | The issue worker's merge gate and the stop-list; one file, no imports from the repository |
+| `routines/issue-worker.md` | The issue worker's prompt |
 
 Tests: `tests/test_maint_fork_invariants.py`, on real scratch repositories
 that model an upstream and a fork made from it with the repository's own
-codemod.
+codemod; `tests/test_maint_worker_gate.py`, the gate on real scratch
+repositories and the prompt's rules.

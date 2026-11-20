@@ -16,8 +16,13 @@ happens instead:
   for merges, every ``merge`` attribute. ``merge=union`` alone would turn a
   conflict into a silent mix of both sides.
 * :func:`unsupported_entries` names what must not be checked out at all: a
-  link, another repository, an attributes file, a name that collides with
-  another on a case-insensitive file system.
+  link, another repository, an attributes file, a name outside a small set of
+  characters, a name that collides with another on a case-insensitive file
+  system.
+* :func:`inert_path` and :func:`inert_text` are what every string from a
+  tree, a tool or git goes through before it is reported. What comes out can
+  be pasted into a shell or into Markdown that is posted under the owner's
+  name: no quote, no backtick, no mention, no reference, no link.
 
 Objects made here stay here. The fork's repository gets one finished commit,
 fetched from the scratch repository at the very end.
@@ -29,7 +34,6 @@ from __future__ import annotations
 
 import os
 import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -40,6 +44,27 @@ MIN_GIT = (2, 40)
 PLAIN_MODES = ("100644", "100755")
 ATTRIBUTES_FILE = ".gitattributes"
 NOTE_LIMIT = 400
+# The characters a path may be made of. Everything else in a name is either
+# shell syntax or Markdown, and a name is what a caller pastes into both.
+NAME_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/+@-"
+)
+NAME_RE = re.compile(r"[A-Za-z0-9._/+@-]+")
+OPTION_PREFIX = "-"
+# What a sentence may additionally hold. `@` is left out: in prose it is a
+# mention.
+TEXT_CHARACTERS = (NAME_CHARACTERS - {"@"}) | frozenset(" ,:;()=_'\"")
+# Character sequences GitHub turns into a link or a reference although every
+# character of them is harmless on its own: sequence -> the character in it
+# that is written as an escape.
+AUTOLINKS = (
+    (re.compile(r"://"), "/"),
+    (re.compile(r"(?i)www\."), "."),
+    (re.compile(r"(?i)\bgh-(?=\d)"), "-"),
+)
+# How a line may not start: a list, a quote, a heading underline, a number.
+ESCAPED_OR_ANY = re.compile(r"\\(?:x[0-9a-f]{2}|u[0-9a-f]{4})|.", re.DOTALL)
+LINE_OPENERS = re.compile(r"^(?:[-+=:.]|\d+[.)])")
 
 RESULT_REFUSED = "refused"
 RESULT_GIT = "git-failed"
@@ -93,8 +118,54 @@ class Stop(Exception):
 
 
 def shown(text: str) -> str:
-    """Text from a tree, a tool or git, safe to print and bounded."""
+    """A string the caller gave (a directory, an argument): printable and
+    bounded. Not for anything that came out of a tree; see ``inert_*``."""
     return common.safe_text(text, NOTE_LIMIT)
+
+
+def _escape(char: str) -> str:
+    code = ord(char)
+    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+
+
+def _only(text: str, allowed: frozenset[str]) -> str:
+    """``text`` with every character outside ``allowed`` as an escape. An
+    escape that is already there is left as it is, so making a string inert
+    twice changes nothing: a line can pass through two reports."""
+
+    def kept(match: re.Match[str]) -> str:
+        piece = match.group()
+        return piece if len(piece) > 1 or piece in allowed else _escape(piece)
+
+    return ESCAPED_OR_ANY.sub(kept, text)
+
+
+def inert_path(name: str) -> str:
+    """A path as reported: every character outside ``NAME_CHARACTERS`` is a
+    visible escape, and so is a leading dash. A supported name comes out as
+    it went in; a refused one can still be shown without being acted on."""
+    made = _only(name, NAME_CHARACTERS)
+    if made.startswith(OPTION_PREFIX):
+        made = _escape(OPTION_PREFIX) + made[1:]
+    return made if len(made) <= NOTE_LIMIT else made[: NOTE_LIMIT - 3] + "..."
+
+
+def inert_text(text: str, limit: int = NOTE_LIMIT) -> str:
+    """One line of prose from a tool, git, a commit or a note, with nothing
+    left that Markdown or a shell would act on: backticks, pipes, `#`, `@`,
+    brackets and quotes of command substitution become escapes, link-forming
+    sequences are broken, and the line cannot open a list or a quote."""
+    made = _only(" ".join(text.split()), TEXT_CHARACTERS)
+    for pattern, char in AUTOLINKS:
+        made = pattern.sub(
+            lambda match, char=char: match.group().replace(char, _escape(char), 1),
+            made,
+        )
+    opener = LINE_OPENERS.match(made)
+    if opener is not None:
+        last = opener.end() - 1
+        made = made[:last] + _escape(made[last]) + made[last + 1 :]
+    return made if len(made) <= limit else made[: limit - 3] + "..."
 
 
 def refuse(detail: str) -> NoReturn:
@@ -161,9 +232,10 @@ class Repo:
         return self.run("cat-file", "blob", f"{revision}:{rel}").stdout
 
 
-def require_repository(repo: Repo) -> None:
+def require_repository(repo: Repo, full_history: bool = True) -> None:
     """Refuse a directory this cannot work in: not the top of a repository, a
-    git too old for the merge, or a history with its beginning cut off."""
+    git too old for the merge, or (where a merge base is needed) a history
+    with its beginning cut off."""
     probe = common.run_command(
         ["git", *GIT_OPTIONS, "-C", str(repo.path), "rev-parse", "--show-toplevel"],
         common.GIT_TIMEOUT_SEC,
@@ -175,7 +247,8 @@ def require_repository(repo: Repo) -> None:
     version = re.search(r"(\d+)\.(\d+)", repo.text("version"))
     if version is None or (int(version[1]), int(version[2])) < MIN_GIT:
         refuse(f"git {MIN_GIT[0]}.{MIN_GIT[1]} or newer is required")
-    if repo.text("rev-parse", "--is-shallow-repository") != "false":
+    shallow = repo.text("rev-parse", "--is-shallow-repository") != "false"
+    if full_history and shallow:
         refuse("the clone is shallow; run: git fetch --unshallow origin")
 
 
@@ -236,7 +309,8 @@ class Scratch:
         self.repo.run("add", "--update")
         strays = self.repo.listed("ls-files", "--others", "-z")
         if strays:
-            failed(RESULT_TOOL, f"a tool left files behind: {shown(', '.join(strays))}")
+            named = ", ".join(inert_path(name) for name in strays)
+            failed(RESULT_TOOL, f"a tool left files behind: {named}")
         return self.repo.text("write-tree")
 
     def commit(
@@ -260,27 +334,32 @@ def unsupported_entries(repo: Repo, tree: str) -> list[str]:
 
     A link can point outside the scratch directory, another repository is not
     this one's content, and an attributes file chooses filters and merge
-    drivers. Two names that differ only in case or in Unicode composition are
-    one file on macOS, so a checkout would silently hold one of them.
+    drivers. A name outside ``NAME_CHARACTERS``, or with a component that
+    starts with a dash, is shell syntax or an option the moment someone
+    pastes it. Two names that differ only in case are one file on macOS, so a
+    checkout would silently hold one of them, and an update would write one
+    over the other.
     """
     problems: list[str] = []
     seen: dict[str, str] = {}
     for entry in repo.listed("ls-tree", "-r", "-z", "--full-tree", tree):
         meta, _, name = entry.partition("\t")
         mode = meta.split(" ", 1)[0]
-        if mode not in PLAIN_MODES:
-            problems.append(f"{shown(name)}: mode {mode} is not a plain file")
-        if name.rsplit("/", 1)[-1] == ATTRIBUTES_FILE:
-            problems.append(f"{shown(name)}: an attributes file")
-        if any(not char.isprintable() or char == "�" for char in name):
-            problems.append(f"{shown(name)}: a name that cannot be shown as written")
         parts = name.split("/")
+        if mode not in PLAIN_MODES:
+            problems.append(f"{inert_path(name)}: mode {mode} is not a plain file")
+        if parts[-1] == ATTRIBUTES_FILE:
+            problems.append(f"{inert_path(name)}: an attributes file")
+        if NAME_RE.fullmatch(name) is None:
+            problems.append(f"{inert_path(name)}: a character outside A-Za-z0-9._/+@-")
+        if any(part.startswith(OPTION_PREFIX) for part in parts):
+            problems.append(f"{inert_path(name)}: a name that starts with a dash")
         for depth in range(1, len(parts) + 1):
             prefix = "/".join(parts[:depth])
-            key = unicodedata.normalize("NFC", prefix).casefold()
-            if seen.setdefault(key, prefix) != prefix:
+            if seen.setdefault(prefix.casefold(), prefix) != prefix:
                 problems.append(
-                    f"{shown(prefix)}: the same name as {shown(seen[key])} "
+                    f"{inert_path(prefix)}: the same name as "
+                    f"{inert_path(seen[prefix.casefold()])} "
                     "on a case-insensitive file system"
                 )
     return sorted(set(problems))

@@ -27,22 +27,25 @@ never be dropped. A changed ``T`` costs conflicts, not content.
 A conflict that survives ``T`` is a real one: it is reported, with what git
 said about it, and never resolved here. ``--resolve-in DIR`` leaves the
 automatic result in ``DIR`` (markers included, on top of the fork's commit)
-for a person or an agent to finish; ``seal`` then builds the same two-parent
-commit from that directory, once every reported path is acknowledged by name
-with a note and the result passes the same checks as a clean merge. A marker
-scan would not be enough: a file deleted on one side, or a binary one,
-conflicts without a marker.
+for someone to finish; ``intake_seal.py`` then builds the same two-parent
+commit from that directory.
 
 What an intake may not change without the owner, compared with the fork
 object by object in the final tree: anything under ``.github/`` (pushing a
-changed workflow would run it), the model manifest, and the fork's own state
-files. Seeds must match the digests the fork pins; ``seal`` accepts a seed
-together with its new pin and says so in its result.
+changed workflow would run it), the model manifest and its local override,
+and the fork's own state files. Seeds must match the digests the fork pins.
+The merged tree is scanned again as a whole before it is checked out: two
+clean sides can still collide by case.
+
+What a caller is given to show the owner is already inert: ``upstream_log``
+(upstream's commit subjects), every path, every line a tool reported. And
+``sensitive_changes`` names the changed paths a later session executes or
+loads as instructions, so that list is computed, not searched for.
 
 Nothing is pushed. The fork's repository changes in one way, at the end: the
 finished commit is fetched from the scratch repository into the new branch.
 
-Run through ``fork_invariants.py intake`` and ``fork_invariants.py seal``.
+Run through ``fork_invariants.py intake``.
 """
 
 from __future__ import annotations
@@ -58,19 +61,34 @@ from typing import NoReturn
 import common
 import fork_invariants as invariants
 import scratch_repo
-from scratch_repo import Repo, Scratch, Stop, failed, refuse, shown
+import worker_gate
+from scratch_repo import (
+    Repo,
+    Scratch,
+    Stop,
+    failed,
+    inert_path,
+    inert_text,
+    refuse,
+    shown,
+)
 
 MANIFEST = ".claude/skills/_shared/models.json"
 WORKFLOWS = ".github"
-# Files that must leave an intake exactly as the fork has them: the model
-# manifest, and what the fork keeps where upstream keeps its seeds.
-FORK_OWNED = (MANIFEST, *invariants.SEEDS)
+# The file that overrides the manifest key by key, and can switch its
+# management of the settings files off.
+MANIFEST_OVERRIDE = ".claude/models.local.json"
+# Files that must leave an intake exactly as the fork has them (absent, if
+# the fork has none): the manifest, its override, and what the fork keeps
+# where upstream keeps its seeds.
+FORK_OWNED = (MANIFEST, MANIFEST_OVERRIDE, *invariants.SEEDS)
 
 BRANCH_PREFIX = "bot/upstream-"
-STATE_FILE = "orchestra-intake.json"
-STATE_VERSION = 1
-STATE_SHAS = ("fork", "upstream", "base", "auto_tree")
+RECORD_FILE = "orchestra-intake.json"
+RECORD_VERSION = 2
 ZERO_EPOCH = "0"
+LOG_LIMIT = 100
+SUBJECT_LIMIT = 120
 # Branch names in the scratch repository. merge-tree writes the two it is
 # given into the conflict markers.
 OURS = "fork-main"
@@ -79,8 +97,6 @@ BASE = "merge-base"
 AUTO = "auto-merge"
 SEALED = "intake"
 CONFLICT_PREFIX = "CONFLICT"
-# The start of a marker line merge-tree writes, as a pattern for `git grep -E`.
-MARKER_PATTERN = r"^(<{7}|>{7}|\|{7}) "
 
 
 @dataclass(frozen=True)
@@ -245,13 +261,70 @@ def with_facts(stop: Stop, facts: dict[str, object]) -> Stop:
     return Stop(stop.result, stop.exit_code, stop.detail, **{**facts, **stop.fields})
 
 
+def changed_paths(repo: Repo, before: str, after: str, *under: str) -> list[str]:
+    """Every path that differs between two trees. A rename counts as both of
+    its names."""
+    scope = ["--", *under] if under else []
+    return repo.listed(
+        "diff", "--name-only", "-z", "--no-renames", before, after, *scope
+    )
+
+
+def upstream_log(sides: Sides) -> list[dict[str, str]]:
+    """Upstream's commits, newest first, for a caller to show. A subject is
+    upstream's own words, so it is given only in the inert form: pasted into
+    a pull request under the owner's name it closes no code block, mentions
+    nobody and references nothing."""
+    listed = sides.project.run(
+        "log",
+        "--no-color",
+        f"--max-count={LOG_LIMIT}",
+        "--format=%H%x09%s",
+        f"{sides.fork}..{sides.upstream}",
+    )
+    entries = []
+    for line in listed.stdout.split("\n"):
+        commit, _, subject = line.partition("\t")
+        if common.SHA_RE.fullmatch(commit):
+            shown_subject = inert_text(subject, SUBJECT_LIMIT)
+            entries.append({"commit": commit, "subject": shown_subject})
+    return entries
+
+
+def sensitive_changes(repo: Repo, sides: Sides, tree: str) -> list[str]:
+    """The changed paths a reviewer reads first: what defines the required
+    checks, and what a later session executes or loads as instructions. It is
+    the issue worker's stop-list, computed here so that the list in a pull
+    request is not somebody's own search."""
+    return [
+        inert_path(path)
+        for path in changed_paths(repo, sides.fork, tree)
+        if worker_gate.stop_list_entry(path) is not None
+    ]
+
+
+def require_supported(repo: Repo, sides: Sides, tree: str) -> None:
+    """Stop before a merged tree is checked out if it holds an entry the
+    fork's own tree does not already hold and no checkout may hold: each
+    side can be clean while the two together collide (``scripts/Maint/`` from
+    upstream beside the fork's ``scripts/maint/``)."""
+    inherited = set(scratch_repo.unsupported_entries(repo, sides.fork))
+    entries = [
+        entry
+        for entry in scratch_repo.unsupported_entries(repo, tree)
+        if entry not in inherited
+    ]
+    if entries:
+        detail = "the merged tree holds entries this does not check out"
+        shown_entries = entries[: invariants.DETAIL_LINES]
+        needs_owner(invariants.RESULT_UNSUPPORTED, detail, entries=shown_entries)
+
+
 def protected_findings(repo: Repo, sides: Sides, tree: str) -> list[invariants.Finding]:
     """What an intake must not change, compared with the fork object by
     object: the workflows, the model manifest, the fork's own state."""
     found = []
-    changed = repo.listed(
-        "diff", "--name-only", "-z", "--no-renames", sides.fork, tree, "--", WORKFLOWS
-    )
+    changed = changed_paths(repo, sides.fork, tree, WORKFLOWS)
     if changed and not sides.allow_workflows:
         detail = f"changed under {WORKFLOWS}: {', '.join(changed)}"
         found.append(invariants.Finding("workflows-untouched", detail))
@@ -270,6 +343,7 @@ def judged(
     pins: dict[str, str] | None,
 ) -> list[invariants.Finding]:
     """Everything a merged tree must satisfy before it becomes a commit."""
+    require_supported(scratch.repo, sides, tree)
     scratch.load(tree)
     target = invariants.Target(tools, scratch.repo.path, scratch.repo.env, pins)
     return invariants.check_tree(target) + protected_findings(scratch.repo, sides, tree)
@@ -303,9 +377,10 @@ def publish(
     commit = scratch.commit(tree, (fork, upstream), message, max(stamps, key=int))
     branch = f"{BRANCH_PREFIX}{common.short_sha(upstream)}"
     ref = f"refs/heads/{branch}"
-    if project.has(ref) and project.text("rev-parse", ref) != commit:
+    existed = project.has(ref)
+    if existed and project.text("rev-parse", ref) != commit:
         detail = f"{branch} already exists and is another commit"
-        needs_owner(invariants.RESULT_BRANCH, detail)
+        needs_owner(invariants.RESULT_BRANCH, detail, branch=branch)
     scratch.branch(SEALED, commit)
     project.run(
         "-c", "protocol.file.allow=always",
@@ -317,7 +392,10 @@ def publish(
     recorded = project.text("rev-list", "--parents", "-n", "1", ref).split()
     kept_tree = project.text("rev-parse", f"{ref}^{{tree}}")
     if recorded != [commit, fork, upstream] or kept_tree != tree:
-        detail = f"{branch} is not the merge of the fork and upstream that was built"
+        if not existed:
+            # Not left behind: a branch of this name is what gets pushed.
+            project.run("update-ref", "-d", ref)
+        detail = f"{branch} was not the merge that was built; it was not kept"
         failed(scratch_repo.RESULT_GIT, detail)
     return {
         "result": invariants.RESULT_MERGED,
@@ -325,6 +403,7 @@ def publish(
         "commit": commit,
         "branch": branch,
         "tree": tree,
+        "sensitive_changes": sensitive_changes(scratch.repo, sides, tree),
     }
 
 
@@ -343,21 +422,24 @@ def preflight(sides: Sides) -> dict[str, object]:
         needs_owner(invariants.RESULT_NO_BASE, detail)
     base = bases[0]
     ahead = project.text("rev-list", "--count", f"{fork}..{upstream}")
-    known: dict[str, object] = {"base": base, "upstream_commits": int(ahead)}
-    workflows = project.listed(
-        "diff", "--name-only", "-z", "--no-renames", base, upstream, "--", WORKFLOWS
-    )
+    known: dict[str, object] = {
+        "base": base,
+        "upstream_commits": int(ahead),
+        "upstream_log": upstream_log(sides),
+    }
+    workflows = changed_paths(project, base, upstream, WORKFLOWS)
     if workflows and not sides.allow_workflows:
-        paths = [shown(path) for path in workflows]
+        paths = [inert_path(path) for path in workflows]
         detail = f"upstream changed files under {WORKFLOWS}"
         needs_owner(invariants.RESULT_WORKFLOWS, detail, **known, paths=paths)
     for name, tree in (("the merge base", base), ("upstream's tip", upstream)):
-        entries = scratch_repo.unsupported_entries(project, tree)[
-            : invariants.DETAIL_LINES
-        ]
+        entries = scratch_repo.unsupported_entries(project, tree)
         if entries:
             detail = f"{name} holds entries this does not check out"
-            needs_owner(invariants.RESULT_UNSUPPORTED, detail, **known, entries=entries)
+            shown_entries = entries[: invariants.DETAIL_LINES]
+            needs_owner(
+                invariants.RESULT_UNSUPPORTED, detail, **known, entries=shown_entries
+            )
     return known
 
 
@@ -365,7 +447,9 @@ def merge_transformed(
     scratch: Scratch, tools: Path, sides: Sides, base: str
 ) -> tuple[str, list[Conflict], dict[str, object]]:
     """Hold the fork to its invariants, apply T to the other two sides, and
-    merge. Returns the tree, its conflicts, and what was measured on the way."""
+    merge. Returns the tree, its conflicts, and what was measured on the way.
+    The same inputs give the same tree, which is what lets ``seal`` build the
+    automatic merge again instead of believing a record of it."""
     scratch.load(sides.fork)
     own = invariants.check_tree(
         invariants.Target(tools, scratch.repo.path, scratch.repo.env)
@@ -384,47 +468,41 @@ def merge_transformed(
         "transformed": {"merge_base": applied_to_base, "upstream": applied},
         "conflicts_without_transform": len(plain),
         "conflicts": [
-            {"path": shown(c.path), "types": [shown(kind) for kind in c.types]}
+            {
+                "path": inert_path(c.path),
+                "types": [inert_text(kind) for kind in c.types],
+            }
             for c in conflicts
         ],
     }
     return tree, conflicts, measured
 
 
-def leave_for_resolution(
-    scratch: Scratch, sides: Sides, base: str, tree: str, conflicts: list[Conflict]
-) -> None:
+def leave_for_resolution(scratch: Scratch, sides: Sides, tree: str) -> None:
     """Leave the automatic result checked out on top of the fork's commit, so
     the difference to finish is the one a reviewer will see. A branch holds
-    the result, so it outlives a garbage collection."""
+    the result, so it outlives a garbage collection. The record says only
+    which two commits the directory is for: ``seal`` works everything else
+    out again."""
     scratch.load(tree)
     scratch.repo.run("update-ref", "--no-deref", "HEAD", sides.fork)
     held = scratch.commit(tree, (sides.fork,), "automatic merge result\n", ZERO_EPOCH)
     scratch.branch(AUTO, held)
-    state = {
-        "version": STATE_VERSION,
-        "fork": sides.fork,
-        "upstream": sides.upstream,
-        "base": base,
-        "auto_tree": tree,
-        "conflicts": [conflict.path for conflict in conflicts],
-    }
-    record = scratch.repo.path / ".git" / STATE_FILE
-    record.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    record = {"version": RECORD_VERSION, **sides.facts()}
+    target = scratch.repo.path / ".git" / RECORD_FILE
+    target.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 def unfinished(
-    conflicts: list[Conflict],
-    findings: list[invariants.Finding],
-    known: dict[str, object],
+    conflicts: list[Conflict], findings: list[invariants.Finding]
 ) -> NoReturn:
-    """A merge that needs judgment: say which kind, with everything known."""
+    """A merge that needs judgment: say which kind."""
     if conflicts:
         detail = f"{len(conflicts)} path(s) conflict after the mechanical changes"
-        needs_owner(invariants.RESULT_CONFLICTS, detail, **known)
+        needs_owner(invariants.RESULT_CONFLICTS, detail)
     detail = f"the merge is clean, but {len(findings)} finding(s) remain"
     listed = invariants.as_json(findings)
-    needs_owner(invariants.RESULT_INVARIANTS, detail, **known, findings=listed)
+    needs_owner(invariants.RESULT_INVARIANTS, detail, findings=listed)
 
 
 def take_in(sides: Sides, resolve_in: Path | None, work: Path) -> dict[str, object]:
@@ -437,17 +515,21 @@ def take_in(sides: Sides, resolve_in: Path | None, work: Path) -> dict[str, obje
         tree, conflicts, measured = merge_transformed(scratch, tools, sides, base)
         known = {**known, **measured}
         # A conflicted tree is not judged: it is not a candidate for anything.
+        # It is still checked out for whoever finishes it, so it is scanned.
+        require_supported(scratch.repo, sides, tree)
         findings = (
             [] if conflicts else judged(scratch, tools, sides, tree, sides.pins())
         )
         if conflicts or findings:
             keep = resolve_in is not None
             if keep:
-                leave_for_resolution(scratch, sides, base, tree, conflicts)
+                leave_for_resolution(scratch, sides, tree)
                 known = {**known, "resolve_in": shown(str(resolve_in))}
-            unfinished(conflicts, findings, known)
+            unfinished(conflicts, findings)
         message = commit_message(sides, base, by_hand=0)
         return {**known, **publish(sides, scratch, tree, message)}
+    except Stop as stop:
+        raise with_facts(stop, known) from None
     finally:
         if resolve_in is not None and not keep:
             shutil.rmtree(resolve_in, ignore_errors=True)
@@ -471,133 +553,3 @@ def cmd_intake(args: argparse.Namespace, work: Path) -> dict[str, object]:
         return {**sides.facts(), **take_in(sides, args.resolve_in, work)}
     except Stop as stop:
         raise with_facts(stop, sides.facts()) from None
-
-
-# =============================================================================
-# seal
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class Record:
-    """What ``intake --resolve-in`` wrote down about the merge it left."""
-
-    base: str
-    auto_tree: str
-    conflicts: tuple[str, ...]
-
-
-def load_record(directory: Path, sides: Sides) -> Record:
-    """The record in ``directory``, held to the commits the caller names."""
-    try:
-        state = json.loads((directory / ".git" / STATE_FILE).read_text("utf-8"))
-    except (OSError, ValueError):
-        refuse("--resolve-in is not a directory that intake --resolve-in prepared")
-    conflicts = state.get("conflicts") if isinstance(state, dict) else None
-    well_formed = (
-        isinstance(state, dict)
-        and state.get("version") == STATE_VERSION
-        and all(
-            isinstance(state.get(key), str) and common.SHA_RE.fullmatch(state[key])
-            for key in STATE_SHAS
-        )
-        and isinstance(conflicts, list)
-        and all(isinstance(path, str) for path in conflicts)
-    )
-    if not well_formed:
-        refuse("the intake record in --resolve-in is damaged")
-    if state["fork"] != sides.fork or state["upstream"] != sides.upstream:
-        refuse("--resolve-in was prepared for another fork or upstream commit")
-    return Record(state["base"], state["auto_tree"], tuple(conflicts))
-
-
-def load_resolutions(path: Path) -> dict[str, str]:
-    """The notes that acknowledge each conflict: path -> what was decided."""
-    try:
-        notes = json.loads(path.read_text("utf-8"))
-    except (OSError, ValueError):
-        refuse("--resolutions must be a JSON object: path -> one-line note")
-    if not isinstance(notes, dict) or not all(
-        isinstance(note, str) and note.strip() for note in notes.values()
-    ):
-        refuse("--resolutions must map every path to a note that is not empty")
-    return notes
-
-
-def require_answers(conflicts: tuple[str, ...], notes: dict[str, str]) -> None:
-    """Every conflict is answered by name. A marker scan alone would pass a
-    file deleted on one side, or a binary one: neither leaves a marker."""
-    unanswered = sorted(set(conflicts) - set(notes))
-    unknown = sorted(set(notes) - set(conflicts))
-    if unanswered or unknown:
-        needs_owner(
-            invariants.RESULT_UNRESOLVED,
-            "--resolutions must name exactly the conflicted paths",
-            unanswered=[shown(path) for path in unanswered],
-            not_conflicts=[shown(path) for path in unknown],
-        )
-
-
-def finished_tree(edited: Repo, conflicts: tuple[str, ...]) -> str:
-    """Stage the directory as it stands and return its tree. A conflicted
-    path that still holds a marker line stops the run."""
-    edited.run("add", "--all")
-    tree = edited.text("write-tree")
-    if not conflicts:
-        return tree
-    found = edited.run(
-        "--literal-pathspecs", "grep", "-z", "-l", "-I", "-E", "-e", MARKER_PATTERN,
-        tree, "--", *conflicts, ok=(0, 1),
-    )  # fmt: skip
-    marked = [entry.split(":", 1)[1] for entry in found.stdout.split("\0") if entry]
-    if marked:
-        still = [shown(path) for path in marked]
-        needs_owner(
-            invariants.RESULT_UNRESOLVED, "conflict markers remain", unanswered=still
-        )
-    return tree
-
-
-def seal(
-    sides: Sides, record: Record, notes: dict[str, str], resolve_in: Path, work: Path
-) -> dict[str, object]:
-    require_answers(record.conflicts, notes)
-    edited = Scratch(Repo(resolve_in, sides.project.env))
-    # `git add` leaves ignored files out. They are named, so a resolution
-    # written to an ignored path is not lost without a word.
-    ignored = edited.repo.listed(
-        "ls-files", "--others", "--ignored", "--exclude-standard", "-z"
-    )
-    tree = finished_tree(edited.repo, record.conflicts)
-    tools = invariants.extract_tools(sides.project, sides.fork, work / "tools")
-    scratch = Scratch.create(work / "tree", edited.repo)
-    findings = judged(scratch, tools, sides, tree, None)
-    if findings:
-        detail = f"{len(findings)} finding(s) remain"
-        listed = invariants.as_json(findings)
-        needs_owner(invariants.RESULT_INVARIANTS, detail, findings=listed)
-    by_hand = edited.repo.listed(
-        "diff", "--name-only", "-z", "--no-renames", record.auto_tree, tree
-    )
-    message = commit_message(sides, record.base, by_hand=len(by_hand))
-    pins_after = invariants.seed_pins(
-        edited.repo.text_at(tree, invariants.SEED_PIN_FILE)
-    )
-    return {
-        **publish(sides, edited, tree, message),
-        "ignored_files_left_out": [shown(path) for path in ignored],
-        "edited_by_hand": [shown(path) for path in by_hand],
-        "resolutions": {shown(path): shown(notes[path]) for path in record.conflicts},
-        "seed_pins_changed": sides.pins() != pins_after,
-    }
-
-
-def cmd_seal(args: argparse.Namespace, work: Path) -> dict[str, object]:
-    sides = Sides.of(args)
-    record = load_record(args.resolve_in, sides)
-    notes = load_resolutions(args.resolutions)
-    facts = {**sides.facts(), "base": record.base}
-    try:
-        return {**facts, **seal(sides, record, notes, args.resolve_in, work)}
-    except Stop as stop:
-        raise with_facts(stop, facts) from None

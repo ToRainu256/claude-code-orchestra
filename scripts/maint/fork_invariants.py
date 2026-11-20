@@ -7,13 +7,18 @@ manifest, the files a new project is seeded from live in ``scripts/scaffold/``,
 and the default install commands clone the fork. This file says what those
 invariants are and whether a tree satisfies them:
 
-    roles-renamed     ``scripts/rename-roles.py`` finds nothing left to rename
-    model-names       ``models_lint.py`` finds no model name outside the manifest
-    manifest-applied  ``models.py check --strict`` finds no drift
-    seeds-pinned      each seed has the SHA-256 ``tests/test_scaffold.py`` pins
-    install-urls      the updater's default and the README's default clone
-                      commands name the fork
-    no-claude-md      none of the files Claude Code reads instead of AGENTS.md
+    roles-renamed         ``scripts/rename-roles.py`` finds nothing left to rename
+    model-names           ``models_lint.py`` finds no model name outside the manifest
+    manifest-applied      ``models.py check --strict`` finds no drift
+    manifest-needs-owner  that tool refuses the tree: an agent the manifest does
+                          not name, or names and the tree lacks. Only the owner
+                          assigns a model, so no tool fixes this one
+    seeds-pinned          each seed has the SHA-256 ``tests/test_scaffold.py`` pins
+    install-urls          the updater assigns its default repository once, to
+                          the fork, and no README command installs from upstream
+    no-claude-md          none of the files Claude Code reads instead of AGENTS.md
+    plain-entries         (``check --rev`` only) the commit holds nothing that is
+                          not checked out: see ``scratch_repo.unsupported_entries``
 
 The first three are the repository's own checkers, run with ``--project-root``
 on the tree in question. The last three have no checker that can be pointed
@@ -22,18 +27,21 @@ data, from the same definitions: the digests out of the test file, the file
 list ``scripts/check.sh`` refuses.
 
 ``check`` judges the work tree, or one revision checked out in a scratch
-repository, with the tools of the checkout it is run from. ``intake`` and
-``seal`` (``upstream_intake.py``) prepare the merge of upstream; they run the
-fork's tools as they are at the fork's commit, extracted into a private
-directory, so no file of the tree being merged is ever executed.
+repository, with the tools of the checkout it is run from. ``intake``
+(``upstream_intake.py``) and ``seal`` (``intake_seal.py``) prepare the merge of
+upstream; they run the fork's tools as they are at the fork's commit,
+extracted into a private directory, so no file of the tree being merged is
+ever executed.
 
-Everything printed that came from a tree, a tool or git goes through
-``common.safe_text``. Nothing here pushes, and nothing contacts a remote.
+Everything reported that came from a tree, a tool or git goes through
+``scratch_repo.inert_path`` or ``inert_text``: what is in the JSON can be
+pasted into a shell or posted as Markdown without acting there. Nothing here
+pushes, and nothing contacts a remote.
 
 Standard library only; runs on Python 3.9. Needs git 2.40 or newer.
 
 Usage:
-    python3 scripts/maint/fork_invariants.py check [--rev REV]
+    python3 scripts/maint/fork_invariants.py check [--rev SHA]
     python3 scripts/maint/fork_invariants.py intake --fork-rev SHA \\
         --upstream-rev SHA [--resolve-in DIR]
     python3 scripts/maint/fork_invariants.py seal --fork-rev SHA \\
@@ -68,7 +76,7 @@ from typing import NoReturn
 
 import common
 import scratch_repo
-from scratch_repo import Repo, Scratch, Stop, failed, refuse, shown
+from scratch_repo import Repo, Scratch, Stop, failed, inert_text, refuse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -96,8 +104,29 @@ SHADOW_FILES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
 UPDATER = "scripts/update.sh"
 README = "README.md"
 DEFAULT_REPO_PREFIX = "TEMPLATE_REPO="
+# The one assignment the updater may hold, byte for byte.
+DEFAULT_REPO_LINE = (
+    f'{DEFAULT_REPO_PREFIX}"${{ORCHESTRA_TEMPLATE_REPO:-{common.FORK_GIT_URL}}}"'
+)
+# Any assignment to that variable, whatever its indentation or keyword.
+REPO_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:(?:export|readonly|local|declare|typeset)\s+(?:-\w+\s+)*)?TEMPLATE_REPO\+?="
+)
 CLONE_COMMAND = "git clone"
 BRANCH_FLAG = "--branch"
+# A command that fetches an installer instead of cloning the repository.
+FETCH_RE = re.compile(r"\b(?:curl|wget)\b|raw\.githubusercontent\.com")
+REFUSED_PREFIX = "refused:"
+INVARIANT_NAMES = (
+    "roles-renamed",
+    "model-names",
+    "manifest-applied",
+    "manifest-needs-owner",
+    "seeds-pinned",
+    "install-urls",
+    "no-claude-md",
+    "plain-entries",
+)
 TOOL_TIMEOUT_SEC = 120
 PATH_ARGUMENTS = ("project_root", "resolve_in", "resolutions")
 DETAIL_LINES = 20
@@ -145,10 +174,17 @@ OUTCOMES: dict[str, dict[str, tuple[int, ...]]] = {
         RESULT_BRANCH: _NEEDS_OWNER,
         **_ALWAYS,
     },
+    # `seal` builds the automatic merge again, so everything that stops
+    # `intake` before a merge exists can stop it too.
     "seal": {
         RESULT_MERGED: (common.EXIT_OK,),
         RESULT_UNRESOLVED: _NEEDS_OWNER,
         RESULT_INVARIANTS: _NEEDS_OWNER,
+        RESULT_WORKFLOWS: _NEEDS_OWNER,
+        RESULT_NO_BASE: _NEEDS_OWNER,
+        RESULT_UNSUPPORTED: _NEEDS_OWNER,
+        RESULT_TRANSFORM: _NEEDS_OWNER,
+        RESULT_FORK: _NEEDS_OWNER,
         RESULT_BRANCH: _NEEDS_OWNER,
         **_ALWAYS,
     },
@@ -208,8 +244,9 @@ def run_tool(target: Target, rel: str, *args: str) -> common.CommandResult:
 
 
 def said(result: common.CommandResult) -> list[str]:
-    """What a tool reported, as bounded, printable lines."""
-    lines = [shown(" ".join(line.split())) for line in result.stderr.split("\n")]
+    """What a tool reported, as bounded lines with nothing left in them
+    that a shell or Markdown would act on: a tool quotes the tree it read."""
+    lines = [inert_text(line) for line in result.stderr.split("\n")]
     kept = [line for line in lines if line]
     if len(kept) > DETAIL_LINES:
         return [*kept[:DETAIL_LINES], f"... {len(kept) - DETAIL_LINES} more line(s)"]
@@ -253,23 +290,34 @@ def read_text(root: Path, rel: str) -> str | None:
         return None
 
 
-def check_roles(target: Target) -> list[str]:
+def found(invariant: str, details: list[str]) -> list[Finding]:
+    return [Finding(invariant, detail) for detail in details]
+
+
+def check_roles(target: Target) -> list[Finding]:
     result = run_tool(target, RENAME_TOOL, "--project-root", str(target.tree))
-    return verdict(RENAME_TOOL, result, _NEEDS_OWNER)
+    return found("roles-renamed", verdict(RENAME_TOOL, result, _NEEDS_OWNER))
 
 
-def check_model_names(target: Target) -> list[str]:
+def check_model_names(target: Target) -> list[Finding]:
     result = run_tool(target, LINT_TOOL, "--project-root", str(target.tree))
-    return verdict(LINT_TOOL, result, _NEEDS_OWNER)
+    return found("model-names", verdict(LINT_TOOL, result, _NEEDS_OWNER))
 
 
-def check_manifest(target: Target) -> list[str]:
+def check_manifest(target: Target) -> list[Finding]:
     """Exit 1 is a manifest the tree holds but the tool cannot read: the
-    tree's fault, like drift, not the tool's."""
+    tree's fault, like drift, not the tool's. A line the tool marks as
+    refused is not drift: rendering the manifest again cannot clear it, and
+    the manifest itself is the owner's to change."""
     result = run_tool(
         target, MODELS_TOOL, "--project-root", str(target.tree), "check", "--strict"
     )
-    return verdict(MODELS_TOOL, result, (common.EXIT_USAGE, common.EXIT_NEEDS_OWNER))
+    lines = verdict(MODELS_TOOL, result, (common.EXIT_USAGE, common.EXIT_NEEDS_OWNER))
+    refused = [line for line in lines if line.startswith(REFUSED_PREFIX)]
+    drift = [line for line in lines if not line.startswith(REFUSED_PREFIX)]
+    if refused:
+        return found("manifest-needs-owner", refused)
+    return found("manifest-applied", drift)
 
 
 def seed_pins(text: str | None) -> dict[str, str] | None:
@@ -285,10 +333,11 @@ def seed_pins(text: str | None) -> dict[str, str] | None:
     return pins
 
 
-def check_seeds(target: Target) -> list[str]:
+def check_seeds(target: Target) -> list[Finding]:
     pins = target.pins or seed_pins(read_text(target.tree, SEED_PIN_FILE))
     if pins is None:
-        return [f"{SEED_PIN_FILE} does not pin a digest for each seed"]
+        detail = f"{SEED_PIN_FILE} does not pin a digest for each seed"
+        return found("seeds-pinned", [detail])
     problems = []
     for seed, digest in pins.items():
         path = plain_file(target.tree, seed)
@@ -298,7 +347,7 @@ def check_seeds(target: Target) -> list[str]:
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual != digest:
             problems.append(f"{seed} has SHA-256 {actual}; the pin is {digest}")
-    return problems
+    return found("seeds-pinned", problems)
 
 
 def is_default_repo_line(line: str) -> bool:
@@ -318,47 +367,63 @@ INSTALL_LINES: tuple[tuple[str, Callable[[str], bool]], ...] = (
 )
 
 
-def check_install_urls(target: Target) -> list[str]:
+def installs_from_upstream(line: str) -> bool:
+    """A README line that would install upstream's default branch: a clone
+    without a branch, or an installer fetched from upstream."""
+    if UPSTREAM_SLUG not in line:
+        return False
+    return is_default_clone(line) or FETCH_RE.search(line) is not None
+
+
+def check_install_urls(target: Target) -> list[Finding]:
+    """The updater's default is compared as a whole line: a line that merely
+    contains the fork's URL (in a comment, say) proves nothing, and neither
+    does a correct line with a second assignment below it."""
     problems = []
     updater = read_text(target.tree, UPDATER) or ""
-    defaults = [line for line in updater.split("\n") if is_default_repo_line(line)]
-    if len(defaults) != 1 or common.FORK_GIT_URL not in defaults[0]:
+    assigned = [line for line in updater.split("\n") if REPO_ASSIGNMENT_RE.match(line)]
+    if assigned != [DEFAULT_REPO_LINE]:
         problems.append(
-            f"{UPDATER} must set {DEFAULT_REPO_PREFIX} once, to {common.FORK_GIT_URL}"
+            f"{UPDATER} must assign TEMPLATE_REPO exactly once, as the line "
+            f"{DEFAULT_REPO_LINE}; it has {len(assigned)} assignment(s)"
         )
     readme = read_text(target.tree, README) or ""
     for number, line in enumerate(readme.split("\n"), 1):
-        if is_default_clone(line) and UPSTREAM_SLUG in line:
-            problems.append(f"{README}:{number}: a default install clones upstream")
-    return problems
+        if installs_from_upstream(line):
+            problems.append(f"{README}:{number}: an install command names upstream")
+    return found("install-urls", problems)
 
 
-def check_shadow_files(target: Target) -> list[str]:
-    return [
-        f"{rel} exists: Claude Code reads it instead of AGENTS.md"
-        for rel in SHADOW_FILES
-        if os.path.lexists(target.tree / rel)
-    ]
+def check_shadow_files(target: Target) -> list[Finding]:
+    return found(
+        "no-claude-md",
+        [
+            f"{rel} exists: Claude Code reads it instead of AGENTS.md"
+            for rel in SHADOW_FILES
+            if os.path.lexists(target.tree / rel)
+        ],
+    )
 
 
-INVARIANTS: tuple[tuple[str, Callable[[Target], list[str]]], ...] = (
-    ("roles-renamed", check_roles),
-    ("model-names", check_model_names),
-    ("manifest-applied", check_manifest),
-    ("seeds-pinned", check_seeds),
-    ("install-urls", check_install_urls),
-    ("no-claude-md", check_shadow_files),
+INVARIANTS: tuple[Callable[[Target], list[Finding]], ...] = (
+    check_roles,
+    check_model_names,
+    check_manifest,
+    check_seeds,
+    check_install_urls,
+    check_shadow_files,
 )
 
 
 def check_tree(target: Target) -> list[Finding]:
-    return [
-        Finding(name, detail) for name, check in INVARIANTS for detail in check(target)
-    ]
+    return [finding for check in INVARIANTS for finding in check(target)]
 
 
 def as_json(findings: list[Finding]) -> list[dict[str, str]]:
-    return [{"invariant": f.invariant, "detail": shown(f.detail)} for f in findings]
+    return [
+        {"invariant": finding.invariant, "detail": inert_text(finding.detail)}
+        for finding in findings
+    ]
 
 
 # =============================================================================
@@ -370,17 +435,17 @@ def cmd_check(args: argparse.Namespace, work: Path) -> dict[str, object]:
     """Judge the work tree, or one revision checked out in scratch, with the
     tools of the checkout this is run from."""
     project = Repo(args.project_root, scratch_repo.child_env())
-    scratch_repo.require_repository(project)
+    # No merge base is needed here, so a shallow clone (CI's) will do.
+    scratch_repo.require_repository(project, full_history=False)
     tree = args.project_root
     findings: list[Finding] = []
     if args.rev is not None:
-        if not project.has(f"{args.rev}^{{commit}}"):
-            refuse("--rev is not a commit in this repository")
-        entries = scratch_repo.unsupported_entries(project, args.rev)
-        findings = [Finding("plain-entries", entry) for entry in entries]
+        rev = scratch_repo.commit_of(project, args.rev, "--rev")
+        entries = scratch_repo.unsupported_entries(project, rev)
+        findings = found("plain-entries", entries)
         if not findings:
             scratch = Scratch.create(work / "tree", project)
-            scratch.load(args.rev)
+            scratch.load(rev)
             tree = scratch.repo.path
     if not findings:
         findings = check_tree(Target(args.project_root, tree, project.env))
@@ -402,9 +467,9 @@ def _cmd_intake(args: argparse.Namespace, work: Path) -> dict[str, object]:
 
 
 def _cmd_seal(args: argparse.Namespace, work: Path) -> dict[str, object]:
-    import upstream_intake
+    import intake_seal
 
-    return upstream_intake.cmd_seal(args, work)
+    return intake_seal.cmd_seal(args, work)
 
 
 COMMANDS: dict[str, Callable[[argparse.Namespace, Path], dict[str, object]]] = {
@@ -445,7 +510,9 @@ def build_parser() -> JsonArgumentParser:
         parser_class=JsonArgumentParser,
     )
     check = commands.add_parser("check", help="Report whether a tree holds")
-    check.add_argument("--rev", help="A commit to check instead of the work tree")
+    check.add_argument(
+        "--rev", help="A full commit SHA to check instead of the work tree"
+    )
     intake = commands.add_parser("intake", help="Prepare the merge of upstream")
     seal = commands.add_parser("seal", help="Commit a merge finished by hand")
     for command in (intake, seal):
@@ -481,7 +548,7 @@ def build_parser() -> JsonArgumentParser:
 def report(command: str, payload: dict[str, object], exit_code: int) -> int:
     """Print the outcome, only when its command declared it."""
     result = str(payload["result"])
-    detail = shown(str(payload["detail"]))
+    detail = inert_text(str(payload["detail"]))
     common.checked_result(OUTCOMES[command], command, result, exit_code, detail)
     findings = payload.get("findings", [])
     conflicts = payload.get("conflicts", [])

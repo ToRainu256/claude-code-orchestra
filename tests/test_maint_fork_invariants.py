@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -34,12 +35,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAINT_DIR = REPO_ROOT / "scripts" / "maint"
-ROUTINES_DIR = MAINT_DIR / "routines"
 if str(MAINT_DIR) not in sys.path:
     sys.path.insert(0, str(MAINT_DIR))
 
 import common  # noqa: E402
 import fork_invariants  # noqa: E402
+import gh  # noqa: E402
+import intake_seal  # noqa: E402
+import report  # noqa: E402
 import scratch_repo  # noqa: E402
 import upstream_intake  # noqa: E402
 
@@ -119,27 +122,41 @@ UPSTREAM_FILES = {
     GUIDE: "# Guide\n\nline one\nline two\nline three\n\nend\n",
     "docs/keep.md": "kept\n",
 }
-EXIT_OK, EXIT_USAGE, EXIT_NEEDS_OWNER = 0, 1, 2
+EXIT_OK, EXIT_USAGE, EXIT_NEEDS_OWNER, EXIT_FAILED = 0, 1, 2, 3
 SYSTEM_PYTHON = Path("/usr/bin/python3")
+# The interpreters the helper must run under: the one running the tests, and
+# the system one (Python 3.9 on macOS). The second is listed even where it is
+# missing, so that its absence shows up as a skip with a reason.
+INTERPRETERS = pytest.mark.parametrize(
+    "python", [sys.executable, str(SYSTEM_PYTHON)], ids=["this-python", "system-python"]
+)
+# Variables that aim git at another repository.
+GIT_REDIRECTS = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE")
 
 
-def interpreters() -> list[str]:
-    """The test interpreter, plus the system one when it is another version:
-    the helper must stay runnable on the macOS system Python 3.9."""
-    found = [sys.executable]
-    if SYSTEM_PYTHON.exists():
-        probe = subprocess.run(
-            [str(SYSTEM_PYTHON), "-c", "import sys; print(sys.version_info[:2])"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if probe.returncode == 0 and probe.stdout.strip() != str(sys.version_info[:2]):
-            found.append(str(SYSTEM_PYTHON))
-    return found
+def usable(python: str) -> str:
+    """``python``, or an explicit skip when it adds no second version."""
+    if python == sys.executable:
+        return python
+    if not SYSTEM_PYTHON.exists():
+        pytest.skip(f"{SYSTEM_PYTHON} is not installed; the oldest Python is not run")
+    probe = subprocess.run(
+        [python, "-c", "import sys; print(sys.version_info[:2])"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"{SYSTEM_PYTHON} does not start; the oldest Python is not run")
+    if probe.stdout.strip() == str(sys.version_info[:2]):
+        pytest.skip(f"{SYSTEM_PYTHON} is the version the tests already run under")
+    return python
 
 
 def git(root: Path, *args: str) -> str:
+    """git for the tests' own bookkeeping, never aimed anywhere by the
+    environment a test sets up for the helper."""
+    env = {key: value for key, value in os.environ.items() if key not in GIT_REDIRECTS}
     done = subprocess.run(
         [
             "git",
@@ -156,6 +173,7 @@ def git(root: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return done.stdout.strip()
 
@@ -337,12 +355,69 @@ def conflict_paths(payload: dict[str, Any]) -> dict[str, list[str]]:
 # --- check: the invariants ---
 
 
-@pytest.mark.parametrize("python", interpreters(), ids=lambda path: Path(path).name)
+def cli(python: str, world: World, *argv: object) -> tuple[int, dict[str, Any]]:
+    """The command line in a process of its own, under one interpreter."""
+    script = str(MAINT_DIR / "fork_invariants.py")
+    done = subprocess.run(
+        [python, script, "--project-root", str(world.fork), *map(str, argv)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.stdout.strip(), done.stderr
+    return done.returncode, json.loads(done.stdout)
+
+
+# What upstream does -> the outcome `intake` must report for it.
+OUTCOME_CASES = {
+    "up-to-date": ({}, EXIT_OK),
+    "merged": ({"docs/new.md": "new\n"}, EXIT_OK),
+    "invariants-failed": (
+        {"docs/models.md": f"runs on {MODEL_WORD}\n"},
+        EXIT_NEEDS_OWNER,
+    ),
+    "unsupported-entry": ({".gitattributes": "* -text\n"}, EXIT_NEEDS_OWNER),
+    "workflows-changed": ({".github/workflows/new.yml": "name: X\n"}, EXIT_NEEDS_OWNER),
+}
+
+
+@INTERPRETERS
+@pytest.mark.parametrize("outcome", sorted(OUTCOME_CASES))
+def test_every_outcome_runs_under_every_supported_interpreter(
+    world: World, python: str, outcome: str
+) -> None:
+    """Each branch of the code is its own chance to use something the oldest
+    supported Python lacks, so each outcome is run there, not one of them."""
+    usable(python)
+    changes, expected = OUTCOME_CASES[outcome]
+    if changes:
+        world.upstream_commits(changes)
+
+    code, payload = cli(python, world, "intake", *world.revisions())
+
+    assert (code, payload["result"]) == (expected, outcome), payload
+
+
+@INTERPRETERS
+def test_check_runs_under_every_supported_interpreter(
+    world: World, python: str
+) -> None:
+    usable(python)
+
+    in_place = cli(python, world, "check")
+    of_commit = cli(python, world, "check", "--rev", world.fork_rev)
+
+    assert (in_place[0], in_place[1]["result"]) == (EXIT_OK, "satisfied")
+    assert (of_commit[0], of_commit[1]["result"]) == (EXIT_OK, "satisfied")
+
+
+@INTERPRETERS
 def test_intake_and_seal_run_under_every_supported_interpreter(
     world: World, tmp_path: Path, python: str
 ) -> None:
     """The command line, end to end, in a process of its own: a conflict left
     for editing, finished, and sealed into the two-parent commit."""
+    usable(python)
     world.upstream_commits(
         {GUIDE: UPSTREAM_FILES[GUIDE].replace("line two", "line two, upstream's way")}
     )
@@ -395,11 +470,17 @@ def test_fixture_fork_satisfies_every_invariant(world: World) -> None:
     assert (code, payload["result"]) == (EXIT_OK, "satisfied")
 
 
-@pytest.mark.parametrize("python", interpreters(), ids=lambda path: Path(path).name)
+@INTERPRETERS
 def test_check_passes_on_this_repository(python: str) -> None:
-    """The real tree is a fork that holds: what an intake starts from."""
+    """The real fork holds: what an intake starts from. It is the commit that
+    is judged, not the work tree: an intake starts from a commit, and the
+    work tree may hold files that belong to nobody (pytest's own temporary
+    directory, when it is put inside the repository). A shallow clone, which
+    is what CI checks out, is enough for this."""
+    usable(python)
+    head = git(REPO_ROOT, "rev-parse", "HEAD")
     done = subprocess.run(
-        [python, str(MAINT_DIR / "fork_invariants.py"), "check"],
+        [python, str(MAINT_DIR / "fork_invariants.py"), "check", "--rev", head],
         capture_output=True,
         text=True,
         timeout=120,
@@ -735,6 +816,10 @@ def test_tools_come_from_the_forks_commit_not_from_the_work_tree(
     assert (code, payload["result"]) == (EXIT_OK, "merged")
 
 
+# A reported name: the supported characters, and `\xNN` for anything else.
+INERT_NAME_RE = re.compile(r"(?:[A-Za-z0-9._/+@-]|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})+")
+
+
 def upstream_adds_entry(world: World, mode: str, rel: str, content: str) -> None:
     """Commit one tree entry on upstream without ever creating it on disk: a
     name this file system cannot hold, or a link."""
@@ -758,7 +843,13 @@ def upstream_adds_entry(world: World, mode: str, rel: str, content: str) -> None
         ("100644", "docs/.gitattributes", "*.md -text\n", "an attributes file"),
         ("100644", "docs/KEEP.md", "another case\n", "case-insensitive"),
         ("100644", "DOCS/other.md", "another case\n", "case-insensitive"),
-        ("100644", "docs/bad\x1b[2Jname.md", "x\n", "cannot be shown"),
+        ("100644", "docs/bad\x1b[2Jname.md", "x\n", "a character outside"),
+        ("100644", "docs/a'$(touch PWNED)'.md", "x\n", "a character outside"),
+        ("100644", "docs/`id`.md", "x\n", "a character outside"),
+        ("100644", "docs/two words.md", "x\n", "a character outside"),
+        ("100644", "docs/caf\u00e9.md", "x\n", "a character outside"),
+        ("100644", "docs/-rf", "x\n", "starts with a dash"),
+        ("100644", "-n/x.md", "x\n", "starts with a dash"),
         ("120000", "docs/link.md", "/etc/passwd", "mode 120000"),
         ("160000", "vendor", "", "mode 160000"),
     ],
@@ -777,8 +868,13 @@ def test_tree_that_must_not_be_checked_out_is_refused(
     payload = json.loads(captured.out)
     assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unsupported-entry")
     assert any(reason in entry for entry in payload["entries"])
-    # Nothing a name carries reaches the terminal as written.
+    # Nothing a name carries reaches the terminal, a shell or Markdown as
+    # written: what is reported of a refused name is made of the characters
+    # a supported name may have, plus visible escapes.
     assert "\x1b" not in captured.out + captured.err
+    for entry in payload["entries"]:
+        assert INERT_NAME_RE.fullmatch(entry.split(": ", 1)[0]), entry
+    assert "PWNED)" not in captured.out + captured.err
     assert world.intake_branches() == []
 
 
@@ -1165,6 +1261,7 @@ def readme_intake_outcomes() -> dict[str, dict[str, tuple[int, ...]]]:
     """The outcome tables of the intake section: command -> result -> codes."""
     text = README.read_text(encoding="utf-8")
     section = text.split(INTAKE_SECTION, 1)[1].split("\n## ", 1)[0]
+    section = section.split("\n### Issue worker", 1)[0]
     tables: dict[str, dict[str, tuple[int, ...]]] = {}
     current = ""
     for line in section.split("\n"):
@@ -1186,126 +1283,782 @@ def test_readme_intake_tables_match_what_the_code_can_report() -> None:
     }
 
 
-# --- the routine prompts ---
-
-INTAKE_PROMPT = ROUTINES_DIR / "upstream-intake.md"
-WORKER_PROMPT = ROUTINES_DIR / "issue-worker.md"
-FORK_API = f"repos/{common.FORK_SLUG}/"
-REQUIRED_CHECKS = ("Gates (ubuntu-latest)", "Gates (macos-latest)")
+def readme_invariants() -> list[str]:
+    text = README.read_text(encoding="utf-8")
+    table = text.split("\n### The invariants\n", 1)[1].split("\n### ", 1)[0]
+    return re.findall(r"(?m)^\| `([a-z-]+)` \|", table)
 
 
-def prompt(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+def test_readme_names_every_invariant_a_finding_can_carry() -> None:
+    assert readme_invariants() == list(fork_invariants.INVARIANT_NAMES)
 
 
-def hard_rules(path: Path) -> str:
-    """The numbered rules between "## Hard rules" and the next heading."""
-    return prompt(path).split("\n## Hard rules\n", 1)[1].split("\n## ", 1)[0]
+# --- what a caller is handed is already inert ---
 
 
-def flat(text: str) -> str:
-    return " ".join(text.split())
+@pytest.mark.parametrize(
+    ("name", "reported"),
+    [
+        ("docs/guide.md", "docs/guide.md"),
+        ("a+b@c/d_e-f.G9", "a+b@c/d_e-f.G9"),
+        ("docs/a'$(touch PWNED)'.md", r"docs/a\x27\x24\x28touch\x20PWNED\x29\x27.md"),
+        ("-rf", r"\x2drf"),
+        ("docs/caf" + chr(0xE9) + " " + chr(0x2603), r"docs/caf\xe9\x20\u2603"),
+    ],
+)
+def test_reported_path_cannot_act_in_a_shell_or_in_markdown(
+    name: str, reported: str
+) -> None:
+    assert scratch_repo.inert_path(name) == reported
 
 
-def api_calls(text: str) -> list[str]:
-    """Every `gh api` command line in a prompt, continuation lines joined."""
-    joined = re.sub(r"\\\n\s*", " ", text)
-    lines = [line.strip() for line in joined.split("\n")]
-    return [line for line in lines if line.startswith("gh api ")]
+@pytest.mark.parametrize(
+    ("text", "reported"),
+    [
+        ("feat(x): add y, keep z", "feat(x): add y, keep z"),
+        ("``` Closes #1 @someone", r"\x60\x60\x60 Closes \x231 \x40someone"),
+        ("a | b [x](y) <!-- c -->", r"a \x7c b \x5bx\x5d(y) \x3c\x21-- c --\x3e"),
+        ("see http://evil.example now", r"see http:\x2f/evil.example now"),
+        ("see WWW.evil.example", r"see WWW\x2eevil.example"),
+        ("fixes GH-12 and gh-7", r"fixes GH\x2d12 and gh\x2d7"),
+        ("- a list item", r"\x2d a list item"),
+        ("3. a numbered item", r"3\x2e a numbered item"),
+        ("=======", r"\x3d======"),
+        ("two\nlines\there", "two lines here"),
+        ("$(id) && `id`", r"\x24(id) \x26\x26 \x60id\x60"),
+    ],
+)
+def test_reported_text_cannot_form_markdown_or_a_command(
+    text: str, reported: str
+) -> None:
+    assert scratch_repo.inert_text(text) == reported
+    # A line can pass through two reports: the second changes nothing.
+    assert scratch_repo.inert_text(reported) == reported
+    assert scratch_repo.inert_path(scratch_repo.inert_path(text)) == (
+        scratch_repo.inert_path(text)
+    )
 
 
-@pytest.mark.parametrize("path", [INTAKE_PROMPT, WORKER_PROMPT])
-def test_prompt_is_versioned_and_self_contained(path: Path) -> None:
-    text = prompt(path)
-
-    assert re.search(r"(?m)^Prompt-Version: [1-9][0-9]*$", text)
-    for heading in ("## Hard rules", "## Steps", "## If something breaks"):
-        assert f"\n{heading}\n" in text
-    assert "## Status comment" in text
-    assert "context-loader" in text
-    assert "--review-only" in text
-    assert "When Codex Is Unavailable" in text
+HOSTILE_SUBJECT = "``` Closes #1 @someone <!-- job:x --> [x](http://e) | GH-2"
 
 
-@pytest.mark.parametrize("path", [INTAKE_PROMPT, WORKER_PROMPT])
-def test_prompt_writes_only_to_the_fork_and_only_over_rest(path: Path) -> None:
-    text = prompt(path)
-    rules = flat(hard_rules(path))
+def test_upstream_commit_subjects_are_given_only_in_the_inert_form(
+    world: World,
+) -> None:
+    """A subject is upstream's own words. Pasted as it is into a pull request
+    under the owner's name it would close a code block, close an issue and
+    mention people; the helper's field cannot."""
+    first = world.upstream_commits({"docs/one.md": "one\n"}, "docs: a plain subject")
+    second = world.upstream_commits({"docs/two.md": "two\n"}, HOSTILE_SUBJECT)
 
-    calls = api_calls(text)
-    assert calls
-    for call in calls:
-        assert FORK_API in call, call
-        assert "graphql" not in call.lower(), call
-    assert not re.search(r"(?m)^\s*gh (pr|issue|label|repo|workflow|run) ", text)
-    assert f"starts with `{FORK_API}`" in rules
-    assert "Never push to `main`" in rules
-    assert "GraphQL" in rules
+    code, payload, _ = world.intake()
 
-
-@pytest.mark.parametrize("path", [INTAKE_PROMPT, WORKER_PROMPT])
-def test_prompt_never_changes_protection_history_or_the_manifest(path: Path) -> None:
-    text = prompt(path)
-    rules = flat(hard_rules(path))
-
-    assert "branch protection" in rules
-    assert "force-push" in rules
-    assert "models.json" in rules
-    assert "scripts/scaffold/" in rules
-    assert "weakening" in rules
-    for forbidden in ("/protection", "--force", "-f origin", "automerge", "--auto"):
-        assert forbidden not in text, forbidden
-    assert "-X PUT" not in text.replace("-X PUT " + FORK_API + "pulls/", "")
+    assert code == EXIT_OK
+    assert payload["upstream_commits"] == 2
+    assert [entry["commit"] for entry in payload["upstream_log"]] == [second, first]
+    assert payload["upstream_log"][1]["subject"] == "docs: a plain subject"
+    hostile = payload["upstream_log"][0]["subject"]
+    assert hostile == scratch_repo.inert_text(HOSTILE_SUBJECT)
+    assert not set("`#@|<>[]!") & set(hostile)
+    assert "://" not in hostile and "GH-" not in hostile
 
 
-def test_intake_prompt_never_merges_and_says_so_in_the_pull_request() -> None:
-    text = prompt(INTAKE_PROMPT)
-    rules = flat(hard_rules(INTAKE_PROMPT))
+def test_finding_quotes_what_a_tool_read_only_in_the_inert_form(world: World) -> None:
+    """A checker quotes the tree: here the value upstream put in a config."""
+    config = UPSTREAM_FILES[".codex/config.toml"].replace("fixture-model", "x`id`|y")
+    world.upstream_commits({".codex/config.toml": config})
 
-    assert "Never merge" in rules
-    assert "/merge" not in text
-    assert "Never merged unattended" in text
-    assert "merge commit, never squash" in text
-    refusal = "never pass `--owner-allows-workflow-changes`"
-    assert refusal in rules
-    assert "--owner-allows-workflow-changes" not in flat(text).replace(refusal, "")
+    code, payload, err = world.intake()
 
-
-def test_intake_prompt_runs_only_the_forks_tools_on_upstreams_tree() -> None:
-    text = prompt(INTAKE_PROMPT)
-    rules = flat(hard_rules(INTAKE_PROMPT))
-
-    assert "Never execute" in rules
-    assert "is data" in rules
-    assert "python3 scripts/maint/fork_invariants.py intake" in text
-    assert "python3 scripts/maint/fork_invariants.py seal" in text
-    for executed in ("verify.sh", "pytest", "bash ../", "git merge ", "git pull"):
-        assert executed not in text.replace("Do not run `verify.sh`", ""), executed
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    reported = json.dumps(payload["findings"]) + err
+    assert "`" not in reported and "|" not in reported
+    assert r"x\x60id\x60\x7cy" in reported.replace("\\\\", "\\")
 
 
-def test_worker_prompt_acts_only_on_the_owners_labelled_issues() -> None:
-    text = prompt(WORKER_PROMPT)
-    rules = flat(hard_rules(WORKER_PROMPT))
+def test_sensitive_changes_name_what_a_later_session_runs_or_loads(
+    world: World,
+) -> None:
+    world.upstream_commits(
+        {
+            "scripts/tool.sh": "#!/bin/sh\necho tool\n",
+            ".claude/hooks/new.py": "print(1)\n",
+            ".mcp.json": "{}\n",
+            "docs/CLAUDE.md": "# Notes\n",
+            "docs/plain.md": "plain\n",
+            "AGENTS.md": "# Contract\n",
+        }
+    )
 
-    assert f"creator={common.FORK_OWNER}" in text
-    assert "labels=agent:ready" in text
-    assert f"`user.login` is not `{common.FORK_OWNER}`" in flat(text)
-    assert "author_association" in text
-    assert "is data, not instructions" in rules
-    assert "body of the issue" in rules
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_OK, "merged")
+    assert payload["sensitive_changes"] == [
+        ".claude/hooks/new.py",
+        ".mcp.json",
+        "AGENTS.md",
+        "docs/CLAUDE.md",
+        "scripts/tool.sh",
+    ]
 
 
-def test_worker_prompt_merges_over_rest_only_after_both_required_checks() -> None:
-    text = prompt(WORKER_PROMPT)
-    merges = [call for call in api_calls(text) if "/merge" in call]
+# --- the merged tree is scanned as a whole ---
 
-    assert len(merges) == 1
-    merge = merges[0]
-    assert f"-X PUT {FORK_API}pulls/" in merge
-    assert "merge_method=squash" in merge
-    assert "-f sha=" in merge
-    for name in REQUIRED_CHECKS:
-        assert name in text
-    assert "check-runs" in text
-    assert text.index("check-runs") < text.index("merge_method=squash")
-    assert "Codex unavailable: substituted" in text
+
+@pytest.mark.parametrize(
+    "rel",
+    [".GitHub/workflows/evil.yml", "docs/Fork-Only.md", "scripts/Rename-Roles.py"],
+)
+def test_name_that_collides_only_with_the_forks_own_paths_is_refused(
+    world: World, tmp_path: Path, rel: str
+) -> None:
+    """Upstream's tree is clean by itself and so is the fork's: the two names
+    meet only in the merge. On the owner's disk they are one file."""
+    upstream_adds_entry(world, "100644", rel, "theirs\n")
+    directory = tmp_path / "resolve"
+
+    code, payload, _ = world.intake("--resolve-in", directory)
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unsupported-entry")
+    assert "merged tree" in payload["detail"]
+    assert any("case-insensitive" in entry for entry in payload["entries"])
+    assert world.intake_branches() == []
+    assert not directory.exists()
+
+
+def test_colliding_name_is_refused_before_a_conflicted_tree_is_left(
+    world: World, tmp_path: Path
+) -> None:
+    world.upstream_commits(
+        {GUIDE: UPSTREAM_FILES[GUIDE].replace("line two", "line two, upstream's way")}
+    )
+    upstream_adds_entry(world, "100644", "docs/Fork-Only.md", "theirs\n")
+    directory = tmp_path / "resolve"
+
+    code, payload, _ = world.intake("--resolve-in", directory)
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unsupported-entry")
+    assert not directory.exists()
+
+
+def test_merge_base_is_scanned_like_upstreams_tip(world: World) -> None:
+    """The base is checked out and transformed as well. Here it holds an
+    attributes file that upstream has since removed."""
+    world.upstream_commits({".gitattributes": "* -text\n"})
+    git(world.fork, "merge", "--quiet", "-s", "ours", "--no-edit", world.upstream_rev)
+    world.upstream_commits({".gitattributes": None, "docs/new.md": "new\n"})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unsupported-entry")
+    assert "the merge base" in payload["detail"]
+
+
+@pytest.mark.parametrize(
+    ("rel", "reason"),
+    [
+        ("docs/.gitattributes", "an attributes file"),
+        ("docs/two words.md", "a character outside"),
+        ("docs/link.md", "mode 120000"),
+    ],
+)
+def test_seal_refuses_an_entry_no_checkout_may_hold(
+    world: World, tmp_path: Path, rel: str, reason: str
+) -> None:
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    if reason.startswith("mode"):
+        (directory / rel).symlink_to("/etc/passwd")
+    else:
+        write(directory, rel, "* -text\n")
+
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unsupported-entry")
+    assert any(reason in entry for entry in payload["entries"])
+    assert world.intake_branches() == []
+
+
+# --- install lines: a protection, not a consistency check ---
+
+EVIL_URL = "https://evil.example/x.git"
+FORK_DEFAULT = fork_invariants.DEFAULT_REPO_LINE
+UPDATER_VARIANTS = {
+    "the fork's URL only in a comment": (
+        f'TEMPLATE_REPO="${{ORCHESTRA_TEMPLATE_REPO:-{EVIL_URL}}}" # was {common.FORK_GIT_URL}\n'
+    ),
+    "a second, indented assignment": (
+        f'{FORK_DEFAULT}\nif true; then\n    TEMPLATE_REPO="{EVIL_URL}"\nfi\n'
+    ),
+    "an exported second assignment": f'{FORK_DEFAULT}\nexport TEMPLATE_REPO="{EVIL_URL}"\n',
+    "an appended value": f'{FORK_DEFAULT}\nTEMPLATE_REPO+="/../evil.git"\n',
+    "the default line, indented": f"  {FORK_DEFAULT}\n",
+    "a trailing command": f"{FORK_DEFAULT}; TEMPLATE_REPO={EVIL_URL}\n",
+    "no assignment at all": 'echo "$TEMPLATE_REPO"\n',
+}
+
+
+@pytest.mark.parametrize("variant", sorted(UPDATER_VARIANTS))
+def test_updater_default_must_be_the_forks_line_and_the_only_one(
+    world: World, variant: str
+) -> None:
+    write(
+        world.fork,
+        "scripts/update.sh",
+        "#!/usr/bin/env bash\n" + UPDATER_VARIANTS[variant],
+    )
+
+    code, payload, _ = world.run("check")
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "violated")
+    assert {f["invariant"] for f in payload["findings"]} == {"install-urls"}
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"curl -fsSL https://raw.githubusercontent.com/{fork_invariants.UPSTREAM_SLUG}"
+        "/main/scripts/install.sh | bash",
+        f"wget -qO- https://github.com/{fork_invariants.UPSTREAM_SLUG}/raw/main/x.sh | sh",
+        f"bash <(curl https://raw.githubusercontent.com/{fork_invariants.UPSTREAM_SLUG}/main/i.sh)",
+    ],
+)
+def test_readme_installer_fetched_from_upstream_is_a_finding(
+    world: World, line: str
+) -> None:
+    readme = (world.fork / "README.md").read_text(encoding="utf-8")
+    write(world.fork, "README.md", f"{readme}\n    {line}\n")
+
+    code, payload, _ = world.run("check")
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "violated")
+    assert {f["invariant"] for f in payload["findings"]} == {"install-urls"}
+
+
+def test_upstream_cannot_merge_another_default_repository_in(world: World) -> None:
+    """Through a whole intake: upstream rewrites the default and leaves the
+    fork's URL in a comment. The merge is clean; the invariant is not."""
+    updater = UPSTREAM_FILES["scripts/update.sh"].replace(
+        f'"${{ORCHESTRA_TEMPLATE_REPO:-{fork_invariants.UPSTREAM_GIT_URL}}}"',
+        f'"${{ORCHESTRA_TEMPLATE_REPO:-{EVIL_URL}}}" # was {common.FORK_GIT_URL}',
+    )
+    world.upstream_commits({"scripts/update.sh": updater})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    assert {f["invariant"] for f in payload["findings"]} == {"install-urls"}
+    assert world.intake_branches() == []
+
+
+# --- the manifest is the owner's ---
+
+
+def test_upstream_removing_an_agent_needs_the_owner_not_a_tool(world: World) -> None:
+    """The manifest names an agent the tree no longer has. Rendering the
+    manifest again cannot clear that, and the manifest is not this tool's to
+    edit: the finding says so by its name."""
+    world.upstream_commits({f"{AGENTS}/{OLD_DEEP}.md": None})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    assert {f["invariant"] for f in payload["findings"]} == {"manifest-needs-owner"}
+    assert all(f["detail"].startswith("refused:") for f in payload["findings"])
+
+
+def test_upstream_adding_an_agent_needs_the_owner_not_a_tool(world: World) -> None:
+    agent = "---\nname: extra\ndescription: new\nmodel: inherit\n---\n\nBody.\n"
+    world.upstream_commits({f"{AGENTS}/extra.md": agent})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    assert "manifest-needs-owner" in {f["invariant"] for f in payload["findings"]}
+
+
+def test_manifest_override_file_cannot_arrive_with_upstream(world: World) -> None:
+    override = json.dumps({"schema_version": 1, "manage_native_settings": False})
+    world.upstream_commits({upstream_intake.MANIFEST_OVERRIDE: override + "\n"})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    assert "fork-owned-untouched" in {f["invariant"] for f in payload["findings"]}
+    assert world.intake_branches() == []
+
+
+def test_seal_refuses_a_manifest_override_written_by_the_resolver(
+    world: World, tmp_path: Path
+) -> None:
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    write(directory, upstream_intake.MANIFEST_OVERRIDE, '{"schema_version": 1}\n')
+
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "invariants-failed")
+    assert "fork-owned-untouched" in {f["invariant"] for f in payload["findings"]}
+
+
+# --- seal believes nothing the directory says about itself ---
+
+
+def test_seal_reports_every_path_edited_outside_the_conflicts(
+    world: World, tmp_path: Path
+) -> None:
+    """Edits beside the conflicts are allowed (an invariant fix needs them),
+    and each one is named, with the ones a later session would run."""
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    write(directory, "docs/keep.md", "rewritten by the resolver\n")
+    write(directory, "scripts/added.sh", "#!/bin/sh\necho added\n")
+
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (code, payload["result"]) == (EXIT_OK, "merged")
+    assert payload["edited_by_hand"] == [GUIDE, "docs/keep.md", "scripts/added.sh"]
+    assert payload["sensitive_changes"] == ["scripts/added.sh"]
+    message = git(world.fork, "show", "-s", "--format=%B", payload["commit"])
+    assert "Paths that differ from the automatic merge: 3" in message
+
+
+def test_rewritten_record_cannot_hide_a_hand_edit_or_a_conflict(
+    world: World, tmp_path: Path
+) -> None:
+    """The record in the directory is the resolver's to rewrite. It says the
+    finished tree is the automatic one and that nothing conflicted; `seal`
+    builds the automatic merge again and is not told otherwise."""
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    write(directory, "scripts/added.sh", "#!/bin/sh\necho added\n")
+    git(directory, "add", "--all")
+    record = directory / ".git" / upstream_intake.RECORD_FILE
+    state = json.loads(record.read_text(encoding="utf-8"))
+    state.update({"auto_tree": git(directory, "write-tree"), "conflicts": []})
+    record.write_text(json.dumps(state), encoding="utf-8")
+
+    unanswered, refused, _ = world.seal(directory, {})
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (unanswered, refused["result"]) == (EXIT_NEEDS_OWNER, "unresolved")
+    assert refused["unanswered"] == [GUIDE]
+    assert (code, payload["result"]) == (EXIT_OK, "merged")
+    assert payload["edited_by_hand"] == [GUIDE, "scripts/added.sh"]
+    assert payload["sensitive_changes"] == ["scripts/added.sh"]
+
+
+@pytest.mark.parametrize(
+    "left",
+    ["<<<<<<< fork-main", "||||||| merge-base", "=======", ">>>>>>> upstream-main"],
+)
+def test_one_marker_line_left_behind_is_enough_to_refuse(
+    world: World, tmp_path: Path, left: str
+) -> None:
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, f"# Guide\n\nline one\n{left}\nline three\n")
+
+    code, payload, _ = world.seal(directory, {GUIDE: "kept both"})
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "unresolved")
+    assert payload["unanswered"] == [GUIDE]
+
+
+def test_marker_like_text_in_a_file_that_did_not_conflict_is_not_judged(
+    world: World, tmp_path: Path
+) -> None:
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    write(directory, "docs/keep.md", "Heading\n=======\n\nkept\n")
+
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (code, payload["result"]) == (EXIT_OK, "merged")
+
+
+def test_seal_names_the_ignored_files_it_leaves_out(
+    world: World, tmp_path: Path
+) -> None:
+    directory, _ = conflicted(world, tmp_path)
+    write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+    write(directory, "__pycache__/resolution.md", "written to an ignored path\n")
+
+    code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert (code, payload["result"]) == (EXIT_OK, "merged")
+    assert payload["ignored_files_left_out"] == ["__pycache__/resolution.md"]
+    assert "__pycache__/resolution.md" not in world.paths(payload["commit"])
+
+
+def test_seal_refuses_a_directory_intake_did_not_prepare(
+    world: World, tmp_path: Path
+) -> None:
+    world.upstream_commits({"docs/new.md": "new\n"})
+    stranger = tmp_path / "stranger"
+    git(tmp_path, "init", "--quiet", str(stranger))
+
+    code, payload, _ = world.seal(stranger, {})
+
+    assert (code, payload["result"]) == (EXIT_USAGE, "refused")
+    assert world.intake_branches() == []
+
+
+# --- outcomes that had no test ---
+
+
+def test_existing_branch_at_another_commit_is_left_as_it_is(world: World) -> None:
+    upstream = world.upstream_commits({"docs/new.md": "new\n"})
+    branch = f"bot/upstream-{upstream[:12]}"
+    git(world.fork, "branch", branch, world.fork_rev)
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "branch-exists")
+    assert git(world.fork, "rev-parse", branch) == world.fork_rev
+    assert payload["branch"] == branch
+    assert payload["upstream"] == upstream
+    assert payload["base"] == git(world.fork, "merge-base", world.fork_rev, upstream)
+    assert payload["upstream_commits"] == 1
+
+
+def test_unrelated_history_has_no_merge_base(world: World) -> None:
+    git(world.upstream, "checkout", "--quiet", "--orphan", "rewritten")
+    world.upstream_commits({"docs/new.md": "new\n"})
+    git(world.fork, "fetch", "--quiet", str(world.upstream), "rewritten")
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "no-single-merge-base")
+    assert payload["detail"].startswith("0 merge bases")
+    assert world.intake_branches() == []
+
+
+def test_criss_cross_history_has_two_merge_bases(world: World) -> None:
+    """Each side merged the other's earlier commit. No single base exists,
+    and none is invented."""
+    theirs = world.upstream_commits({"docs/theirs.md": "theirs\n"})
+    ours = world.fork_commits({"docs/ours.md": "ours\n"})
+    git(world.fork, "merge", "--quiet", "--no-ff", "--no-edit", theirs)
+    git(world.upstream, "fetch", "--quiet", str(world.fork), ours)
+    git(world.upstream, "merge", "--quiet", "--no-ff", "--no-edit", ours)
+    git(world.fork, "fetch", "--quiet", str(world.upstream), "main")
+    bases = git(world.fork, "merge-base", "--all", world.fork_rev, world.upstream_rev)
+    assert sorted(bases.split()) == sorted([ours, theirs])
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "no-single-merge-base")
+    assert payload["detail"].startswith("2 merge bases")
+    assert world.intake_branches() == []
+
+
+def test_tree_with_both_seed_layouts_is_not_transformed(world: World) -> None:
+    world.upstream_commits({SEED_STATE: "# Agent State\n\nupstream's own scaffold\n"})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "transform-refused")
+    assert "a layout the fork has no rule for" in payload["detail"]
+    assert world.intake_branches() == []
+
+
+def test_file_the_codemod_refuses_stops_the_transformation(world: World) -> None:
+    """A file that is not text could hide an old role name from the rename;
+    the codemod refuses the tree, and nothing is merged on a guess."""
+    (world.upstream / "docs" / "blob.bin").write_bytes(b"\x00\x01binary")
+    world.upstream_commits({})
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "transform-refused")
+    assert "docs/blob.bin" in payload["detail"]
+    assert world.intake_branches() == []
+
+
+def test_checker_that_fails_is_a_failure_not_a_finding(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 2 is the lint's finding; exit 1 is the lint not working. The
+    second must not be reported as something for the owner to decide."""
+    real = fork_invariants.run_tool
+
+    def broken_lint(
+        target: fork_invariants.Target, rel: str, *args: str
+    ) -> common.CommandResult:
+        result = real(target, rel, *args)
+        if rel != fork_invariants.LINT_TOOL:
+            return result
+        return common.CommandResult(result.argv, 1, "", "error: the lint broke\n")
+
+    monkeypatch.setattr(fork_invariants, "run_tool", broken_lint)
+    world.upstream_commits({"docs/new.md": "new\n"})
+
+    checked, check_payload, _ = world.run("check")
+    code, payload, _ = world.intake()
+
+    assert (checked, check_payload["result"]) == (EXIT_FAILED, "tool-failed")
+    assert (code, payload["result"]) == (EXIT_FAILED, "tool-failed")
+    assert world.intake_branches() == []
+
+
+def test_git_failure_while_publishing_is_exit_three(world: World) -> None:
+    """A ref below the branch's name makes git refuse to create the branch."""
+    upstream = world.upstream_commits({"docs/new.md": "new\n"})
+    blocker = f"refs/heads/bot/upstream-{upstream[:12]}/in-the-way"
+    git(world.fork, "update-ref", blocker, world.fork_rev)
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_FAILED, "git-failed")
+    assert world.intake_branches() == [blocker.removeprefix("refs/heads/")]
+
+
+def test_branch_that_is_not_the_merge_is_not_kept(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit is read back from the repository that will be pushed from.
+    Here what arrives there is the fork's own commit, not the merge."""
+    world.upstream_commits({"docs/new.md": "new\n"})
+    fork = world.fork_rev
+    real = scratch_repo.Scratch.branch
+
+    def wrong_commit(self: scratch_repo.Scratch, name: str, commit: str) -> None:
+        real(self, name, fork if name == upstream_intake.SEALED else commit)
+
+    monkeypatch.setattr(scratch_repo.Scratch, "branch", wrong_commit)
+
+    code, payload, _ = world.intake()
+
+    assert (code, payload["result"]) == (EXIT_FAILED, "git-failed")
+    assert world.intake_branches() == []
+
+
+def test_existing_resolve_directory_is_refused_and_left_alone(
+    world: World, tmp_path: Path
+) -> None:
+    world.upstream_commits({"docs/new.md": "new\n"})
+    directory = tmp_path / "resolve"
+    write(directory, "mine.txt", "not the helper's to remove\n")
+
+    code, payload, _ = world.intake("--resolve-in", directory)
+
+    assert (code, payload["result"]) == (EXIT_USAGE, "refused")
+    assert (directory / "mine.txt").read_text(encoding="utf-8").startswith("not the")
+    assert world.intake_branches() == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "result"),
+    [
+        ({"docs/new.md": "new\n"}, "merged"),
+        ({SEED_STATE: "both layouts\n"}, "transform-refused"),
+    ],
+)
+def test_resolve_directory_is_removed_when_nothing_is_left_to_resolve(
+    world: World, tmp_path: Path, changes: dict[str, str], result: str
+) -> None:
+    world.upstream_commits(changes)
+    directory = tmp_path / "resolve"
+
+    _, payload, _ = world.intake("--resolve-in", directory)
+
+    assert payload["result"] == result
+    assert not directory.exists()
+
+
+def test_check_of_a_revision_takes_only_a_full_sha(world: World) -> None:
+    for name in ("main", "HEAD", world.fork_rev[:12]):
+        code, payload, _ = world.run("check", "--rev", name)
+        assert (code, payload["result"]) == (EXIT_USAGE, "refused"), name
+
+
+def test_merge_tree_exit_code_and_conflict_list_must_agree(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 1 with no conflict named, or exit 0 with one, is git saying two
+    things: neither is taken as a clean merge."""
+    project = scratch_repo.Repo(world.fork, scratch_repo.child_env())
+    scratch = scratch_repo.Scratch.create(tmp_path / "scratch", project)
+    tree = git(world.fork, "rev-parse", "HEAD^{tree}")
+    real = scratch_repo.Repo.run
+
+    def says_conflict(self: scratch_repo.Repo, *args: str, **kwargs: Any) -> Any:
+        if args[0] != "merge-tree":
+            return real(self, *args, **kwargs)
+        return common.CommandResult(("git",), 1, f"{tree}\0", "")
+
+    monkeypatch.setattr(scratch_repo.Repo, "run", says_conflict)
+
+    with pytest.raises(scratch_repo.Stop) as stopped:
+        upstream_intake.merge(scratch, world.fork_rev, world.fork_rev)
+
+    assert (stopped.value.result, stopped.value.exit_code) == (
+        "git-failed",
+        EXIT_FAILED,
+    )
+
+
+# --- nothing of the fork's repository is used or changed but one ref ---
+
+HOOKS = (
+    "post-checkout",
+    "post-commit",
+    "post-index-change",
+    "post-merge",
+    "pre-commit",
+    "reference-transaction",
+)
+ISOLATION_CASES = {
+    "merged": {"docs/new.md": "new\n"},
+    "conflicts": {GUIDE: UPSTREAM_FILES[GUIDE].replace("line two", "upstream's line")},
+    "invariants-failed": {"docs/models.md": f"runs on {MODEL_WORD}\n"},
+    "unsupported-entry": {".gitattributes": "* -text\n"},
+    "sealed": {GUIDE: UPSTREAM_FILES[GUIDE].replace("line two", "upstream's line")},
+}
+
+
+def plant_hooks(git_dir: Path, marker: Path) -> None:
+    for name in HOOKS:
+        hook = git_dir / "hooks" / name
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_text(f"#!/bin/sh\necho {name} >> '{marker}'\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+
+def snapshot(directory: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("case", sorted(ISOLATION_CASES))
+def test_helper_ignores_inherited_git_variables_hooks_and_leaves_config_alone(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Whatever the outcome: git variables aimed at another repository are
+    not followed, no hook of the fork's repository runs, and its
+    configuration, index and work tree are byte for byte what they were."""
+    world.upstream_commits(ISOLATION_CASES[case])
+    revisions = world.revisions()
+    directory = tmp_path / "resolve"
+    decoy = tmp_path / "decoy"
+    git(tmp_path, "init", "--quiet", str(decoy))
+    marker = tmp_path / "a-hook-ran"
+    config = (world.fork / ".git" / "config").read_bytes()
+    index = (world.fork / ".git" / "index").read_bytes()
+    refs = git(world.fork, "for-each-ref")
+    plant_hooks(world.fork / ".git", marker)
+    plant_hooks(decoy / ".git", marker)
+    decoy_before = snapshot(decoy)
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "decoy-index"))
+
+    code, payload, _ = world.run("intake", *revisions, "--resolve-in", directory)
+    if case == "sealed":
+        write(directory, GUIDE, UPSTREAM_FILES[GUIDE])
+        plant_hooks(directory / ".git", marker)
+        code, payload, _ = world.seal(directory, {GUIDE: "took upstream's"})
+
+    assert payload["result"] == ("merged" if case == "sealed" else case), payload
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
+    assert snapshot(decoy) == decoy_before
+    assert (world.fork / ".git" / "config").read_bytes() == config
+    assert (world.fork / ".git" / "index").read_bytes() == index
+    shutil.rmtree(world.fork / ".git" / "hooks")
+    assert git(world.fork, "status", "--porcelain") == ""
+    added = set(git(world.fork, "for-each-ref").split("\n")) - set(refs.split("\n"))
+    expected = 1 if code == EXIT_OK else 0
+    assert len(added) == expected, added
+
+
+# What the scratch repository's own configuration must say, written out: a
+# test that read the list from the code would pass with an entry removed.
+SCRATCH_CONFIG = {
+    "core.hooksPath": "/dev/null",
+    "core.fsmonitor": "false",
+    "core.autocrlf": "false",
+    "core.attributesFile": "/dev/null",
+    "core.excludesFile": "/dev/null",
+    "submodule.recurse": "false",
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    "protocol.allow": "never",
+}
+
+
+def test_scratch_repository_carries_its_own_configuration(
+    world: World, tmp_path: Path
+) -> None:
+    """The fork's tools start git themselves in the scratch tree. What holds
+    that git to the rules is the scratch repository's own configuration."""
+    directory, _ = conflicted(world, tmp_path)
+
+    assert dict(scratch_repo.SCRATCH_CONFIG) == SCRATCH_CONFIG
+    for key, value in SCRATCH_CONFIG.items():
+        assert git(directory, "config", "--local", "--get", key) == value, key
+    attributes = (directory / ".git" / "info" / "attributes").read_text("utf-8")
+    assert attributes == scratch_repo.SCRATCH_ATTRIBUTES
+    assert "!merge" in attributes.split() and "-filter" in attributes.split()
+    assert not (directory / ".git" / "hooks").exists()
+
+
+def test_tool_that_starts_its_own_process_in_the_scratch_tree_runs_no_hook(
+    world: World, tmp_path: Path
+) -> None:
+    """A tool's own call carries none of the helper's options. A hook that
+    somehow sat in the scratch repository still must not run."""
+    project = scratch_repo.Repo(world.fork, scratch_repo.child_env())
+    scratch = scratch_repo.Scratch.create(tmp_path / "scratch", project)
+    scratch.load(world.fork_rev)
+    marker = tmp_path / "a-hook-ran"
+    plant_hooks(scratch.repo.path / ".git", marker)
+    write(scratch.repo.path, GUIDE, "changed by a tool\n")
+
+    done = subprocess.run(
+        ["git", "-C", str(scratch.repo.path), "add", "--update"],
+        capture_output=True,
+        text=True,
+        env=scratch.repo.env,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not marker.exists()
+
+
+# --- the job marker ---
+
+
+def test_job_marker_is_defined_once_and_the_status_comment_uses_it() -> None:
+    assert common.JOB_MARKER_PREFIX == "<!-- job:"
+    assert report.MARKER == "<!-- job:local-maint -->"
+    assert common.job_marker("issue-worker", "body-sha256:ab") == (
+        "<!-- job:issue-worker body-sha256:ab -->"
+    )
+
+
+def test_issue_opened_by_the_local_job_starts_with_the_job_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The issue worker refuses a body that starts with the marker. An issue
+    a job opens under the owner's name quotes text the owner did not write."""
+    sent: list[tuple[str, ...]] = []
+
+    def record(self: gh.GitHub, *args: str) -> common.CommandResult:
+        sent.append(args)
+        return common.CommandResult(("gh",), 0, "", "")
+
+    monkeypatch.setattr(gh.GitHub, "_repo", record)
+
+    gh.GitHub({}, common.Log(None)).create_issue("Title", "Body text", "a-label")
+
+    body = sent[0][sent[0].index("--body") + 1]
+    assert body == "<!-- job:local-maint -->\nBody text"
+    assert body.startswith(common.JOB_MARKER_PREFIX)
+
+
+def test_seal_lives_in_its_own_module_and_is_reached_from_the_command_line() -> None:
+    assert fork_invariants.COMMANDS["seal"] is fork_invariants._cmd_seal
+    assert callable(intake_seal.cmd_seal)

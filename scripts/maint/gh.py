@@ -169,7 +169,10 @@ class GitHub:
         return self._repo("label", "create", name, *look).ok
 
     def create_issue(self, title: str, body: str, label: str) -> CommandResult:
-        text = ("--title", title, "--body", body)
+        # Marked as a job's words: the issue is created under the owner's
+        # account and quotes text the owner did not write.
+        marked = f"{common.job_marker(common.LOCAL_JOB)}\n{body}"
+        text = ("--title", title, "--body", marked)
         return self._repo("issue", "create", *text, "--label", label)
 
     def comments(self, issue: int) -> list[dict[str, Any]] | None:
