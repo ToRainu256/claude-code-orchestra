@@ -30,6 +30,12 @@ main() {
     local fetch_pause_sec="${ORCHESTRA_MAINT_FETCH_PAUSE_SEC:-20}"
     local git_deadline_sec="${ORCHESTRA_MAINT_GIT_DEADLINE_SEC:-120}"
     local sha_pattern='^[0-9a-f]{40}$'
+    # What git printed is kept in one file of the job's own, under a fixed
+    # name; at most capture_max bytes of it are read back, and at most
+    # lock_candidates_max lock names in it are looked at.
+    local capture="${base}/run/launcher-git.out"
+    local capture_max=65536
+    local lock_candidates_max=32
     umask 077
     export PYTHONDONTWRITEBYTECODE=1
     unset ORCHESTRA_MAINT_CHECKOUT_FAILED
@@ -96,6 +102,74 @@ main() {
             g -C "${clone}" clean --quiet -fdx
     }
 
+    # Text from git, made safe to show: every byte that is not printable
+    # ASCII becomes `?`.
+    sanitize() {
+        LC_ALL=C tr -c '[:print:]\n' '?'
+    }
+
+    # Whether $1 is a lock of the job's own: a regular file, not a link,
+    # inside this clone's .git directory, so the command shown to the owner
+    # can only ever remove such a lock.
+    own_lock() {
+        case "$1" in
+            "" | */../* | */./*) return 1 ;;
+            "${clone}/.git/"*.lock | "${top}/.git/"*.lock) ;;
+            *) return 1 ;;
+        esac
+        [[ -f "$1" && ! -L "$1" ]]
+    }
+
+    # Run a command with its output going to a file, never to a pipe: a
+    # helper git starts (git-remote-https) inherits that output and outlives
+    # git when the deadline ends it, and a pipe it holds open would never
+    # reach end of file. Sets `said` to at most capture_max bytes of what the
+    # command printed, shows that safely, and returns the command's status.
+    run_captured() {
+        local status=0
+        rm -f "${capture}"
+        "$@" > "${capture}" 2>&1 || status=$?
+        said="$(head -c "${capture_max}" "${capture}" 2> /dev/null || true)"
+        rm -f "${capture}"
+        if [[ -n "${said}" ]]; then
+            printf '%s\n' "${said}" | sanitize >&2
+        fi
+        return "${status}"
+    }
+
+    # The lock a killed git process left in the clone, when that is why git
+    # failed: the first of the first lock_candidates_max locks git's own
+    # words name that is one of the job's own, else the index lock. Prints
+    # its path; fails when there is none.
+    stale_lock() {
+        local rest="$1" named seen=0
+        local pattern="Unable to create '([^']*[.]lock)'"
+        while [[ "${seen}" -lt "${lock_candidates_max}" && "${rest}" =~ ${pattern} ]]; do
+            seen=$((seen + 1))
+            named="${BASH_REMATCH[1]}"
+            if own_lock "${named}"; then
+                printf '%s\n' "${named}"
+                return 0
+            fi
+            rest="${rest#*"${BASH_REMATCH[0]}"}"
+        done
+        if own_lock "${clone}/.git/index.lock"; then
+            printf '%s\n' "${clone}/.git/index.lock"
+            return 0
+        fi
+        return 1
+    }
+
+    # Say that a lock a killed run left in the clone stopped $1, and give the
+    # command that removes it. It is never removed here: it may belong to a
+    # git command that is still running.
+    note_lock() {
+        local shown
+        shown="$(printf '%q' "$2" | sanitize)"
+        note_failure "$1: a previous run was killed and left the lock ${shown} in the maintenance clone; nothing was run" \
+            "rm ${shown}  (only while no git command is running in ${clone}), then: bash scripts/maint/launchd.sh run-now"
+    }
+
     # The checkout and clean below are destructive, so they only ever run in
     # the clone this automation owns: a real directory at this exact path (a
     # link could lead to another checkout of the same repository), holding
@@ -146,19 +220,30 @@ main() {
         refuse "no approved revision; run launchd.sh install"
     fi
 
+    # Git's words are written under run/ before anything else looks at the
+    # layout, so a run directory that is a link elsewhere is refused here.
+    [[ ! -L "${base}/run" ]] || refuse "${base}/run is a link; it must be a real directory"
+
     # Nothing is created before this point: a launcher that is not installed
     # properly leaves no trace.
     mkdir -p "${base}/logs/maint" "${base}/run"
 
     # The network may lag a wake from sleep, so the fetch gets three attempts.
     # Exactly one ref is fetched, by its full name, and never a tag.
-    local try
+    # git's own words are kept for the lock check, and still shown.
+    local try said="" fetch_status lock
     for ((try = 1; try <= fetch_tries; try++)); do
-        if g -C "${clone}" fetch --quiet --no-tags --prune \
-            origin "+refs/heads/main:${main_ref}"; then
+        fetch_status=0
+        run_captured g -C "${clone}" fetch --quiet --no-tags --prune \
+            origin "+refs/heads/main:${main_ref}" || fetch_status=$?
+        if [[ "${fetch_status}" -eq 0 ]]; then
             break
         fi
         if [[ "${try}" -eq "${fetch_tries}" ]]; then
+            if lock="$(stale_lock "${said}")"; then
+                note_lock "cannot fetch the fork" "${lock}"
+                exit 3
+            fi
             note_failure "cannot fetch the fork" \
                 "check the network, then: bash scripts/maint/launchd.sh run-now"
             exit 3
@@ -171,11 +256,19 @@ main() {
     # apply its own, older promotion rule and open pull requests by it. Only
     # `promote` and `status` may then use the last revision that did check
     # out, so the owner can see what waits and approve a fix.
-    if put_tree "${rev}"; then
+    local checkout_status=0
+    run_captured put_tree "${rev}" || checkout_status=$?
+    if [[ "${checkout_status}" -eq 0 ]]; then
         printf '%s\n' "${rev}" > "${last_good}.tmp.$$"
         mv -f "${last_good}.tmp.$$" "${last_good}"
         rm -f "${failure}"
     else
+        # A lock left by a killed run blocks every checkout, the fallback's
+        # too, and merging a fix cannot clear it.
+        if lock="$(stale_lock "${said}")"; then
+            note_lock "cannot check out the approved revision ${rev}" "${lock}"
+            exit 3
+        fi
         case "${1:-}" in
             promote | status) ;;
             *)
