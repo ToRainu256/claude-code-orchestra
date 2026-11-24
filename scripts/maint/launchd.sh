@@ -5,6 +5,8 @@
 #   install    clone, record the approved revision, copy the launcher, load the agent
 #   status     loaded? last run, approved vs main, tool and login probes, launcher drift
 #   promote    show approved..main, ask, advance the approved revision
+#   adopt DIR  show what an update would change in one project, ask, update it,
+#              and let scheduled runs keep it updated
 #   run-now    start one run now through launchd
 #   uninstall  unload the agent, remove the plist and the launcher; keep the rest
 #
@@ -14,7 +16,8 @@
 # token: the job uses the logins `gh` and `codex` already have (those two
 # programs keep their own state where they always do).
 #
-# `install` and `promote` are answered at a terminal; a piped answer is refused.
+# `install`, `promote` and `adopt` are answered at a terminal; a piped answer is
+# refused.
 # Text that comes from the fork (commit subjects, path names) is shown with
 # every non-printable byte replaced, so it cannot redraw the screen.
 #
@@ -159,6 +162,7 @@ Created by runs:
   ${BASE}/state/last-run.json      summary that status prints
   ${BASE}/state/last-good-rev      last revision that checked out
   ${BASE}/state/bump-records.json  bumps this Mac tested
+  ${BASE}/state/distribution.json  projects adopted for updates, and what the last run found
   ${BASE}/state/launcher-failure   present only while the launcher is failing
   ${BASE}/run/                     lock and scratch worktrees
 EOF
@@ -481,6 +485,18 @@ cmd_promote() {
     ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" exec /bin/bash "${LAUNCHER}" promote
 }
 
+cmd_adopt() {
+    require_terminal adopt
+    [[ -f "${LAUNCHER}" && ! -L "${LAUNCHER}" ]] || die "not installed; run launchd.sh install"
+    # The job changes its working directory, so the project is named by its
+    # real path. Through the launcher, like promote: the approved revision's
+    # code shows the change and asks.
+    local target
+    target="$(CDPATH='' cd -- "$1" 2> /dev/null && pwd -P)" ||
+        die "adopt: not a directory: $(printf '%s' "$1" | sanitize)"
+    ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" exec /bin/bash "${LAUNCHER}" adopt "${target}"
+}
+
 cmd_run_now() {
     require_macos_tools
     is_loaded || die "${LABEL} is not loaded; run launchd.sh install"
@@ -489,16 +505,21 @@ cmd_run_now() {
 }
 
 usage() {
-    echo "usage: bash scripts/maint/launchd.sh print|install|status|promote|run-now|uninstall" >&2
+    echo "usage: bash scripts/maint/launchd.sh print|install|status|promote|adopt DIR|run-now|uninstall" >&2
     exit 1
 }
 
-[[ $# -eq 1 ]] || usage
+# `adopt` names one project; every other subcommand stands alone.
+case "${1:-}" in
+    adopt) [[ $# -eq 2 ]] || usage ;;
+    *) [[ $# -eq 1 ]] || usage ;;
+esac
 case "$1" in
     print) cmd_print ;;
     install) cmd_install ;;
     status) cmd_status ;;
     promote) cmd_promote ;;
+    adopt) cmd_adopt "$2" ;;
     run-now) cmd_run_now ;;
     uninstall) cmd_uninstall ;;
     *) usage ;;

@@ -1502,6 +1502,8 @@ def readme_outcomes() -> dict[str, dict[str, tuple[int, ...]]]:
 def test_readme_outcome_tables_match_what_the_code_can_report() -> None:
     declared = {
         "promote": promote.OUTCOMES,
+        "distribute": support.distribute.OUTCOMES,
+        "distribute, per project": support.distribute.TARGET_STATES,
         "model-watch": model_watch.OUTCOMES,
         "report": report.OUTCOMES,
         "any step, and the launcher": maint_run.OUTCOMES,

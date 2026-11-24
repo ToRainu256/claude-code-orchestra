@@ -8,13 +8,14 @@ developer's checkout by mistake.
 
 ``run`` promotes first, then executes every entry of ``STEPS`` in order, then
 reports. Each step returns its own result and one failing does not stop the
-others; the process exits with the highest step code. A later step is added
-by appending one entry to ``STEPS``: the lock, the log, the summary file and
-the status comment already treat steps as a list.
+others; the process exits with the highest step code. A step is added by
+adding one entry to ``STEPS``: the lock, the log, the summary file and the
+status comment already treat steps as a list.
 
 Usage:
     python3 run.py run                 # the scheduled run
     python3 run.py promote             # the owner's typed confirmation
+    python3 run.py adopt PROJECT       # the owner lets the job maintain a project
     python3 run.py status              # last run and approved-vs-main; reads only
     python3 run.py --state-root DIR …  # default: $ORCHESTRA_MAINT_HOME, else
                                        # ~/.claude/orchestra
@@ -36,15 +37,23 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import adopt
 import common
+import distribute
+import ledger
 import model_watch
 import promote
 import report
 
 Step = Callable[[common.Context], common.StepResult]
 # Executed in this order, after promotion and before the report, so each sees
-# the revision the Mac is now allowed to act on.
-STEPS: tuple[tuple[str, Step], ...] = ((model_watch.STEP, model_watch.run),)
+# the revision the Mac is now allowed to act on. Distribution comes first: it
+# needs nothing but the approved revision, and it must not wait for a model
+# catalog or a live call.
+STEPS: tuple[tuple[str, Step], ...] = (
+    (distribute.STEP, distribute.run),
+    (model_watch.STEP, model_watch.run),
+)
 LAUNCHER_STEP = "launcher"
 # Outcomes this dispatcher reports for a step that did not report its own,
 # and for the launcher when it had to fall back. Pinned to the README table.
@@ -213,27 +222,49 @@ def cmd_run(paths: common.Paths, after_promotion: str | None) -> int:
     return exit_code
 
 
-def cmd_promote(paths: common.Paths) -> int:
+def ask(prompt: str) -> str:
+    """Read one typed answer. A closed terminal is an answer too: not
+    confirmed."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def attended_context(paths: common.Paths, command: str) -> common.Context | None:
+    """The context for a command the owner answers at a terminal, with the run
+    lock held; None, after saying why, when it cannot be given."""
     if not sys.stdin.isatty():
-        print("promote: needs a terminal; a promotion is typed, never piped")
-        return common.EXIT_USAGE
-    lock = common.acquire_lock(paths)
-    if lock is None:
-        print("promote: a run holds the lock; try again when it has finished")
-        return common.EXIT_USAGE
+        print(f"{command}: needs a terminal; its confirmation is typed, never piped")
+        return None
+    # The lock is held until this process ends: its descriptor is never closed.
+    if common.acquire_lock(paths) is None:
+        print(f"{command}: a run holds the lock; try again when it has finished")
+        return None
     now = time.time()
-    ctx = common.make_context(
+    return common.make_context(
         paths, tools_root(), common.open_run_log(paths, now), now=now
     )
 
-    def ask(prompt: str) -> str:
-        """A closed terminal is an answer too: not confirmed."""
-        try:
-            return input(prompt)
-        except EOFError:
-            return ""
 
+def cmd_promote(paths: common.Paths) -> int:
+    ctx = attended_context(paths, "promote")
+    if ctx is None:
+        return common.EXIT_USAGE
     return promote.manual_promote(ctx, ask, print)
+
+
+def cmd_adopt(paths: common.Paths, target: str) -> int:
+    if launcher_result():
+        # Same rule as a run: nothing is distributed from a fallback revision.
+        # The launcher already stops before this; the check is for a start
+        # that reaches this file some other way.
+        print("adopt: the approved revision could not be checked out; nothing done")
+        return common.EXIT_FAILED
+    ctx = attended_context(paths, "adopt")
+    if ctx is None:
+        return common.EXIT_USAGE
+    return adopt.run(ctx, target, ask, print)
 
 
 def cmd_status(paths: common.Paths) -> int:
@@ -278,6 +309,8 @@ def cmd_status(paths: common.Paths) -> int:
             f"(exit {step.get('exit_code')}) {step.get('detail') or ''}"
         )
         print(common.one_line(line))
+    for line in ledger.status_lines(paths):
+        print(common.one_line(line))
     return common.EXIT_OK
 
 
@@ -307,6 +340,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set by this script when it restarts after a promotion",
     )
     commands.add_parser("promote", help="Show the waiting range and ask to approve it")
+    adopt_parser = commands.add_parser(
+        "adopt", help="Show what an update would change in a project and ask"
+    )
+    adopt_parser.add_argument("target", metavar="PROJECT", help="Its absolute path")
     commands.add_parser("status", help="Print the last run and the approved revision")
     return parser
 
@@ -324,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(paths, args.after_promotion)
         if args.command == "promote":
             return cmd_promote(paths)
+        if args.command == "adopt":
+            return cmd_adopt(paths, args.target)
         return cmd_status(paths)
     except common.Refused as exc:
         print(f"refused: {common.safe_text(str(exc))}", file=sys.stderr)

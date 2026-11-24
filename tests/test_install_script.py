@@ -1913,3 +1913,164 @@ def test_update_refuses_a_scaffold_path_that_is_not_a_directory(
     ) in result.stderr
     for destination in SEEDED_PROJECT_FILES:
         assert not (target / destination).exists()
+
+
+# --------------------------------------------------------------------------
+# The updater never writes through what a project holds
+# --------------------------------------------------------------------------
+
+OUTSIDE_TEXT = "the owner's own file, outside the project\n"
+LEGACY_ZONES = (
+    "# ━━━━━\n# @orchestra:template-boundary\n# ━━━━━\nidentity\n"
+    "# ━━━━━\n# @orchestra:repo-boundary\n# ━━━━━\nworking notes\n"
+)
+
+
+def outside_file(tmp_path: Path) -> Path:
+    """A file outside the project that no update may change."""
+    victim = tmp_path / "outside" / "victim.txt"
+    (victim.parent / "a-directory").mkdir(parents=True)
+    victim.write_text(OUTSIDE_TEXT, encoding="utf-8")
+    return victim
+
+
+def listing(root: Path) -> list[str]:
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+
+@pytest.mark.parametrize(
+    "shape", ["directory-holding-a-link", "link-to-a-file", "link-to-nowhere"]
+)
+def test_update_never_writes_a_seed_through_what_is_at_its_path(
+    tmp_path: Path, shape: str
+) -> None:
+    """Anything at a seed's path counts as present. A directory there used to
+    be copied into, through a link inside it; a link to nowhere used to be
+    written through, creating the file it named."""
+    template, target = install_from_template(tmp_path)
+    victim = outside_file(tmp_path)
+    seed = target / ".claude/STATE.md"
+    seed.unlink()
+    if shape == "directory-holding-a-link":
+        seed.mkdir()
+        (seed / "STATE.md").symlink_to(victim)
+    elif shape == "link-to-a-file":
+        seed.symlink_to(victim)
+    else:
+        seed.symlink_to(victim.with_name("created-by-the-update.txt"))
+    outside = listing(victim.parent)
+
+    result = run_update(target, template)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert victim.read_text(encoding="utf-8") == OUTSIDE_TEXT
+    assert listing(victim.parent) == outside
+    assert seed.is_symlink() or seed.is_dir()
+
+
+def test_update_never_appends_legacy_state_through_a_link(tmp_path: Path) -> None:
+    template, target = install_from_template(tmp_path)
+    victim = outside_file(tmp_path)
+    state = target / ".claude/STATE.md"
+    state.unlink()
+    state.symlink_to(victim)
+    (target / "CLAUDE.md").write_text(LEGACY_ZONES, encoding="utf-8")
+
+    result = run_update(target, template)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "was NOT migrated into it" in result.stdout
+    assert victim.read_text(encoding="utf-8") == OUTSIDE_TEXT
+
+
+@pytest.mark.parametrize("canonical", ["absent", "present"])
+def test_update_refuses_to_migrate_a_legacy_directory_that_holds_links(
+    tmp_path: Path, canonical: str
+) -> None:
+    """The legacy move carried links into `.claude/`, and the steps after it
+    wrote through them: a seed created a file outside, and a `.gitkeep`
+    landed in a directory outside."""
+    template, target = install_from_template(tmp_path)
+    victim = outside_file(tmp_path)
+    if canonical == "absent":
+        shutil.rmtree(target / ".claude/docs")
+    legacy = target / ".agents/docs"
+    legacy.mkdir(parents=True)
+    (legacy / "note.md").write_text("the project's own notes\n", encoding="utf-8")
+    (legacy / "DESIGN.md").symlink_to(victim.with_name("created-by-the-update.txt"))
+    (legacy / "libraries").symlink_to(victim.parent / "a-directory")
+    outside = listing(victim.parent)
+
+    result = run_update(target, template)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert ".agents/docs holds a link" in result.stderr
+    assert listing(victim.parent) == outside
+    assert victim.read_text(encoding="utf-8") == OUTSIDE_TEXT
+    # Left where it was, and the rest of the update still happened.
+    assert (legacy / "note.md").is_file() and (legacy / "DESIGN.md").is_symlink()
+    design = target / ".claude/docs/DESIGN.md"
+    keep = target / ".claude/docs/libraries/.gitkeep"
+    assert design.is_file() and not design.is_symlink()
+    assert keep.is_file() and not keep.parent.is_symlink()
+
+
+def test_update_never_writes_through_a_link_named_like_its_temporary_file(
+    tmp_path: Path,
+) -> None:
+    """Temporary files used to be named `<destination>.tmp.<process id>`, a
+    name anybody can prepare. `exec` keeps the process id, so the links
+    planted here carry the very number the updater then runs as."""
+    template, target = install_from_template(tmp_path)
+    victim = outside_file(tmp_path)
+    plant_then_update = (
+        "for rel in AGENTS.md .claude/docs/INDEX.md .claude/orchestra-version "
+        '.claude/settings.json; do ln -s "$1" "$rel.tmp.$$"; done; '
+        "exec bash scripts/update.sh --yes"
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", plant_then_update, "plant", str(victim)],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=target,
+        env={**os.environ, "ORCHESTRA_TEMPLATE_REPO": str(template)},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert victim.read_text(encoding="utf-8") == OUTSIDE_TEXT
+    assert not list(target.rglob(".orchestra-tmp.*"))
+
+
+def test_update_stops_at_a_directory_where_a_template_file_belongs(
+    tmp_path: Path,
+) -> None:
+    template, target = install_from_template(tmp_path)
+    contract = target / "AGENTS.md"
+    contract.unlink()
+    contract.mkdir()
+    (contract / "mine.md").write_text("the owner's\n", encoding="utf-8")
+
+    result = run_update(target, template)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Cannot write AGENTS.md: a directory is in the way." in result.stderr
+    assert listing(contract) == ["mine.md"]
+    assert not list(target.rglob(".orchestra-tmp.*"))
+
+
+def test_update_keeps_the_mode_of_the_files_it_replaces_with_the_template_s(
+    tmp_path: Path,
+) -> None:
+    """A file put in place by temporary file and rename takes the template
+    file's mode, not the private mode a temporary file is born with."""
+    template, target = install_from_template(tmp_path)
+
+    result = run_update(target, template)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rel in ("AGENTS.md", ".claude/orchestra-version", "scripts/check.sh"):
+        wanted = (template / ("VERSION" if "version" in rel else rel)).stat().st_mode
+        assert (target / rel).stat().st_mode & 0o777 == wanted & 0o777, rel
+    assert os.access(target / "scripts/update.sh", os.X_OK)

@@ -158,6 +158,10 @@ CURRENT_STAGING_DIR=""
 CURRENT_OLD_DIR=""
 CURRENT_LIVE_DIR=""
 SWAP_IN_PROGRESS=false
+# The temporary file replace_file is in the middle of, if any.
+CURRENT_TMP_FILE=""
+# Set when a legacy directory was left where it was because it holds a link.
+LEGACY_MIGRATION_REFUSED=false
 
 cleanup() {
     # Roll back a stage-and-swap that was interrupted mid-transition: the
@@ -179,11 +183,35 @@ cleanup() {
         rm -rf "${CURRENT_OLD_DIR}"
     fi
 
+    if [[ -n "${CURRENT_TMP_FILE}" ]]; then
+        rm -f -- "${CURRENT_TMP_FILE}"
+    fi
+
     if [[ -n "${TMPDIR_UPDATE}" && -d "${TMPDIR_UPDATE}" ]]; then
         rm -rf "${TMPDIR_UPDATE}"
     fi
 }
 trap cleanup EXIT INT TERM
+
+# Put a copy of SRC at DST without ever writing through what is there. The
+# copy is made under a name mktemp has just created in DST's own directory and
+# is then renamed over DST. A link at DST is replaced, not followed, and a link
+# planted under a temporary name cannot be met, because the name is not one
+# anybody could have guessed. The rename also gives DST a new inode, which is
+# what keeps a running update.sh readable while it replaces itself.
+replace_file() {
+    local src="$1" dst="$2"
+    if [[ -L "${dst}" ]]; then
+        rm -f -- "${dst}"
+    elif [[ -d "${dst}" ]]; then
+        error "Cannot write ${dst#"${PROJECT_ROOT}"/}: a directory is in the way."
+        return 1
+    fi
+    CURRENT_TMP_FILE="$(mktemp "$(dirname "${dst}")/.orchestra-tmp.XXXXXX")"
+    cp -p -- "${src}" "${CURRENT_TMP_FILE}"
+    mv -f -- "${CURRENT_TMP_FILE}" "${dst}"
+    CURRENT_TMP_FILE=""
+}
 
 # =============================================================================
 # Parse arguments
@@ -274,7 +302,9 @@ preflight_checks() {
 fetch_template() {
     header "Fetching Template"
 
-    TMPDIR_UPDATE="$(mktemp -d)"
+    # Named under TMPDIR: BSD mktemp with no template ignores that variable,
+    # and a caller that confines this script confines it by TMPDIR.
+    TMPDIR_UPDATE="$(mktemp -d "${TMPDIR:-/tmp}/orchestra-update.XXXXXX")"
     info "Cloning template to temporary directory..."
 
     local clone_args=(--depth 1)
@@ -418,6 +448,16 @@ migrate_legacy_native_data() {
             continue
         fi
 
+        # A link inside the legacy directory would be carried into .claude/,
+        # and whatever later writes there would write through it. Nothing is
+        # moved or merged from a directory that holds one, or into a link.
+        if [[ -L "${canonical}" || -n "$(find "${legacy}" -type l -print -quit)" ]]; then
+            error ".agents/${name} holds a link, or .claude/${name} is one: it was NOT migrated."
+            error "Remove the link, then run the update again."
+            LEGACY_MIGRATION_REFUSED=true
+            continue
+        fi
+
         if [[ ! -e "${canonical}" ]] ||
             [[ -d "${canonical}" && -z "$(find "${canonical}" -mindepth 1 -print -quit)" ]]; then
             rm -rf -- "${canonical}"
@@ -543,11 +583,7 @@ sync_safe_files() {
             && ! cmp -s "${src}" "${dst}"; then
             SELF_UPDATED=true
         fi
-        # Copy via temp + mv: an atomic rename gives the destination a new
-        # inode, so the running update.sh keeps reading its original file
-        # instead of a half-overwritten one (self-update safety).
-        cp -f "${src}" "${dst}.tmp.$$"
-        mv -f "${dst}.tmp.$$" "${dst}"
+        replace_file "${src}" "${dst}"
         info "Updated ${file}"
         UPDATED_FILES+=("${file}")
     done
@@ -650,7 +686,10 @@ _emit_boundary_block() {
 seed_project_file_if_missing() {
     local path="$1" seed_name="$2"
     local destination="${PROJECT_ROOT}/${path}"
-    [[ ! -f "${destination}" ]] || return 0
+    # Anything at the destination counts as present: a file, a directory, a
+    # link, a link that leads nowhere. Only a path that does not exist is
+    # seeded, so a seed is never copied into or through something else.
+    [[ ! -e "${destination}" && ! -L "${destination}" ]] || return 0
 
     local scaffold="${TEMPLATE_DIR}/scripts/scaffold"
     local seed="${scaffold}/${seed_name}"
@@ -661,7 +700,7 @@ seed_project_file_if_missing() {
         error "Template has no seed for ${path}: ${seed#"${TEMPLATE_DIR}"/} is missing."
         exit 1
     fi
-    cp -f "${seed}" "${destination}"
+    replace_file "${seed}" "${destination}"
     UPDATED_FILES+=("${path}")
 }
 
@@ -685,6 +724,13 @@ migrate_legacy_agent_state() {
         fi
     done
     [[ -n "${source}" ]] || return 0
+
+    # The legacy zones are appended to the state file in place, so it has to
+    # be a regular file of the project's own: never a link, never a directory.
+    if [[ ! -f "${state}" || -L "${state}" ]]; then
+        warn ".claude/STATE.md is not a regular file; legacy state from ${label} was NOT migrated into it."
+        return 0
+    fi
 
     local migration_marker="<!-- Migrated from legacy ${label} by scripts/update.sh. -->"
     if grep -Fqx "${migration_marker}" "${state}"; then
@@ -763,10 +809,12 @@ migrate_native_settings_paths() {
     # suffix argument on BSD/macOS and an optional one on GNU, so no single
     # spelling of it works on both. `cp -p` first so the replacement keeps the
     # original file mode, then the rename keeps the swap atomic.
-    cp -p "${settings}" "${settings}.tmp.$$"
+    CURRENT_TMP_FILE="$(mktemp "$(dirname "${settings}")/.orchestra-tmp.XXXXXX")"
+    cp -p "${settings}" "${CURRENT_TMP_FILE}"
     sed -e 's#\.agents/hooks/#.claude/hooks/#g' \
-        -e 's#\.agents/logs/#.claude/logs/#g' "${settings}" > "${settings}.tmp.$$"
-    mv -f "${settings}.tmp.$$" "${settings}"
+        -e 's#\.agents/logs/#.claude/logs/#g' "${settings}" > "${CURRENT_TMP_FILE}"
+    mv -f "${CURRENT_TMP_FILE}" "${settings}"
+    CURRENT_TMP_FILE=""
     UPDATED_FILES+=(".claude/settings.json (migrated hook and log paths)")
     info "Migrated legacy .agents paths in settings to .claude paths."
 }
@@ -895,8 +943,7 @@ update_version() {
     if [[ -f "${TEMPLATE_DIR}/VERSION" ]]; then
         local destination="${PROJECT_ROOT}/${LOCAL_VERSION_FILE}"
         mkdir -p "$(dirname "${destination}")"
-        cp -f "${TEMPLATE_DIR}/VERSION" "${destination}.tmp.$$"
-        mv -f "${destination}.tmp.$$" "${destination}"
+        replace_file "${TEMPLATE_DIR}/VERSION" "${destination}"
         info "${LOCAL_VERSION_FILE} updated to ${BOLD}${NEW_VERSION}${RESET}"
         UPDATED_FILES+=("${LOCAL_VERSION_FILE}")
     else
@@ -985,6 +1032,10 @@ main() {
     update_version
     print_summary
 
+    if [[ "${LEGACY_MIGRATION_REFUSED}" == true ]]; then
+        error "The template was updated, but a legacy directory under .agents/ was not migrated (see above)."
+        exit 1
+    fi
     if [[ "${MODEL_APPLY_FAILED}" == true ]]; then
         error "The template was updated, but the model manifest was not applied (see above)."
         exit 1

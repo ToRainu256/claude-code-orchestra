@@ -938,6 +938,7 @@ def test_run_end_to_end_opens_one_pull_request_and_a_rerun_opens_none(
     assert first.returncode == common.EXIT_OK, first.stderr
     assert step_results(installed) == {
         "promote": "up-to-date",
+        "distribute": "no-targets",
         "model-watch": "pr-opened",
         "report": "no-status-issue",
     }

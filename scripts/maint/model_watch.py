@@ -236,12 +236,7 @@ def _worktree(ctx: common.Context) -> Path:
 
 def _remove_worktree(ctx: common.Context) -> None:
     """Drop the scratch worktree and forget it. Safe when there is none."""
-    tree = common.require_scratch(ctx.paths, _worktree(ctx))
-    if tree.exists():
-        ctx.git.run(["worktree", "remove", "--force", str(tree)])
-    if tree.exists():
-        shutil.rmtree(str(tree))
-    ctx.git.run(["worktree", "prune"])
+    common.remove_scratch_worktree(ctx.git, _worktree(ctx))
 
 
 def _models_tool(
