@@ -1067,6 +1067,29 @@ def test_launcher_refuses_a_clone_path_that_is_a_link(installed: support.Fork) -
     assert not installed.paths.logs_dir.exists()
 
 
+def test_launcher_refuses_a_run_directory_that_is_a_link(
+    installed: support.Fork,
+) -> None:
+    # The launcher writes git's words under run/ before run.py checks the
+    # layout, so a linked run directory must stop it before that write.
+    elsewhere = installed.root / "elsewhere"
+    elsewhere.mkdir()
+    kept = elsewhere / "launcher-git.out"
+    kept.write_text("not the launcher's file\n", encoding="utf-8")
+    run_dir = installed.paths.run_dir
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.symlink_to(elsewhere, target_is_directory=True)
+
+    done = launch(installed, "run")
+
+    assert done.returncode == common.EXIT_USAGE
+    assert "run is a link" in done.stderr
+    assert kept.read_text(encoding="utf-8") == "not the launcher's file\n"
+    assert installed.gh_state()["calls"] == []
+    assert not installed.paths.logs_dir.exists()
+
+
 def test_launcher_without_a_clone_creates_nothing(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     done = subprocess.run(
@@ -2149,3 +2172,292 @@ def test_launcher_fails_closed_when_the_refs_cannot_be_listed(
     assert "cannot list the refs" in done.stderr
     assert list(installed.paths.clone.iterdir()) == [installed.paths.clone / ".git"]
     assert installed.gh_state()["calls"] == []
+
+
+# --------------------------------------------------------------------------
+# Residuals (issue #10)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lock", ["index.lock", "refs/heads/approved.lock"])
+def test_launcher_names_a_lock_a_killed_run_left_and_the_command_to_remove_it(
+    installed: support.Fork, lock: str
+) -> None:
+    # A run killed in the middle of a checkout leaves git's lock behind, and
+    # every later checkout fails on it. Merging a fix cannot clear that.
+    assert launch(installed, "run").returncode == common.EXIT_OK
+    stale = installed.paths.clone / ".git" / lock
+    stale.write_text("", encoding="utf-8")
+    calls = len(installed.gh_state()["calls"])
+
+    done = launch(installed, "run")
+    status = launch(installed, "status")
+
+    record = installed.paths.launcher_failure_file.read_text(encoding="utf-8")
+    for said in (done.stderr, status.stderr, record):
+        assert "a previous run was killed and left the lock" in said
+        assert f"Next: rm {stale}  " in said
+        assert "merge a fix" not in said
+        assert "run launchd.sh install again" not in said
+    assert (done.returncode, status.returncode) == (common.EXIT_FAILED,) * 2
+    assert stale.exists()  # never removed by the job
+    assert len(installed.gh_state()["calls"]) == calls  # nothing ran
+
+    stale.unlink()
+    after = launch(installed, "run")
+
+    assert after.returncode == common.EXIT_OK, after.stderr
+    assert not installed.paths.launcher_failure_file.exists()
+
+
+def test_launcher_names_the_first_lock_git_names_that_really_is_stale(
+    installed: support.Fork,
+) -> None:
+    # git can name more than one lock; the first one it names may not exist.
+    assert launch(installed, "run").returncode == common.EXIT_OK
+    clone_git = installed.paths.clone / ".git"
+    stale = clone_git / "refs" / "heads" / "approved.lock"
+    stale.write_text("", encoding="utf-8")
+    installed.fail_git(
+        "checkout",
+        said=(
+            f"error: Unable to create '{clone_git / 'gone.lock'}': File exists.\n"
+            f"fatal: Unable to create '{stale}': File exists.\n"
+        ),
+    )
+
+    done = launch(installed, "run")
+
+    assert done.returncode == common.EXIT_FAILED
+    assert f"left the lock {stale} in the maintenance clone" in done.stderr
+    assert f"Next: rm {stale}  " in done.stderr
+    assert "gone.lock in the maintenance clone" not in done.stderr
+    assert stale.exists()
+
+
+def test_launcher_names_a_lock_that_stops_the_fetch(installed: support.Fork) -> None:
+    assert launch(installed, "run").returncode == common.EXIT_OK
+    installed.commit({"README.md": "# moved on\n"}, "docs")  # the fetch must write
+    stale = installed.paths.clone / ".git" / "refs" / "remotes" / "origin" / "main.lock"
+    stale.write_text("", encoding="utf-8")
+    calls = len(installed.gh_state()["calls"])
+
+    done = launch(installed, "run")
+
+    record = installed.paths.launcher_failure_file.read_text(encoding="utf-8")
+    assert done.returncode == common.EXIT_FAILED
+    for said in (done.stderr, record):
+        assert "cannot fetch the fork: a previous run was killed and left" in said
+        assert f"Next: rm {stale}  " in said
+        assert "check the network" not in said
+    assert stale.exists()
+    assert len(installed.gh_state()["calls"]) == calls  # nothing ran
+
+
+def test_launcher_without_a_lock_keeps_the_network_message_for_a_failed_fetch(
+    installed: support.Fork,
+) -> None:
+    installed.bare.rename(installed.root / "gone.git")
+
+    done = launch(installed, "run")
+
+    expected = (
+        "orchestra-maint: cannot fetch the fork. Next: check the network, "
+        "then: bash scripts/maint/launchd.sh run-now"
+    )
+    record = installed.paths.launcher_failure_file.read_text(encoding="utf-8")
+    assert done.returncode == common.EXIT_FAILED
+    assert done.stderr.endswith(expected + "\n")
+    assert record.split(" ", 1)[1] == expected + "\n"
+    assert "killed" not in done.stderr
+
+
+LINGER_BOUND_SEC = 20  # the lingering child lives 30 s; a hang outlasts this
+
+
+def launch_with_short_deadline(fork: support.Fork) -> tuple[int, str, float]:
+    """One `run` with a one-second git deadline: (exit code, stderr, seconds).
+    A launcher that is still running after LINGER_BOUND_SEC fails the test."""
+    env = {
+        **fork.env,
+        "ORCHESTRA_MAINT_FETCH_PAUSE_SEC": "0",
+        "ORCHESTRA_MAINT_GIT_DEADLINE_SEC": "1",
+    }
+    started = time.monotonic()
+    try:
+        done = subprocess.run(
+            ["/bin/bash", str(fork.paths.launcher), "run"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=LINGER_BOUND_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"the launcher was still running after {LINGER_BOUND_SEC} s")
+    return done.returncode, done.stderr, time.monotonic() - started
+
+
+def test_launcher_ends_a_fetch_whose_helper_outlives_git(
+    installed: support.Fork,
+) -> None:
+    # git-remote-https stuck on the network keeps git's output open after the
+    # deadline ended git: reading that output must not wait for it.
+    installed.linger_git("fetch")
+    try:
+        code, stderr, seconds = launch_with_short_deadline(installed)
+    finally:
+        installed.reap_lingering()
+
+    assert code == common.EXIT_FAILED
+    assert stderr.endswith(
+        "orchestra-maint: cannot fetch the fork. Next: check the network, "
+        "then: bash scripts/maint/launchd.sh run-now\n"
+    )
+    assert seconds < LINGER_BOUND_SEC
+    assert installed.gh_state()["calls"] == []
+
+
+def test_launcher_ends_a_checkout_whose_child_outlives_git(
+    installed: support.Fork,
+) -> None:
+    installed.linger_git("checkout")
+    try:
+        code, stderr, seconds = launch_with_short_deadline(installed)
+    finally:
+        installed.reap_lingering()
+
+    assert code == common.EXIT_FAILED
+    assert "cannot check out the approved revision" in stderr
+    assert "merge a fix" in stderr
+    assert seconds < LINGER_BOUND_SEC
+    assert installed.gh_state()["calls"] == []
+
+
+def test_launcher_reads_a_bounded_part_of_a_huge_git_message(
+    installed: support.Fork,
+) -> None:
+    # Far more than the launcher reads back, every name a lock that is not
+    # the job's own: looking at them must stay cheap.
+    noise = "".join(
+        f"error: Unable to create '/nowhere/{index:06d}.lock': File exists.\n"
+        for index in range(20000)
+    )
+    installed.fail_git("checkout", said=noise)
+    started = time.monotonic()
+
+    done = launch(installed, "run")
+
+    assert time.monotonic() - started < 30
+    assert done.returncode == common.EXIT_FAILED
+    assert "merge a fix, then: bash scripts/maint/launchd.sh promote" in done.stderr
+    assert "killed" not in done.stderr
+    assert len(done.stderr) < 2 * 65536  # what git said is shown cut short
+
+
+def test_launcher_ends_a_checkout_that_stalls_while_it_reads_what_git_said(
+    installed: support.Fork,
+) -> None:
+    # git's words are now captured for the lock check: the deadline must
+    # still end a checkout that hangs.
+    installed.stall_git("checkout")
+    env = {
+        **installed.env,
+        "ORCHESTRA_MAINT_FETCH_PAUSE_SEC": "0",
+        "ORCHESTRA_MAINT_GIT_DEADLINE_SEC": "1",
+    }
+    started = time.monotonic()
+
+    done = subprocess.run(
+        ["/bin/bash", str(installed.paths.launcher), "run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert done.returncode == common.EXIT_FAILED
+    assert "cannot check out the approved revision" in done.stderr
+    assert "killed" not in done.stderr
+    assert time.monotonic() - started < 15
+    assert installed.gh_state()["calls"] == []
+
+
+def test_launcher_without_a_lock_keeps_the_message_for_a_broken_revision(
+    installed: support.Fork,
+) -> None:
+    assert launch(installed, "run").returncode == common.EXIT_OK
+    installed.approve(unusable_commit(installed))
+
+    done = launch(installed, "run")
+
+    assert done.returncode == common.EXIT_FAILED
+    assert "merge a fix, then: bash scripts/maint/launchd.sh promote" in done.stderr
+    assert "killed" not in done.stderr
+
+
+@pytest.mark.parametrize(
+    "name", [".claude/Models.Local.json", ".CLAUDE/MODELS.LOCAL.JSON"]
+)
+def test_watch_with_a_differently_cased_override_file_does_nothing(
+    bumpable: support.Fork, name: str
+) -> None:
+    # macOS checks it out as the very file the manifest tool reads.
+    override = {"schema_version": 1, "codex": {"model": f"gpt-1-{FAMILY}"}}
+    bumpable.commit_entry(name, json.dumps(override) + "\n", "chore: override")
+    bumpable.fetch()
+
+    result = watch(bumpable)
+
+    assert (result.result, result.exit_code) == (
+        "override-in-tree",
+        common.EXIT_NEEDS_OWNER,
+    )
+    assert name in result.detail
+    assert bumpable.codex_calls("exec") == []
+    assert_nothing_published(bumpable)
+
+
+def write_records(fork: support.Fork, **changes: object) -> None:
+    path = fork.paths.bump_records_file
+    records = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps([{**r, **changes} for r in records]), encoding="utf-8")
+
+
+def recorded_pulls(fork: support.Fork) -> list[object]:
+    path = fork.paths.bump_records_file
+    return [r["pull"] for r in json.loads(path.read_text(encoding="utf-8"))]
+
+
+def test_watch_ties_its_open_pull_request_to_a_record_left_without_one(
+    bumpable: support.Fork,
+) -> None:
+    # A run stopped between opening the pull request and recording its number.
+    head = open_bump(bumpable)
+    write_records(bumpable, pull=None)
+
+    result = watch(bumpable)
+
+    assert (result.result, result.exit_code) == ("pending", common.EXIT_OK)
+    assert recorded_pulls(bumpable) == [10]
+    assert bumpable.gh_state()["pulls"][0]["headRefOid"] == head
+    assert len(bumpable.gh_calls("pr", "create")) == 1
+
+
+@pytest.mark.parametrize("where", ["pull-head", "record-commit"])
+def test_watch_never_ties_a_pull_request_with_another_head_to_a_record(
+    bumpable: support.Fork, where: str
+) -> None:
+    open_bump(bumpable)
+    if where == "pull-head":
+        change = {"headRefOid": "a" * 40}
+        bumpable.set_gh(pulls=[{**bumpable.gh_state()["pulls"][0], **change}])
+        write_records(bumpable, pull=None)
+    else:
+        write_records(bumpable, pull=None, commit="b" * 40)
+
+    watch(bumpable)
+
+    assert recorded_pulls(bumpable) == [None]

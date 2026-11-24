@@ -18,10 +18,11 @@ file by itself in exactly two cases:
   tested (``bump.recorded_bump_problem``). The record is used once. The same
   change merged by any other means waits.
 
-In both cases every entry the range adds or changes must be a plain file. A
-link or a gitlink is never promoted without the owner, wherever it is: it can
-make the tree impossible to check out, which would leave the Mac running an
-older revision than the one recorded as approved.
+In both cases every entry the range adds or changes must be a plain file whose
+path the Mac's file system can hold. A link, a gitlink, or a name or path over
+the file system's length limits is never promoted without the owner, wherever
+it is: it can make the tree impossible to check out, which would leave the Mac
+running an older revision than the one recorded as approved.
 
 Everything else waits for the owner to run ``launchd.sh promote``. There is no
 setting that relaxes this: the rule is code in the approved revision, and a
@@ -216,7 +217,8 @@ class Decision:
     """What the change from ``approved`` to ``target`` amounts to.
 
     ``relevant`` are the changed paths the Mac executes or ships; ``special``
-    are the entries added or changed that are not plain files.
+    are the entries added or changed that are not plain files; ``overlong``
+    are the paths added or changed that the Mac's file system cannot hold.
     """
 
     action: str  # up-to-date | promote | await | diverged | unconfigured | failed
@@ -227,6 +229,17 @@ class Decision:
     commits: int = 0
     oldest: float | None = None
     special: tuple[str, ...] = ()
+    overlong: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TreeChange:
+    """What differs between two trees, for the decision."""
+
+    shipped: tuple[str, ...] | None
+    relevant: tuple[str, ...]
+    special: tuple[str, ...]
+    overlong: tuple[str, ...]
 
 
 def waiting_range(
@@ -246,17 +259,17 @@ def waiting_range(
     return len(values), float(min(values)) if values else None
 
 
-def _tree_change(
-    ctx: common.Context, approved: str, target: str
-) -> tuple[tuple[str, ...] | None, tuple[str, ...], tuple[str, ...]] | None:
-    """(shipped lists, relevant paths, special entries) for the change between
-    two trees; None when git cannot compare them. Needs no shared history."""
+def _tree_change(ctx: common.Context, approved: str, target: str) -> TreeChange | None:
+    """The change between two trees; None when git cannot compare them.
+    Needs no shared history."""
     changed = bump.changed_paths(ctx.git, approved, target)
     special = bump.special_entries(ctx.git, approved, target)
-    if changed is None or special is None:
+    overlong = bump.overlong_entries(ctx.git, approved, target)
+    if changed is None or special is None or overlong is None:
         return None
     shipped = shipped_paths(ctx.git.show(approved, UPDATE_SCRIPT_REL))
-    return shipped, tuple(relevant_paths(changed, shipped)), tuple(special)
+    relevant = tuple(relevant_paths(changed, shipped))
+    return TreeChange(shipped, relevant, tuple(special), tuple(overlong))
 
 
 def evaluate(ctx: common.Context) -> Decision:
@@ -278,10 +291,18 @@ def evaluate(ctx: common.Context) -> Decision:
     change = _tree_change(ctx, approved, target)
     if change is None:
         return Decision("failed", approved, target, reason="cannot compare the trees")
-    shipped, relevant, special = change
+    relevant, special, overlong = change.relevant, change.special, change.overlong
     if ancestry.returncode == 1:
         why = f"the approved revision is not an ancestor of {common.MAIN_REF}"
-        return Decision("diverged", approved, target, why, relevant, special=special)
+        return Decision(
+            "diverged",
+            approved,
+            target,
+            why,
+            relevant,
+            special=special,
+            overlong=overlong,
+        )
 
     size = waiting_range(ctx.git, approved, target)
     if size is None:
@@ -290,16 +311,28 @@ def evaluate(ctx: common.Context) -> Decision:
 
     def decide(action: str, reason: str) -> Decision:
         return Decision(
-            action, approved, target, reason, relevant, commits, oldest, special
+            action,
+            approved,
+            target,
+            reason,
+            relevant,
+            commits,
+            oldest,
+            special,
+            overlong,
         )
 
     if special:
         return decide(
             "await", f"adds or changes what is not a plain file: {special[0]}"
         )
+    if overlong:
+        return decide(
+            "await", f"adds or changes a path too long to check out: {overlong[0]}"
+        )
     if not relevant:
         return decide("promote", REASON_INERT)
-    if shipped is None:
+    if change.shipped is None:
         return decide(
             "await", f"cannot read the shipped lists from {UPDATE_SCRIPT_REL}"
         )
@@ -346,7 +379,8 @@ def auto_promote(ctx: common.Context) -> common.StepResult:
     if decision.oldest is not None:
         age_days = max(ctx.now - decision.oldest, 0.0) / common.SECONDS_PER_DAY
     overdue = age_days > PROMOTION_OVERDUE_DAYS
-    shown = ", ".join([*decision.special, *decision.relevant][:RELEVANT_SHOWN])
+    listed = [*decision.special, *decision.overlong, *decision.relevant]
+    shown = ", ".join(listed[:RELEVANT_SHOWN])
     detail = (
         f"awaiting promotion: {decision.commits} changes, oldest "
         f"{age_days:.1f} days; {decision.reason}; {shown}"
@@ -410,6 +444,8 @@ def _show_change(ctx: common.Context, decision: Decision, say: Say) -> None:
     say("")
     for entry in decision.special:
         say(f"  NOT A PLAIN FILE (a link or another repository): {entry}")
+    for entry in decision.overlong:
+        say(f"  PATH TOO LONG TO CHECK OUT ON THIS MAC: {entry}")
     if decision.action == "promote":
         say(f"The next scheduled run would promote this by itself ({decision.reason}).")
         return

@@ -1778,3 +1778,140 @@ def test_special_entries_lists_only_added_or_changed_entries(
     assert bump.special_entries(git, first, second) == []  # a deletion is not listed
     assert bump.special_entries(git, before, second) == []
     assert bump.special_entries(git, before, "f" * 40) is None
+
+
+# --------------------------------------------------------------------------
+# Residuals (issue #10)
+# --------------------------------------------------------------------------
+
+LONG_NAME = "docs/" + "a" * (bump.NAME_MAX_BYTES + 45)
+LONG_PATH = "docs/" + "/".join(["b" * 200] * 6)
+
+
+def path_of(total: int) -> str:
+    """A path of exactly ``total`` bytes, every name well under NAME_MAX."""
+    head = "docs/" + ("c" * 199 + "/") * 4
+    return head + "c" * (total - len(head))
+
+
+# PATH_MAX is 1024 with the terminating NUL: 1023 bytes is the longest that
+# checks out, 1024 is already too long.
+LONGEST_PATH = path_of(1023)
+FIRST_TOO_LONG_PATH = path_of(1024)
+
+
+@pytest.mark.parametrize(
+    ("path", "problem"),
+    [
+        ("docs/" + "a" * bump.NAME_MAX_BYTES, None),
+        ("docs/" + "a" * (bump.NAME_MAX_BYTES + 1), "a name of 256 bytes"),
+        # Counted in bytes, not characters: 128 two-byte characters.
+        ("docs/" + "é" * 128, "a name of 256 bytes"),
+        ("d/" * 511 + "a", None),  # exactly 1023 bytes
+        ("d/" * 511 + "ab", "1024 bytes"),  # PATH_MAX counts the NUL
+        ("d/" * 511 + "abc", "1025 bytes"),
+    ],
+    ids=[
+        "name-at-limit",
+        "name-over",
+        "name-over-in-bytes",
+        "path-at-limit",
+        "path-at-path-max",
+        "path-over",
+    ],
+)
+def test_path_length_problem_counts_utf8_bytes_against_both_limits(
+    path: str, problem: str | None
+) -> None:
+    found = bump.path_length_problem(path)
+
+    if problem is None:
+        assert found is None
+    else:
+        assert found is not None and problem in found
+
+
+@pytest.mark.parametrize(
+    "path",
+    [LONG_NAME, LONG_PATH, FIRST_TOO_LONG_PATH],
+    ids=["name", "path", "path-of-1024-bytes"],
+)
+def test_auto_promote_with_a_path_the_mac_cannot_check_out_waits(
+    fork: support.Fork, path: str
+) -> None:
+    # Inert by its path, and still never promoted by itself: the tree could
+    # not be checked out, and the launcher would stop running anything.
+    before = fork.approved()
+    fork.commit_entry(path, "notes\n", "docs: a very long name")
+    fork.fetch()
+    ctx = fork.context(now=time.time())
+
+    decision = promote.evaluate(ctx)
+    result = promote.auto_promote(ctx)
+
+    assert decision.relevant == ()
+    assert (result.result, result.exit_code) == ("awaiting-promotion", common.EXIT_OK)
+    assert "too long to check out" in result.detail
+    assert path[: bump.LONG_PATH_SHOWN - 3] in result.detail  # named, and cut
+    assert path not in result.detail
+    assert fork.approved() == before
+
+
+def test_auto_promote_with_a_path_of_the_longest_length_that_works_promotes(
+    fork: support.Fork,
+) -> None:
+    fork.commit_entry(LONGEST_PATH, "notes\n", "docs: a long, but possible, name")
+    head = fork.fetch()
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert result.result == "promoted"  # inert, and the Mac can hold it
+    assert fork.approved() == head
+
+
+def test_auto_promote_names_a_long_path_only_in_a_safe_form(
+    fork: support.Fork,
+) -> None:
+    path = "docs/\x1b[2J" + "c" * 300
+    fork.commit_entry(path, "notes\n", "docs: hostile name")
+    fork.fetch()
+
+    decision = promote.evaluate(fork.context(now=time.time()))
+
+    assert decision.action == "await"
+    assert "too long to check out: docs/\\x1b[2Jccc" in decision.reason
+    assert "\x1b" not in decision.reason
+    assert all("\x1b" not in entry for entry in decision.overlong)
+
+
+def test_manual_promote_lists_paths_too_long_to_check_out_before_asking(
+    fork: support.Fork,
+) -> None:
+    fork.commit_entry(LONG_NAME, "notes\n", "docs: a very long name")
+    fork.fetch()
+
+    code, shown, prompts = run_manual(fork, "no")
+
+    assert code == common.EXIT_OK and prompts
+    assert "PATH TOO LONG TO CHECK OUT" in shown
+    cut = LONG_NAME[: bump.LONG_PATH_SHOWN - 3]
+    assert f"{cut}... (a name of {len(LONG_NAME) - len('docs/')} bytes" in shown
+    assert "would promote this by itself" not in shown
+
+
+def test_auto_promote_with_a_differently_cased_override_file_waits(
+    fork: support.Fork,
+) -> None:
+    # macOS checks this out as the very file the approved manifest tool reads.
+    before = fork.approved()
+    override = {"schema_version": 1, "codex": {"model": f"gpt-1-{support.FAMILY}"}}
+    fork.commit_entry(
+        ".CLAUDE/Models.Local.JSON", json.dumps(override) + "\n", "override"
+    )
+    fork.fetch()
+
+    result = promote.auto_promote(fork.context(now=time.time()))
+
+    assert result.result == "awaiting-promotion"
+    assert ".CLAUDE/Models.Local.JSON" in result.detail
+    assert fork.approved() == before

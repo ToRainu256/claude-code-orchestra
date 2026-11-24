@@ -120,6 +120,12 @@ changes an entry whose mode is not 100644 or 100755 (a link, 120000; another
 repository, 160000), wherever it is, the range waits and the result names the
 path and the mode. Such an entry can make the tree impossible to check out.
 
+**Never by itself: a path this Mac cannot hold.** If the range adds or
+changes a path with a name longer than 255 bytes or a total length over 1023
+bytes (UTF-8; macOS's 1024-byte `PATH_MAX` counts the terminating NUL;
+`NAME_MAX_BYTES` and `PATH_MAX_BYTES` in `bump.py`), the range
+waits and the result names the path, made safe to show and cut short.
+
 Otherwise it advances `approved-rev` by itself in exactly two cases:
 
 1. **Inert range.** No changed path is one the Mac executes or ships. A path
@@ -161,7 +167,8 @@ Everything else waits. There is no setting that turns the gate off.
 commits with a link to each (built from the commit's SHA, never from a number
 in its subject), the changed paths, every entry that is not a plain file, the
 executed-or-shipped paths that kept it waiting (or that the next run would
-have promoted it anyway), the command that prints the full diff, and asks for
+have promoted it anyway), every path too long to check out on this Mac, the
+command that prints the full diff, and asks for
 a typed `yes`. It needs a terminal. When the default branch was rewritten
 there is no range, so it shows the newest commits and the same comparison of
 the approved tree with the new one; if the two cannot be compared it does not
@@ -335,8 +342,9 @@ retired model.
 What the default branch names now (model and effort) is read from the
 manifest file at that commit itself, not through the manifest tool: a project
 override file (`.claude/models.local.json`) merged on the fork must not decide
-it. While such a file is on the default branch the step does nothing
-(`override-in-tree`).
+it. While such a file is on the default branch, under that name in any letter
+case (macOS checks `.Claude/Models.Local.JSON` out as the same file), the step
+does nothing (`override-in-tree`).
 
 The bump is always built here, with the **approved** tools pointed at a
 scratch worktree of the default branch, in this order, and nothing leaves the
@@ -367,7 +375,9 @@ its two files are byte for byte the ones built here.
 - Open: the branch is fetched and must still be one commit that is exactly
   the bump built here. Then auto-merge is asked for again, pinned to that
   commit. If the branch is anything else or gone, auto-merge is **withdrawn**
-  and the outcome is `unknown-branch`.
+  and the outcome is `unknown-branch`. A record left without a pull-request
+  number (a run stopped right after opening it) gets this pull request's
+  number, but only when GitHub names exactly the recorded commit as its head.
 - No pull request but the branch exists: it must be exactly the bump built
   here (a previous run stopped after its push); then the live call is made
   again, the record is written and the pull request is opened. A branch with
@@ -397,7 +407,7 @@ test compares these tables with the lists in the code).
 |---------|------|-------|------------|
 | `up-to-date` | 0 | The approved revision is the default branch | — |
 | `promoted` | 0 | Advanced by one of the two automatic cases | — |
-| `awaiting-promotion` | 0 / 2 | Merged changes wait for approval: they touch what the Mac executes or ships, add or change an entry that is not a plain file, or are a bump this Mac's record does not cover. 2 once the oldest one landed on `main` more than 7 days ago (a merge counts once, at the time it was merged) | Review and run `launchd.sh promote` |
+| `awaiting-promotion` | 0 / 2 | Merged changes wait for approval: they touch what the Mac executes or ships, add or change an entry that is not a plain file or a path too long for this Mac, or are a bump this Mac's record does not cover. 2 once the oldest one landed on `main` more than 7 days ago (a merge counts once, at the time it was merged) | Review and run `launchd.sh promote` |
 | `diverged` | 2 | The approved revision is no longer in the default branch's history | Run `launchd.sh promote`; it shows the new history |
 | `no-approved-revision` | 1 | `state/approved-rev` is missing or not a SHA (the launcher normally stops before this) | Run `launchd.sh install` |
 | `git-failed` | 3 | The range could not be read, or the branch moved mid-run | Retried |
@@ -447,7 +457,7 @@ and how many have waited too long (`overdue`).
 | `effort-unsupported` | 0 / 2 | The newest slug lacks the configured effort; one issue is opened. 0 once that issue is closed | Decide, then close the issue |
 | `current-unparseable` | 2 | The current slug is not `<vendor>-<version>-<family>`; the watch cannot tell what "newer" is | Bump by hand when you want to |
 | `manifest-unreadable` | 2 | The manifest file on `main` is not a regular file, not JSON, or names a model or effort of an unexpected shape | Fix the manifest on `main` |
-| `override-in-tree` | 2 | `main` carries `.claude/models.local.json`, a project's override file; the watch does nothing while it is there | Remove the file from the fork |
+| `override-in-tree` | 2 | `main` carries `.claude/models.local.json` (in any letter case), a project's override file; the watch does nothing while it is there | Remove the file from the fork |
 | `unknown-branch` | 2 | `bot/models-<slug>` exists and is not exactly the bump this Mac builds: other files, another slug, or the right shape with other bytes (or an open pull request's branch is gone); auto-merge was withdrawn from an open pull request | Inspect the branch; delete it or close its pull request |
 | `auto-merge-not-enabled` | 2 | The pull request is open but GitHub refused auto-merge; every later run asks again | If it repeats, enable "Allow auto-merge" on the fork |
 | `auth-or-tool` | 3 | `gh` is not logged in as the fork owner, or the Codex CLI does not start | `gh auth login`, or fix the CLI |
@@ -534,7 +544,11 @@ its content. Then look, in this order, at:
    job does not fall back to an older revision for a run, because that
    revision would promote and open pull requests by its own, older rules.
    Only `promote` and `status` use the last revision that did check out, so
-   the owner can see what waits and approve a fix;
+   the owner can see what waits and approve a fix. When the checkout failed
+   on a lock a killed run left in the clone (`.git/index.lock`, or the lock
+   git names), the message says so and gives the `rm` command for it instead;
+   the job never removes a lock itself, because it may belong to a git
+   command that is still running;
 2. `~/.claude/orchestra/logs/launchd.err.log`;
 3. the newest file in `~/.claude/orchestra/logs/maint/`.
 
@@ -565,7 +579,7 @@ with `run.py`'s code. `launchd.sh` exits `0` or `1`.
 | `common.py` | Paths, the git guard and its isolation, subprocess with deadline, safe text |
 | `gh.py` | Every `gh` call, with the fork built in |
 | `promote.py` | The approved-revision rule and the owner's prompt |
-| `bump.py` | What one model bump is, entries that are not plain files, and the single-use records of the bumps this Mac tested |
+| `bump.py` | What one model bump is, entries that are not plain files or whose path is too long, and the single-use records of the bumps this Mac tested |
 | `model_watch.py` | Candidate rule and the resumable bump |
 | `report.py` | The public status comment |
 | `distribute.py` | The distribution step: one state per project, what a scheduled run may change by itself, the write and its checks |
