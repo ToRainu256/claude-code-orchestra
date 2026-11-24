@@ -34,12 +34,17 @@ class Unreadable(Exception):
 class Adoption:
     """One project the owner allowed the job to maintain.
 
-    ``identity`` is the directory and repository that were adopted;
-    ``source_print`` and ``target_print`` are the approved template and the
-    project's template-owned content at the job's last write there.
+    ``identity`` is the directory and repository that were adopted.
+    ``source_print`` is the approved template at the job's last write there,
+    without the per-project model lines; ``target_print`` is the project's
+    template-owned content right after that write, every byte of it, so that
+    anything the owner changes since is seen as the owner's.
     ``waiting_since`` is when a revision first had to wait for the project and
     is kept until the wait ends, however many revisions arrive meanwhile.
     ``interrupted`` names a revision whose write did not finish.
+    ``temporaries`` are the paths, relative to the project, of the files a
+    write creates beside the ones it places: recorded before the first of
+    them exists, and the only files a later run may delete as its own.
     """
 
     identity: tuple[int, ...]
@@ -51,6 +56,7 @@ class Adoption:
     waiting_revision: str = ""
     waiting_since: float = 0.0
     interrupted: str = ""
+    temporaries: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -71,8 +77,14 @@ def _adoption_from(raw: object) -> Adoption:
     """An adoption read from the record; ``Unreadable`` when it is not one."""
     if not isinstance(raw, dict):
         raise Unreadable("an adoption is not an object")
+    # A record written before temporary files were recorded has none.
+    listed = raw.get("temporaries", [])
+    if not isinstance(listed, list):
+        raise Unreadable("an adoption holds a value of the wrong kind")
     try:
-        adoption = Adoption(**{**raw, "identity": tuple(raw["identity"])})
+        adoption = Adoption(
+            **{**raw, "identity": tuple(raw["identity"]), "temporaries": tuple(listed)}
+        )
     except (KeyError, TypeError):
         raise Unreadable("an adoption has other fields than this code writes") from None
     numbers = (
@@ -87,6 +99,7 @@ def _adoption_from(raw: object) -> Adoption:
         adoption.target_print,
         adoption.waiting_revision,
         adoption.interrupted,
+        *adoption.temporaries,
     )
     well_formed = (
         len(adoption.identity) == targets.IDENTITY_LENGTH
@@ -160,8 +173,16 @@ class Ledger:
         common.write_text_atomic(self.path, json.dumps(body, indent=2) + "\n")
 
     def put(self, target: str, adoption: Adoption) -> None:
-        self.adoptions = {**self.adoptions, target: adoption}
-        self._write()
+        """Record one adoption. What is in memory changes only when the file
+        did: a later write of this object must not put on disk a mark (an
+        interrupted write, say) that the failed one never recorded."""
+        previous = self.adoptions
+        self.adoptions = {**previous, target: adoption}
+        try:
+            self._write()
+        except BaseException:
+            self.adoptions = previous
+            raise
 
     def close(self, visits: list[Visit], now: float) -> None:
         """Record what this run found, and when."""

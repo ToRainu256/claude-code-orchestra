@@ -220,13 +220,33 @@ The rules, each a check in the code named beside it:
   when. It is a state, not a failure, for 7 days counted from the first
   revision that had to wait; after that the project counts as needing the
   owner (exit 2), and its line says how many paths keep the tree from being
-  clean.
+  clean. A project that is `busy` waits by the same clock, whatever it was
+  waiting for on each run: a marker git left in `.git/` and never took away
+  (`BISECT_LOG`, `index.lock`, …) no longer keeps a project back in silence,
+  and after 7 days its line names the file.
 - **Its own output only** (`distribute.visit_target`,
   `distribute.unattended_problem`). A scheduled run replaces template-owned
-  files only while they are byte for byte what the job left there. Beyond
-  them it creates a missing seed file, and it changes a settings file only
-  when the documents before and after, parsed, differ in the manifest's model
-  keys and in nothing else. A local edit to a template file, a retired path
+  files only while they are byte for byte what the job left there. The record
+  keeps a digest of every byte of them, so the `model:` lines the manifest
+  tool rendered for the project are the job's own output on the next run,
+  and an edit to one of them is the owner's like any other. Both ends of
+  that comparison are the private copy, not the project: the copy the update
+  is prepared from has to match the record, and what the record keeps
+  afterwards is the copy that was written, once every path in the project
+  has been compared with it. An edit saved in the project in between, or
+  right after a write, is therefore never taken for the job's own output.
+  (A second digest, without the `model:` line in an agent definition's
+  frontmatter, is used for one thing only: comparing what the updater
+  produced with the approved template.) Beyond those files it creates a
+  missing seed file, and it changes a settings file only when the documents
+  before and after, parsed, differ in the manifest's model keys and in
+  nothing else. A document that cannot be read with certainty is not
+  compared at all: JSON with a key that is there twice at any depth, a
+  `config.toml` with a top-level key twice, a multi-line string before its
+  first table, a model key in any other spelling than `key = "value"`, or a
+  table named like one. JSON values are compared as they are written, so
+  `1` is not `true` and `1.0` is not `1`. A local edit to a template file, a
+  retired path
   that came back, a file the template newly claims, any other change to a
   settings file: all of these send the project back to `adopt`
   (`local-changes`). They do so only when there is something new to write. A
@@ -249,21 +269,36 @@ The rules, each a check in the code named beside it:
   paths the updater manages, or on the way to one, is a refusal with the path
   named, before anything runs; so is a directory where the updater expects a
   file, a file where it expects a directory, and any name the updater keeps
-  for its own temporary files. Every file of the copy is created exclusively,
+  for its own temporary files. The three directories the updater only makes
+  sure exist (`.claude/logs`, `.claude/checkpoints`, `.claude/docs/research`)
+  are not part of the copy, unless an old installation's `.agents/` twin is
+  being merged into one; a link or a file at one of those paths is a refusal
+  too, found in the project before the copy is made. Every file of the copy
+  is created exclusively,
   so two names that become one (a volume that folds case) stop the copy
   instead of meeting. The updater then runs with its home, its temporary
   directory and its working directory inside the run's scratch area, and,
   where `sandbox-exec` works, with file writes anywhere else denied by the
   kernel. Where it does not work (not macOS, or the job itself runs inside a
-  sandbox) the run log says `no sandbox here` and the rules before it are the
-  guarantee. What the updater leaves is checked again: regular files and
+  sandbox) the run log says `no sandbox here`, the rules before it are the
+  guarantee, and the step's detail, which `launchd.sh status` prints, starts
+  with `unsandboxed N`: on how many private copies the updater was started
+  without it. What the updater leaves is checked again: regular files and
   directories only.
 - **A write is planned whole** (`targets.plan_changes`). Before the first
   change, every path the update touches is compared with what the copy was
   taken from, and every step is proven possible. A failure there means
-  nothing was written. A failure after the first change is never reported
-  that way: the record keeps an `interrupted` mark until every path, and
-  `HEAD`, every ref and the index, have been checked after the write.
+  nothing was written. A template path may change its kind or only the case
+  of its name between two revisions: a file that becomes a directory is
+  removed before anything is put below it, a directory that becomes a file
+  is emptied first, and a name that changes only in case is a removal
+  followed by a creation, never two entries that a case-folding disk holds
+  as one (a revision that itself keeps two such names is not written at
+  all). A failure after the first change is never reported as "not
+  written": the record keeps an `interrupted` mark until every path, and
+  `HEAD`, every ref and the index, have been checked after the write. Before
+  the first change the record also takes down the name of every temporary
+  file the write is going to create.
 
 `adopt` is typed at a terminal. It needs the project listed in `targets.txt`,
 the template already installed there (it updates; `scripts/install.sh`
@@ -284,9 +319,12 @@ posted for that run.
 update … stopped half-way"): in the project, `git status` lists what was
 written. Discard it (`git restore .`, and `git clean` for the listed new
 files) or commit it, then run `launchd.sh adopt <project>`, which shows and
-writes the rest. A file named `.orchestra-maint-<16 hex digits>.tmp` is the
-job's own temporary file from a write that was killed; the next run removes
-it.
+writes the rest. A file named `.orchestra-maint-<16 hex digits>.tmp` can be
+the job's own temporary file from a write that was killed. The next scheduled
+run removes it when its path is one the record took down before that write
+and it is a regular file; one it cannot remove stays in the record for the
+run after. A file that only has such a name is never touched, and a write
+that finds one already at the name it chose stops without removing it.
 
 **If `state/distribution.json` cannot be read** it is never taken to mean
 "nothing adopted". The run moves it aside as
@@ -296,12 +334,16 @@ there. Adopt the projects again, then delete it.
 
 Limits worth knowing:
 
-- Unattended, three things are replaced without a comparison, because the
-  comparison leaves them out by name: bytecode caches (`__pycache__/`,
+- Unattended, two kinds of file are replaced without a comparison, because
+  the comparison leaves them out by name: bytecode caches (`__pycache__/`,
   `*.pyc`) and `.DS_Store` files under the template's directories are deleted
-  with the directory they are in, and the `model:` line of an agent
-  definition is rendered again from the manifest and the project's override
-  file. Keep nothing of your own under those names.
+  with the directory they are in. Keep nothing of your own under those names.
+- The `model:` line of an agent definition is the job's to render, from the
+  manifest and the project's override file. Changing a model by editing
+  `.claude/models.local.json` alone is taken up by the next update. Editing
+  the line itself, or running the manifest tool's `apply` in the project, is
+  an edit to a template file like any other: the next revision is
+  `local-changes` until `adopt`.
 - A replaced file is a new file: extended attributes and an ACL on the old
   one are not carried over. Its mode is kept.
 - A path longer than 400 characters is cut in the listing file and on the
@@ -314,7 +356,14 @@ Limits worth knowing:
   run git inside it. A repository of its own on a template path is refused.
 - The job cannot lock a project. Something else writing there between the
   last comparison and the write is not detected; the write is a rename per
-  file, and every path is verified afterwards.
+  file, and every path is verified afterwards. A process running as the
+  owner that swaps a directory for a link in that same moment is outside
+  what the job defends against: the parents of a path are checked again
+  before each file is placed, not before a deletion or a new directory.
+- An approved revision that keeps two names which a case-folding disk holds
+  as one (the job's own directory would have to be on a case-sensitive volume
+  to lay such a revision out) is not written into any project: `failed`,
+  nothing written, on every run until the template changes.
 - The updater's standard output is dropped, because it prints the difference
   between the project's settings and the template's. Its errors go to the run
   log.
@@ -425,7 +474,7 @@ and how many have waited too long (`overdue`).
 | `up-to-date` | 0 | Every adopted project holds the approved revision's files | — |
 | `distributed` | 0 | At least one project was updated; the changes are uncommitted there | Review and commit them in the project |
 | `waiting` | 0 | Nothing was written, and at least one project waits (`waiting-dirty`, `busy`) | Commit in the project when you want the update |
-| `needs-owner` | 2 | A project is `local-changes` or `refused`, or has been `waiting-dirty` for more than 7 days; or the record of adoptions could not be read and was set aside | See that project's line in `launchd.sh status` |
+| `needs-owner` | 2 | A project is `local-changes` or `refused`, or has been `waiting-dirty` or `busy` for more than 7 days; or the record of adoptions could not be read and was set aside | See that project's line in `launchd.sh status` |
 | `target-failed` | 3 | The update of a project failed (`failed`); the others were still visited | Read the newest log |
 | `source-failed` | 3 | The approved revision could not be laid out in a scratch worktree, its updater's path lists cannot be read, or `git` or `python3` could not be resolved for the updater; no project was touched | Retried; if it repeats, read the newest log |
 | `no-approved-revision` | 1 | `state/approved-rev` is missing or not a SHA | Run `launchd.sh install` |
@@ -438,10 +487,10 @@ and how many have waited too long (`overdue`).
 | `uncommitted` | 0 | The same, with a tree that is not clean, usually because the last update is not committed yet | Commit, or the next revision will wait |
 | `updated` | 0 | Updated in this run; left uncommitted | Review and commit |
 | `waiting-dirty` | 0 / 2 | A new revision waits because the tree is not clean: paths modified or staged, untracked and not ignored, or hidden from `git status` (assume-unchanged, skip-worktree). `status` shows the revision, since when, and the counts. 2 once the wait, counted from the first revision that had to wait, is longer than 7 days | Commit or clean the tree |
-| `busy` | 0 | git is in the middle of a rebase, merge, pick, revert or bisect there (or holds the index lock); a Claude Code session wrote in the project within the hour; or the project changed while the update was being prepared, and nothing was written | — |
+| `busy` | 0 / 2 | git is in the middle of a rebase, merge, pick, revert or bisect there (or holds the index lock): the line names the file in `.git/`; a Claude Code session wrote in the project within the hour; or the project changed while the update was being prepared, and nothing was written. `status` shows the revision that waits and since when. 2 once the wait, counted like `waiting-dirty`'s and by the same clock, is longer than 7 days | Nothing at first. After 7 days: finish or abort what git is doing, or delete the stale file the line names; for a session or a project that never rests, `launchd.sh adopt <project>` |
 | `not-adopted` | 0 | Listed and never adopted. No file there was read and no git ran there | `launchd.sh adopt <project>` if you want it maintained |
-| `local-changes` | 2 | There is something new to write, and: template-owned files are not what the job left; or the update would change something a scheduled run does not change by itself (a path outside the template's own, more than the model keys of a settings file); or an earlier write stopped half-way | `launchd.sh adopt <project>` shows it and asks. After a half-way write, first discard or commit what `git status` lists there |
-| `refused` | 2 | The entry is not an absolute real path to a directory with its own repository, or overlaps the job's directory; another directory or repository is at an adopted path; the repository has no commit, or its configuration sets a key outside the inert list; a link, a special file or a nested repository lies on or under a path the updater manages; a directory is where the updater expects a file (or the reverse), or a file carries one of the updater's temporary names; something there cannot be read; or the manifest tool will not bring the model settings in line | Fix what the line names; for another repository at the path, adopt it |
+| `local-changes` | 2 | There is something new to write, and: template-owned files are not what the job left; or the update would change something a scheduled run does not change by itself (a path outside the template's own, more than the model keys of a settings file, or any change to a settings file that holds a key twice or cannot be read line by line with certainty); or an earlier write stopped half-way | `launchd.sh adopt <project>` shows it and asks. After a half-way write, first discard or commit what `git status` lists there |
+| `refused` | 2 | The entry is not an absolute real path to a directory with its own repository, or overlaps the job's directory; another directory or repository is at an adopted path; the repository has no commit, or its configuration sets a key outside the inert list; a link, a special file or a nested repository lies on or under a path the updater manages; a directory is where the updater expects a file (or the reverse), or a file carries one of the updater's temporary names; a link or a file is where the updater makes a directory (`.claude/logs`, `.claude/checkpoints`, `.claude/docs/research`); something there cannot be read; or the manifest tool will not bring the model settings in line | Fix what the line names; for another repository at the path, adopt it |
 | `failed` | 3 | Nothing was written: the updater failed on the private copy, it left something that is not the approved revision's files, git could not report on the project, a path differs from what the update was prepared from although git calls the tree clean, the approved revision could not be laid out (`not visited`), or the visit raised an error (`stopped by …`). Or written in part: the write stopped, or did not verify | Read the newest log. After a partial write the next run says `local-changes` with the steps |
 
 ### model-watch

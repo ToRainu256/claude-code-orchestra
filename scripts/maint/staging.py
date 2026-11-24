@@ -21,7 +21,8 @@ nothing in it can lead a write somewhere else.
   are resolved before the home moves. Where ``sandbox-exec`` works, file
   writes anywhere else are denied by the kernel, so a path nobody thought of
   fails instead of escaping; where it does not work, the two rules above are
-  the guarantee and the run says so in its log.
+  the guarantee, the run says so in its log, and every such run of the
+  updater is counted (``Source.unfenced``) for the step to report.
 * **What comes out is checked.** The result must be the approved revision's
   files, hold regular files and directories only, and pass the manifest
   tool's own check.
@@ -38,7 +39,7 @@ import shlex
 import shutil
 import stat
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import common
@@ -57,6 +58,12 @@ VERSION_STAMP_REL = ".claude/orchestra-version"
 # Project-owned files the updater creates when they are missing.
 SEED_FILES = (".claude/STATE.md", ".claude/docs/DESIGN.md")
 PROJECT_FILES = (*SEED_FILES, VERSION_STAMP_REL, ".claude/models.local.json")
+# Directories the updater only makes sure exist (`mkdir -p`). They are outside
+# the copy, so nothing here ever reads what a project keeps in them; a link or
+# a file at one of these paths is found in the project itself, before the
+# updater runs (``targets.layout_problem``). A test holds the list to the
+# updater's own.
+MADE_DIRS = (".claude/docs/research", ".claude/logs", ".claude/checkpoints")
 # What only an old installation still has; the updater moves or retires it.
 LEGACY_ROOT, CANONICAL_ROOT = ".agents", ".claude"
 LEGACY_FILES = (".agents/STATE.md", "CLAUDE.md", "CLAUDE.md.pre-agents-md.bak")
@@ -132,7 +139,9 @@ class Source:
     """A scratch checkout of the approved revision. ``files`` are the shipped
     files it really has; ``fingerprint`` is what a project holds when it has
     exactly this revision's template; ``fence`` is what the updater's command
-    line starts with (the sandbox, or nothing)."""
+    line starts with (the sandbox, or nothing). ``unfenced`` is the one thing
+    here that grows during a run: the name of every private copy the updater
+    was started on without the sandbox."""
 
     root: Path
     work: Path
@@ -142,6 +151,7 @@ class Source:
     fingerprint: str
     version: str
     fence: tuple[str, ...]
+    unfenced: list[str] = field(default_factory=list, compare=False)
 
     @property
     def file_paths(self) -> tuple[str, ...]:
@@ -177,8 +187,18 @@ class Source:
         )
 
     def fingerprint_of(self, root: str) -> str:
+        """The template-owned content below ``root`` as it compares with the
+        approved template: without the per-project model lines."""
         return targets.fingerprint(
             root, self.shipped.dirs, self.files, VERSION_STAMP_REL
+        )
+
+    def left_print_of(self, root: str) -> str:
+        """The template-owned content below ``root``, every byte of it: what
+        the record keeps of a project right after a write, and what a later
+        run compares the project with to see whether anybody edited it."""
+        return targets.fingerprint(
+            root, self.shipped.dirs, self.files, VERSION_STAMP_REL, exact=True
         )
 
 
@@ -414,11 +434,19 @@ def shape_problem(
 @dataclass(frozen=True)
 class Staged:
     """A private copy of a project's managed paths, as it was (``before``)
-    and as the approved updater left it (``after``)."""
+    and as the approved updater left it (``after``).
+
+    ``before_print`` and ``after_print`` are the template-owned content of
+    the copy at those two moments, every byte of it. They are taken from the
+    copy, not from the project: what was compared with the record is then
+    exactly what the update was prepared from, and what the record keeps is
+    exactly what was written, whatever is saved in the project meanwhile."""
 
     stage: str
     before: dict[str, targets.Entry]
     after: dict[str, targets.Entry]
+    before_print: str = ""
+    after_print: str = ""
 
     def changes(self) -> list[tuple[str, str]]:
         """(what happens, path) for every file that would be created, changed
@@ -493,6 +521,7 @@ def stage_update(ctx: common.Context, source: Source, target: str, name: str) ->
     problem = shape_problem(source, target, before)
     if problem is not None:
         raise StageProblem(True, problem)
+    before_print = source.left_print_of(str(stage))
     # The updater insists on a git work tree. This one is the job's own.
     updater = stage / UPDATER_REL
     updater.parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +537,8 @@ def stage_update(ctx: common.Context, source: Source, target: str, name: str) ->
     # Started from an empty directory of the job's own: an interpreter looks
     # for modules where it is started, and the copy holds the project's files.
     nowhere = source.work / EMPTY_DIR
+    if not source.fence:
+        source.unfenced.append(name)
     done = common.run_command(
         [*source.fence, BASH, str(updater), "--yes"],
         UPDATER_TIMEOUT_SEC,
@@ -545,4 +576,6 @@ def stage_update(ctx: common.Context, source: Source, target: str, name: str) ->
             ctx.log.line(f"distribute: model check failed -- {check.failure()}")
             why = _first_line(check.stderr) or "the model check did not pass"
             raise StageProblem(True, f"has model settings to fix first: {why}")
-    return Staged(str(stage), before, after)
+    return Staged(
+        str(stage), before, after, before_print, source.left_print_of(str(stage))
+    )

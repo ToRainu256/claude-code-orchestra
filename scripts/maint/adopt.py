@@ -187,7 +187,9 @@ def _fixable_problem(source: staging.Source, git: target_git.TargetGit) -> str |
     adopted; None when nothing."""
     target = git.target
     problem = target_git.repository_problem(git)
-    problem = problem or targets.layout_problem(target, source.guarded)
+    problem = problem or targets.layout_problem(
+        target, source.guarded, staging.MADE_DIRS
+    )
     if problem is not None:
         return f"the project {problem}"
     marker = targets.operation_in_progress(target)
@@ -259,13 +261,24 @@ def _adopt_from(
     if promote.read_approved(ctx.paths) != source.revision:
         say("adopt: the approved revision moved while you were reading; run it again")
         return common.EXIT_FAILED
+    # A new record, but not a forgetful one: the temporary files an earlier
+    # write was killed over stay recorded, so the next scheduled run can
+    # still remove them. Nothing is deleted here that the screen did not
+    # show, and nothing is carried over to another directory or repository
+    # that is at this path now.
+    identity = tuple(targets.identity(target))
+    earlier = book.adoptions.get(target)
+    carried: tuple[str, ...] = ()
+    if earlier is not None and earlier.identity == identity:
+        carried = earlier.temporaries
     adoption = ledger.Adoption(
-        identity=tuple(targets.identity(target)),
+        identity=identity,
         adopted_at=ctx.now,
         revision=source.revision,
         source_print=source.fingerprint,
         target_print="",
         updated_at=ctx.now,
+        temporaries=carried,
     )
     seen = distribute.Seen(state, dirt)
     visit = distribute.write_update(ctx, source, book, git, adoption, staged, seen)

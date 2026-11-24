@@ -1615,6 +1615,9 @@ def test_the_updater_runs_with_its_home_and_temporary_directory_in_the_scratch_a
     assert states(fork) == {"alpha": "updated"}, fork.log_file.read_text()
     assert result.exit_code == common.EXIT_OK
     assert (project / RULE_REL).read_text(encoding="utf-8") == RULE_TEXT
+    # With the sandbox there is nothing to count; without it, exactly this run.
+    assert ("unsandboxed 1" in result.detail) is (not fenced())
+    assert ("unsandboxed" in result.detail) is (not fenced())
 
 
 @pytest.mark.skipif(not fenced(), reason="no usable sandbox-exec here")
@@ -1742,18 +1745,22 @@ def test_run_with_a_write_that_stops_part_way_says_so_and_how_to_recover(
     failed = distribute.run(fork.context())
     detail = detail_of(fork, "alpha")
     monkeypatch.undo()
-    # A write that was killed outright also leaves one of these behind.
-    leftover = project / ".claude" / "rules" / f"{targets.TEMP_PREFIX}{'0' * 16}.tmp"
+    interrupted = record(fork)["adopted"][str(project)]
+    # A write that was killed outright leaves a temporary file behind, under
+    # one of the names the record took down before the write began.
+    leftover = project / interrupted["temporaries"][0]
     leftover.write_text("half a file\n", encoding="utf-8")
     again = distribute.run(fork.context())
 
     assert (failed.result, failed.exit_code) == ("target-failed", common.EXIT_FAILED)
     assert "written in part" in detail and "not written" not in detail
-    assert record(fork)["adopted"][str(project)]["interrupted"] != ""
+    assert interrupted["interrupted"] != ""
+    assert len(interrupted["temporaries"]) == 2
     assert (again.result, states(fork)) == ("needs-owner", {"alpha": "local-changes"})
     for step in ("discard or commit", "git status", "launchd.sh adopt"):
         assert step in detail_of(fork, "alpha")
     assert not leftover.exists()
+    assert record(fork)["adopted"][str(project)]["temporaries"] == []
     # The steps work: discard, adopt, and the mark is gone.
     support.git(project, "checkout", "--", ".")
     code, said, _ = adopt_project(fork, project)
@@ -1811,10 +1818,141 @@ def test_the_model_keys_are_the_manifest_tools_own() -> None:
         ("c.toml", 'x = 1\n[t]\nmodel = "a"\n', 'x = 1\n[t]\nmodel = "b"\n', False),
         ("c.toml", 'model = "a"\nx = 1\n', 'model = "a"\nx = 2\n', False),
         ("c.yaml", "model: a\n", "model: b\n", False),
+        # Values are compared as they are written, not as Python reads them.
+        ("s.json", '{"model": "a", "x": true}', '{"model": "b", "x": 1}', False),
+        (
+            "s.json",
+            '{"x": 1.00000000000000001}',
+            '{"x": 1.00000000000000002}',
+            False,
+        ),
+        (
+            "s.json",
+            '{"model": "a", "n": 1.50, "k": [3, true, null]}',
+            '{"k": [3, true, null], "n": 1.50, "model": "b"}',
+            True,
+        ),
+        # A line further down that only starts like a table header is none.
+        (
+            "c.toml",
+            "model = \"a\"\n[servers.env]\nNOTE = '''\n[model notes]\n'''\n",
+            "model = \"b\"\n[servers.env]\nNOTE = '''\n[model notes]\n'''\n",
+            True,
+        ),
     ],
 )
 def test_only_model_keys_differ(rel: str, old: str, new: str, allowed: bool) -> None:
     assert distribute.only_model_keys_differ(rel, old, new) is allowed
+
+
+# What a parser that keeps the last of two equal keys never sees, and what a
+# reading by lines can take for a model line: each pair below differs in a
+# value of the owner's, and each is a document that cannot be compared.
+UNCOMPARABLE = {
+    "json-key-twice": (
+        "s.json",
+        '{"note": "~/.agents/hooks/x", "note": 1, "model": "a"}',
+        '{"note": "~/.claude/hooks/x", "note": 1, "model": "b"}',
+    ),
+    "json-key-twice-deeper": (
+        "s.json",
+        '{"env": {"MINE": "~/.agents/logs/x", "MINE": "kept"}}',
+        '{"env": {"MINE": "~/.claude/logs/x", "MINE": "kept"}}',
+    ),
+    "json-model-key-twice": (
+        "s.json",
+        '{"model": "~/.agents/hooks/x", "model": "a"}',
+        '{"model": "~/.claude/hooks/x", "model": "a"}',
+    ),
+    "toml-model-key-twice": (
+        "c.toml",
+        'model = "a"\nmodel = "~/.agents/hooks/x"\n',
+        'model = "a"\nmodel = "~/.claude/hooks/x"\n',
+    ),
+    "toml-other-key-twice": (
+        "c.toml",
+        'model = "a"\nx = 1\nx = 2\n',
+        'model = "b"\nx = 1\nx = 2\n',
+    ),
+    "toml-multi-line-string": (
+        "c.toml",
+        'note = """\nmodel = "the owner\'s words"\n"""\n',
+        'note = """\nmodel = "other words"\n"""\n',
+    ),
+    "toml-line-separator-in-a-string": (
+        "c.toml",
+        'note = "x\u2028model = \\"mine\\""\n',
+        'note = "x\u2028model = \\"other\\""\n',
+    ),
+    "toml-form-feed-in-a-string": (
+        "c.toml",
+        "note = 'x\x0cmodel = \"mine\"'\n",
+        "note = 'x\x0cmodel = \"other\"'\n",
+    ),
+    "toml-later-table-named-like-the-key": (
+        "c.toml",
+        'model = "a"\n[model]\nx = 1\n',
+        'model = "b"\n[model]\nx = 1\n',
+    ),
+    "toml-later-table-with-an-escaped-name": (
+        "c.toml",
+        'model = "a"\n["\\u006dodel".x]\ny = 1\n',
+        'model = "b"\n["\\u006dodel".x]\ny = 1\n',
+    ),
+    "toml-quoted-model-key": ("c.toml", '"model" = "a"\n', '"model" = "b"\n'),
+    "toml-key-spelled-with-an-escape": (
+        "c.toml",
+        'model = "a"\n"\\u006dodel" = "~/.agents/hooks/x"\n',
+        'model = "b"\n"\\u006dodel" = "~/.agents/hooks/x"\n',
+    ),
+    "toml-dotted-model-key": ("c.toml", "model.x = 1\n", "model.x = 2\n"),
+    "toml-indented-model-key": ("c.toml", '  model = "a"\n', '  model = "b"\n'),
+    "toml-model-value-not-a-plain-string": ("c.toml", "model = 'a'\n", "model = 'b'\n"),
+}
+# These two are read correctly now, as one line each, and so simply differ.
+READ_AS_ONE_LINE = ("toml-line-separator-in-a-string", "toml-form-feed-in-a-string")
+
+
+@pytest.mark.parametrize("case", sorted(UNCOMPARABLE))
+def test_only_model_keys_differ_refuses_a_document_it_cannot_read_with_certainty(
+    case: str,
+) -> None:
+    rel, old, new = UNCOMPARABLE[case]
+
+    assert distribute.only_model_keys_differ(rel, old, new) is False
+    # Not even two equal copies of such a document count as comparable.
+    same = distribute.only_model_keys_differ(rel, old, old)
+    assert same is (case in READ_AS_ONE_LINE)
+
+
+def test_run_with_a_settings_key_that_is_there_twice_rewrites_neither(
+    fork: support.Fork,
+) -> None:
+    # With the manifest tool told to leave the settings alone, nothing else
+    # refuses the document; the updater's path migration rewrites both keys,
+    # and a parser that keeps the last one sees no difference.
+    project = adopted_project(fork)
+    settings = project / ".claude" / "settings.json"
+    text = settings.read_text(encoding="utf-8")
+    twice = '{\n  "ownerNote": "/x/.agents/hooks/run.sh",\n  "ownerNote": "kept",'
+    assert text.startswith("{\n")
+    settings.write_text(twice + text[1:], encoding="utf-8")
+    (project / OVERRIDE_REL).write_text(
+        json.dumps({"schema_version": 1, "manage_native_settings": False}) + "\n",
+        encoding="utf-8",
+    )
+    commit_all(project, "the owner's own settings, one key twice")
+    release(fork, RELEASE, "change a rule")
+    before = support.tree_digest(project)
+
+    result = distribute.run(fork.context())
+
+    assert states(fork) == {"alpha": "local-changes"}, detail_of(fork, "alpha")
+    assert result.exit_code == common.EXIT_NEEDS_OWNER
+    assert "more than the model keys of .claude/settings.json" in detail_of(
+        fork, "alpha"
+    )
+    assert support.tree_digest(project) == before
 
 
 def test_run_never_rewrites_the_owners_own_settings_values(fork: support.Fork) -> None:
@@ -1912,7 +2050,15 @@ def test_adopt_shows_a_directory_that_goes_although_it_holds_no_file(
 
 @pytest.mark.parametrize(
     "damage",
-    ["truncated", "not-an-object", "bad-adoption", "short-identity", "wrong-type"],
+    [
+        "truncated",
+        "not-an-object",
+        "bad-adoption",
+        "short-identity",
+        "wrong-type",
+        "temporaries-not-a-list",
+        "temporaries-not-text",
+    ],
 )
 def test_run_with_a_record_it_cannot_read_sets_it_aside_and_touches_nothing(
     fork: support.Fork, damage: str
@@ -1932,6 +2078,10 @@ def test_run_with_a_record_it_cannot_read_sets_it_aside_and_touches_nothing(
             adoption["identity"] = "none"
         elif damage == "short-identity":
             adoption["identity"] = adoption["identity"][:3]
+        elif damage == "temporaries-not-a-list":
+            adoption["temporaries"] = "README.md"
+        elif damage == "temporaries-not-text":
+            adoption["temporaries"] = [7]
         else:
             adoption["target_print"] = 7
         bad = json.dumps(document)
@@ -2167,8 +2317,10 @@ def test_run_with_a_write_that_did_not_take_says_so(
     release(fork, RELEASE, "change a rule")
     real_place = targets._place
 
-    def place_then_spoil(source: str, destination: str, executable: bool) -> None:
-        real_place(source, destination, executable)
+    def place_then_spoil(
+        source: str, destination: str, executable: bool, temporary: str
+    ) -> None:
+        real_place(source, destination, executable, temporary)
         if destination.endswith(RULE_REL):
             with open(destination, "a", encoding="utf-8") as handle:
                 handle.write("# written by something else\n")
@@ -2606,3 +2758,899 @@ def test_adopt_on_a_revision_the_launcher_fell_back_to_is_refused(
     assert "could not be checked out; nothing done" in done.stdout
     assert support.tree_digest(project) == before
     assert not (fork.paths.state_dir / distribute.LEDGER_FILE).exists()
+
+
+# --------------------------------------------------------------------------
+# A path that changes its kind, or only its case, between two revisions
+# --------------------------------------------------------------------------
+
+SHAPE_REL = ".claude/rules/shape-shifter.md"
+RESPELLED_REL = ".claude/rules/Shape-Shifter.md"
+SHAPES = ("file-to-directory", "directory-to-file", "case-only-rename")
+
+
+def folds_case(directory: Path) -> bool:
+    """Whether the volume holding ``directory`` takes two spellings of a name
+    for one, as the default macOS volume does."""
+    probe = directory / "Case-Probe"
+    probe.write_text("x\n", encoding="utf-8")
+    try:
+        return (directory / "case-probe").exists()
+    finally:
+        probe.unlink()
+
+
+def release_shape(fork: support.Fork, shape: str) -> None:
+    """Approve a revision that has the path in its first shape."""
+    first = f"{SHAPE_REL}/inner.md" if shape == "directory-to-file" else SHAPE_REL
+    release(fork, {first: "as it was\n", "VERSION": "9.9.8\n"}, "before the change")
+
+
+def release_shape_change(fork: support.Fork, shape: str) -> None:
+    """Approve the next revision, in which the path has its second shape."""
+    path = fork.seed / SHAPE_REL
+    files: dict[str, str | None] = {"VERSION": "9.9.9\n"}
+    if shape == "file-to-directory":
+        path.unlink()
+        files[f"{SHAPE_REL}/inner.md"] = "inside now\n"
+    elif shape == "directory-to-file":
+        shutil.rmtree(path)
+        files[SHAPE_REL] = "a file now\n"
+    else:
+        support.git(fork.seed, "mv", SHAPE_REL, RESPELLED_REL)
+    release(fork, files, "the path changes its shape")
+
+
+def assert_shape_changed(project: Path, shape: str) -> None:
+    path = project / SHAPE_REL
+    names = os.listdir(path.parent)
+    if shape == "file-to-directory":
+        assert path.is_dir() and not path.is_symlink()
+        assert (path / "inner.md").read_text(encoding="utf-8") == "inside now\n"
+    elif shape == "directory-to-file":
+        assert path.is_file() and not path.is_symlink()
+        assert path.read_text(encoding="utf-8") == "a file now\n"
+    else:
+        # One entry, under the new spelling: never two that are one file.
+        assert Path(RESPELLED_REL).name in names
+        assert Path(SHAPE_REL).name not in names
+        assert (project / RESPELLED_REL).read_text(encoding="utf-8") == "as it was\n"
+    assert not [name for name in names if name.startswith(targets.TEMP_PREFIX)]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_run_with_a_template_path_that_changes_its_kind_or_case_updates_the_project(
+    fork: support.Fork, shape: str
+) -> None:
+    # One such commit used to stop every adopted project for ever: the plan
+    # could not be proven, so each run failed the same way.
+    release_shape(fork, shape)
+    project = adopted_project(fork)
+    before = git_bytes(project)
+    release_shape_change(fork, shape)
+
+    result = distribute.run(fork.context())
+
+    assert states(fork) == {"alpha": "updated"}, detail_of(fork, "alpha")
+    assert (result.result, result.exit_code) == ("distributed", common.EXIT_OK)
+    assert_shape_changed(project, shape)
+    assert git_bytes(project) == before
+    assert record(fork)["adopted"][str(project)]["interrupted"] == ""
+    # And the project is not left in a state the next run trips over.
+    if porcelain(project):
+        commit_all(project, "take the update")
+    release(fork, {RULE_REL: RULE_TEXT}, "change a rule")
+    following = distribute.run(fork.context())
+    assert states(fork) == {"alpha": "updated"}, detail_of(fork, "alpha")
+    assert following.exit_code == common.EXIT_OK
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_adopt_with_a_template_path_that_changes_its_kind_or_case_updates_the_project(
+    fork: support.Fork, shape: str
+) -> None:
+    # The way out the scheduled run points to has to work for the same shapes.
+    release_shape(fork, shape)
+    project = adopted_project(fork)
+    before = git_bytes(project)
+    release_shape_change(fork, shape)
+
+    code, said, prompts = adopt_project(fork, project)
+
+    assert code == common.EXIT_OK, said
+    assert len(prompts) == 1
+    assert_shape_changed(project, shape)
+    assert git_bytes(project) == before
+    assert record(fork)["adopted"][str(project)]["interrupted"] == ""
+
+
+def test_apply_changes_with_a_file_that_becomes_a_directory_writes_all_of_it(
+    tmp_path: Path,
+) -> None:
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    for root in (target, stage):
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg" / "x").write_text("a file\n", encoding="utf-8")
+        (root / "pkg" / "keep.md").write_text("keep\n", encoding="utf-8")
+    before = targets.snapshot(str(stage), skip_top=())
+    (stage / "pkg" / "x").unlink()
+    (stage / "pkg" / "x" / "deep").mkdir(parents=True)
+    (stage / "pkg" / "x" / "child.md").write_text("child\n", encoding="utf-8")
+    (stage / "pkg" / "x" / "deep" / "tool.sh").write_text("#!/bin/sh\n", "utf-8")
+    (stage / "pkg" / "x" / "deep" / "tool.sh").chmod(0o700)
+    after = targets.snapshot(str(stage), skip_top=())
+
+    plan = targets.plan_changes(str(target), str(stage), before, after)
+    untouched = targets.snapshot(str(target), skip_top=()) == before
+    targets.apply_plan(plan)
+
+    assert untouched
+    assert plan.unlink == ("pkg/x",)
+    assert plan.mkdir == ("pkg/x", "pkg/x/deep")
+    assert targets.snapshot(str(target), skip_top=()) == after
+    assert targets.applied_problem(str(target), before, after) is None
+    assert stat.S_IMODE((target / "pkg" / "x").stat().st_mode) == 0o755
+
+
+def test_plan_changes_with_a_file_in_the_way_that_is_not_the_one_staged_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    # The file that has to become a directory was edited after the copy.
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    for root in (target, stage):
+        root.mkdir()
+        (root / "x").write_text("a file\n", encoding="utf-8")
+    before = targets.snapshot(str(stage), skip_top=())
+    (stage / "x").unlink()
+    (stage / "x").mkdir()
+    (stage / "x" / "child.md").write_text("child\n", encoding="utf-8")
+    after = targets.snapshot(str(stage), skip_top=())
+    (target / "x").write_text("the owner's words since\n", encoding="utf-8")
+
+    with pytest.raises(targets.Conflict, match="x: changed since"):
+        targets.plan_changes(str(target), str(stage), before, after)
+
+    assert (target / "x").read_text(encoding="utf-8") == "the owner's words since\n"
+
+
+def respelled_update(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
+    """A target and a prepared copy in which a file and a directory change
+    nothing but the case of their names, and the directory gains a file."""
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    for root in (target, stage):
+        (root / "docs" / "Guide").mkdir(parents=True)
+        (root / "docs" / "testing.md").write_text("rules\n", encoding="utf-8")
+        (root / "docs" / "Guide" / "a.md").write_text("a\n", encoding="utf-8")
+    before = targets.snapshot(str(stage), skip_top=())
+    os.rename(stage / "docs" / "testing.md", stage / "docs" / "Testing.md")
+    os.rename(stage / "docs" / "Guide", stage / "docs" / "guide")
+    (stage / "docs" / "guide" / "b.md").write_text("b\n", encoding="utf-8")
+    return target, stage, before, targets.snapshot(str(stage), skip_top=())
+
+
+def test_apply_changes_with_names_that_change_only_in_case_renames_them(
+    tmp_path: Path,
+) -> None:
+    target, stage, before, after = respelled_update(tmp_path)
+
+    plan = targets.plan_changes(str(target), str(stage), before, after)
+    targets.apply_plan(plan)
+
+    # The old names are removed before the new ones are made.
+    assert plan.unlink == ("docs/Guide/a.md", "docs/testing.md")
+    assert plan.rmdir == ("docs/Guide",)
+    assert plan.mkdir == ("docs/guide",)
+    assert sorted(os.listdir(target / "docs")) == ["Testing.md", "guide"]
+    assert sorted(os.listdir(target / "docs" / "guide")) == ["a.md", "b.md"]
+    assert targets.snapshot(str(target), skip_top=()) == after
+    assert targets.applied_problem(str(target), before, after) is None
+
+
+def test_plan_changes_with_a_respelled_directory_that_holds_the_owners_file_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    target, stage, before, after = respelled_update(tmp_path)
+    (target / "docs" / "Guide" / "mine.md").write_text("the owner's\n", "utf-8")
+    untouched = support.tree_digest(target)
+    if not folds_case(tmp_path):
+        # Two spellings are two directories here: the old one simply stays.
+        targets.apply_changes(str(target), str(stage), before, after)
+        assert sorted(os.listdir(target / "docs")) == ["Guide", "Testing.md", "guide"]
+        return
+
+    with pytest.raises(targets.Conflict, match="docs/Guide: holds something"):
+        targets.plan_changes(str(target), str(stage), before, after)
+
+    assert support.tree_digest(target) == untouched
+
+
+@pytest.mark.parametrize("first", ["a-file", "a-directory"])
+def test_apply_changes_with_a_name_that_changes_its_case_and_its_kind_writes_it(
+    tmp_path: Path, first: str
+) -> None:
+    # Both at once: `Notes` the file becomes `notes/` the directory, or the
+    # other way round.
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    for root in (target, stage):
+        root.mkdir()
+        if first == "a-file":
+            (root / "Notes").write_text("a file\n", encoding="utf-8")
+        else:
+            (root / "Notes").mkdir()
+            (root / "Notes" / "inner.md").write_text("inside\n", encoding="utf-8")
+    before = targets.snapshot(str(stage), skip_top=())
+    if first == "a-file":
+        (stage / "Notes").unlink()
+        (stage / "notes").mkdir()
+        (stage / "notes" / "inner.md").write_text("inside\n", encoding="utf-8")
+    else:
+        shutil.rmtree(stage / "Notes")
+        (stage / "notes").write_text("a file\n", encoding="utf-8")
+    after = targets.snapshot(str(stage), skip_top=())
+
+    targets.apply_changes(str(target), str(stage), before, after)
+
+    assert os.listdir(target) == ["notes"]
+    assert targets.snapshot(str(target), skip_top=()) == after
+    assert targets.applied_problem(str(target), before, after) is None
+
+
+def test_plan_changes_never_writes_a_new_name_onto_one_that_stays(
+    tmp_path: Path,
+) -> None:
+    # Two names an update keeps that are one on this disk: writing the new
+    # one would replace the other's content.
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    for root in (target, stage):
+        root.mkdir()
+        (root / "notes.md").write_text("kept\n", encoding="utf-8")
+    before = targets.snapshot(str(stage), skip_top=())
+    kept = before["notes.md"]
+    after = {**before, "Notes.md": kept}
+    untouched = support.tree_digest(target)
+
+    with pytest.raises(targets.Conflict, match="is the same name as notes.md"):
+        targets.plan_changes(str(target), str(stage), before, after)
+
+    assert support.tree_digest(target) == untouched
+
+
+def test_plan_changes_refuses_two_new_names_that_a_folding_disk_holds_as_one(
+    tmp_path: Path,
+) -> None:
+    # Both are new, so neither meets anything in the project: the second
+    # `mkdir` would be the first to find out, after the first was made.
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    target.mkdir()
+    (stage / "Docs").mkdir(parents=True)
+    for name in ("a.md", "b.md"):
+        (stage / "Docs" / name).write_text(f"{name}\n", encoding="utf-8")
+    one = targets.entry_at(str(stage / "Docs" / "a.md"))
+    two = targets.entry_at(str(stage / "Docs" / "b.md"))
+    assert one is not None and two is not None
+    directory = targets.Entry(targets.KIND_DIR)
+    after = {"Docs": directory, "Docs/a.md": one, "docs": directory, "docs/b.md": two}
+
+    with pytest.raises(targets.Conflict, match="is the same name as"):
+        targets.plan_changes(str(target), str(stage), {}, after)
+
+    assert list(target.iterdir()) == []
+
+
+def test_spelled_on_disk_is_not_misled_by_hard_links(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "Keep.md").write_text("kept\n", encoding="utf-8")
+    (target / "cafe\u0301.md").write_text("accented\n", encoding="utf-8")
+    stored = next(name for name in os.listdir(target) if name.startswith("caf"))
+    for number, name in enumerate(("Keep.md", stored)):
+        # The same file under names that sort before and after it.
+        os.link(target / name, target / f"A-link-{number}.md")
+        os.link(target / name, target / f"zz-link-{number}.md")
+    composed = "caf\u00e9.md"
+
+    assert targets.spelled_on_disk(str(target), "Keep.md") == "Keep.md"
+    if folds_case(tmp_path):
+        assert targets.spelled_on_disk(str(target), "keep.md") == "Keep.md"
+        assert targets.spelled_on_disk(str(target), "a-LINK-0.md") == "A-link-0.md"
+    if stored != composed and os.path.lexists(target / composed):
+        assert targets.spelled_on_disk(str(target), composed) == stored
+
+
+def test_applied_problem_sees_a_file_left_under_a_directory_that_was_respelled(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    (target / "docs").mkdir(parents=True)
+    (target / "docs" / "obsolete.md").write_text("old\n", encoding="utf-8")
+    old = targets.entry_at(str(target / "docs" / "obsolete.md"))
+    assert old is not None
+    directory = targets.Entry(targets.KIND_DIR)
+    before = {"Docs": directory, "Docs/obsolete.md": old}
+
+    problem = targets.applied_problem(str(target), before, {"docs": directory})
+
+    # Where the old name still answers, what answers is not the update's.
+    expected = "Docs/obsolete.md should be gone" if folds_case(tmp_path) else None
+    assert problem == expected
+
+
+def test_applied_problem_takes_a_name_in_another_case_for_gone(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "Testing.md").write_text("rules\n", encoding="utf-8")
+    new = targets.entry_at(str(target / "Testing.md"))
+    assert new is not None
+
+    problem = targets.applied_problem(
+        str(target), {"testing.md": new}, {"Testing.md": new}
+    )
+
+    assert problem is None
+    assert targets.spelled_on_disk(str(target), "Testing.md") == "Testing.md"
+    assert targets.spelled_on_disk(str(target), "absent.md") is None
+    if folds_case(tmp_path):
+        assert targets.spelled_on_disk(str(target), "testing.md") == "Testing.md"
+
+
+# --------------------------------------------------------------------------
+# What the job left, byte for byte: the rendered model lines included
+# --------------------------------------------------------------------------
+
+AGENT_REL = ".claude/agents/codex-debugger.md"
+AGENT_EDITS = ("the-frontmatter-model-line", "a-body-line")
+
+
+def test_fingerprint_has_an_exact_form_and_skips_only_the_frontmatter_model_line(
+    tmp_path: Path,
+) -> None:
+    dirs, stamp = (".claude/agents",), "stamp"
+    agent = tmp_path / ".claude" / "agents" / "deep.md"
+    agent.parent.mkdir(parents=True)
+    (tmp_path / stamp).write_text("1.0.0\n", encoding="utf-8")
+    rendered = "---\nname: deep\nmodel: one\n---\nbody\nmodel: a note in the body\n"
+
+    def digests(text: str) -> tuple[str, str]:
+        agent.write_text(text, encoding="utf-8")
+        loose = targets.fingerprint(str(tmp_path), dirs, (), stamp)
+        exact = targets.fingerprint(str(tmp_path), dirs, (), stamp, exact=True)
+        return loose, exact
+
+    start = digests(rendered)
+    another_model = digests(rendered.replace("model: one", "model: two"))
+    another_note = digests(rendered.replace("a note in", "another note in"))
+    no_frontmatter = digests("model: one\nbody\n"), digests("model: two\nbody\n")
+
+    # Against the approved template only the rendered line is left out...
+    assert another_model[0] == start[0]
+    assert another_note[0] != start[0]
+    assert no_frontmatter[0][0] != no_frontmatter[1][0]
+    # ...and against what the job left, nothing is.
+    assert len({start[1], another_model[1], another_note[1]}) == 3
+
+
+def keep_agents_out_of_git(project: Path) -> None:
+    """Stop tracking the agent definitions and have git ignore them: an edit
+    there never shows in ``git status``, and git cannot bring anything back."""
+    support.git(project, "rm", "-r", "--cached", "--quiet", ".claude/agents")
+    with (project / ".gitignore").open("a", encoding="utf-8") as handle:
+        handle.write(".claude/agents/\n")
+    commit_all(project, "keep the agent definitions out of git")
+
+
+@pytest.mark.parametrize("edit", AGENT_EDITS)
+def test_run_with_an_agent_definition_edited_where_git_does_not_look_leaves_it(
+    fork: support.Fork, edit: str
+) -> None:
+    project = adopted_project(fork)
+    keep_agents_out_of_git(project)
+    agent = project / AGENT_REL
+    text = agent.read_text(encoding="utf-8")
+    if edit == "the-frontmatter-model-line":
+        lines = text.splitlines(keepends=True)
+        index = next(i for i, line in enumerate(lines) if line.startswith("model:"))
+        owned = "".join(
+            [*lines[:index], "model: the-owners-choice\n", *lines[index + 1 :]]
+        )
+    else:
+        owned = text + "model: a line of the owner's own notes\n"
+    agent.write_text(owned, encoding="utf-8")
+    assert porcelain(project) == []
+    release(fork, RELEASE, "change a rule")
+    before = support.tree_digest(project)
+
+    result = distribute.run(fork.context())
+
+    assert states(fork) == {"alpha": "local-changes"}, detail_of(fork, "alpha")
+    assert result.exit_code == common.EXIT_NEEDS_OWNER
+    assert "not what the job left there" in detail_of(fork, "alpha")
+    assert "launchd.sh adopt" in detail_of(fork, "alpha")
+    assert agent.read_text(encoding="utf-8") == owned
+    assert support.tree_digest(project) == before
+    # The way out shows the file as one git cannot bring back, and asks.
+    code, said, prompts = adopt_project(fork, project, answer="no")
+    assert (code, len(prompts)) == (common.EXIT_OK, 1)
+    assert f"  change  {AGENT_REL}  (untracked)" in said
+    assert agent.read_text(encoding="utf-8") == owned
+
+
+def test_run_with_an_edit_saved_between_the_look_and_the_copy_leaves_it(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The project is compared with the record, then copied. What is saved in
+    # between is in the copy, so it is the copy that has to match the record.
+    project = adopted_project(fork)
+    keep_agents_out_of_git(project)
+    agent = project / AGENT_REL
+    owned = agent.read_text(encoding="utf-8") + "model: saved a moment too late\n"
+    release(fork, RELEASE, "change a rule")
+    real_copy = staging.copy_scope
+
+    def edit_then_copy(target: str, stage: str, rels: tuple[str, ...]) -> None:
+        agent.write_text(owned, encoding="utf-8")
+        real_copy(target, stage, rels)
+
+    monkeypatch.setattr(staging, "copy_scope", edit_then_copy)
+
+    result = distribute.run(fork.context())
+
+    assert states(fork) == {"alpha": "local-changes"}, detail_of(fork, "alpha")
+    assert result.exit_code == common.EXIT_NEEDS_OWNER
+    assert "not what the job left there" in detail_of(fork, "alpha")
+    assert agent.read_text(encoding="utf-8") == owned
+    assert (project / RULE_REL).read_text(encoding="utf-8") != RULE_TEXT
+
+
+def test_an_edit_saved_right_after_a_write_is_never_recorded_as_the_jobs_own(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The record keeps what was written, not what the project holds a moment
+    # later: otherwise the next revision would replace the owner's edit.
+    project = adopted_project(fork)
+    keep_agents_out_of_git(project)
+    agent = project / AGENT_REL
+    owned = agent.read_text(encoding="utf-8") + "model: saved right after\n"
+    release(fork, RELEASE, "change a rule")
+    real_check = targets.applied_problem
+
+    def check_then_edit(target: str, before: dict, after: dict) -> str | None:
+        problem = real_check(target, before, after)
+        agent.write_text(owned, encoding="utf-8")
+        return problem
+
+    monkeypatch.setattr(targets, "applied_problem", check_then_edit)
+    written = distribute.run(fork.context())
+    after_write = states(fork)
+    monkeypatch.undo()
+    commit_all(project, "take the update")
+    release(fork, {RULE_REL: NEWER_TEXT}, "change it again")
+
+    following = distribute.run(fork.context())
+
+    assert (written.result, after_write) == ("distributed", {"alpha": "updated"})
+    assert states(fork) == {"alpha": "local-changes"}, detail_of(fork, "alpha")
+    assert following.exit_code == common.EXIT_NEEDS_OWNER
+    assert agent.read_text(encoding="utf-8") == owned
+
+
+def test_run_after_a_model_bump_it_wrote_itself_takes_the_next_revision_unattended(
+    fork: support.Fork,
+) -> None:
+    # The record keeps what the job wrote, after the manifest tool rendered
+    # the model lines for this project: with an override, those are not the
+    # bytes of the approved template, and they are still the job's own.
+    project = adopted_project(fork)
+    override = {"schema_version": 1, "claude": {"agents": {"fable-advisor": "opus"}}}
+    (project / OVERRIDE_REL).write_text(json.dumps(override) + "\n", encoding="utf-8")
+    commit_all(project, "this project's own model for one agent")
+    for args in (["set", "claude.agents.codex-debugger", "fable"], ["apply"]):
+        support.run_models(fork.seed, args)
+    release(fork, {"VERSION": "9.9.8\n"}, "another model for one agent")
+
+    bumped = distribute.run(fork.context())
+    after_bump = states(fork)
+    rendered = {
+        name: (project / ".claude" / "agents" / f"{name}.md").read_text("utf-8")
+        for name in ("codex-debugger", "fable-advisor")
+    }
+    commit_all(project, "take the model bump")
+    release(fork, RELEASE, "change a rule")
+    following = distribute.run(fork.context())
+
+    assert (bumped.result, after_bump) == ("distributed", {"alpha": "updated"})
+    assert "\nmodel: fable\n" in rendered["codex-debugger"]
+    assert "\nmodel: opus\n" in rendered["fable-advisor"]
+    assert states(fork) == {"alpha": "updated"}, detail_of(fork, "alpha")
+    assert (following.result, following.exit_code) == ("distributed", common.EXIT_OK)
+    assert (project / RULE_REL).read_text(encoding="utf-8") == RULE_TEXT
+
+
+# --------------------------------------------------------------------------
+# Temporary files: removed by the record, never by the name
+# --------------------------------------------------------------------------
+
+
+def test_run_after_a_write_that_stopped_deletes_no_file_for_its_name(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Files named exactly like the job's temporary ones, committed by
+    # somebody: in the project root and in a directory the updater manages.
+    project = adopted_project(fork)
+    name = f"{targets.TEMP_PREFIX}0123456789abcdef{targets.TEMP_SUFFIX}"
+    lookalikes = [project / name, project / ".claude" / "docs" / name]
+    for path in lookalikes:
+        path.write_text("somebody's file\n", encoding="utf-8")
+    commit_all(project, "files named like the job's temporary ones")
+    release(fork, RELEASE, "change a rule")
+    real_replace, calls = os.replace, []
+
+    def replace_once(source: str, destination: str) -> None:
+        inside = destination.startswith(str(project))
+        calls.extend([destination] if inside else [])
+        if inside and len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_once)
+    failed = distribute.run(fork.context())
+    monkeypatch.undo()
+    recorded = record(fork)["adopted"][str(project)]["temporaries"]
+    killed = project / recorded[-1]
+    killed.write_text("half a file\n", encoding="utf-8")
+
+    again = distribute.run(fork.context())
+
+    assert failed.result == "target-failed"
+    assert (again.result, states(fork)) == ("needs-owner", {"alpha": "local-changes"})
+    assert not killed.exists()
+    for path in lookalikes:
+        assert path.read_text(encoding="utf-8") == "somebody's file\n"
+    assert not [line for line in porcelain(project) if name in line]
+    assert "removed 1 temporary files" in fork.log_file.read_text(encoding="utf-8")
+
+
+def test_remove_temporaries_takes_recorded_regular_files_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    target, outside = tmp_path / "target", tmp_path / "outside"
+    (target / "docs" / "linked").mkdir(parents=True)
+    outside.mkdir()
+
+    def name(number: int) -> str:
+        return f"{targets.TEMP_PREFIX}{number:016x}{targets.TEMP_SUFFIX}"
+
+    (target / name(1)).write_text("the job's\n", encoding="utf-8")
+    (target / "docs" / name(2)).write_text("the job's\n", encoding="utf-8")
+    (target / "docs" / name(3)).mkdir()
+    (outside / name(4)).write_text("outside\n", encoding="utf-8")
+    (target / "docs" / name(5)).symlink_to(outside / name(4))
+    (target / "docs" / name(6)).write_text("not recorded\n", encoding="utf-8")
+    (target / "docs" / "notes.md").write_text("an ordinary name\n", encoding="utf-8")
+    shutil.rmtree(target / "docs" / "linked")
+    (target / "docs" / "linked").symlink_to(outside)
+    recorded = (
+        name(1),
+        f"docs/{name(2)}",
+        f"docs/{name(3)}",
+        f"docs/{name(5)}",
+        "docs/notes.md",
+        f"docs/linked/{name(4)}",
+        f"../outside/{name(4)}",
+        f"{outside}/{name(4)}",
+        f"docs/{name(7)}",
+    )
+
+    removed = targets.remove_temporaries(str(target), recorded)
+
+    assert removed == (2, ())
+    assert sorted(path.name for path in target.iterdir()) == ["docs"]
+    assert sorted(path.name for path in (target / "docs").iterdir()) == sorted(
+        [name(3), name(5), name(6), "linked", "notes.md"]
+    )
+    assert (outside / name(4)).read_text(encoding="utf-8") == "outside\n"
+
+
+def test_remove_temporaries_reports_what_it_could_not_remove(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    (target / "docs").mkdir(parents=True)
+    held = f"docs/{targets.TEMP_PREFIX}{'a' * 16}{targets.TEMP_SUFFIX}"
+    gone = f"docs/{targets.TEMP_PREFIX}{'b' * 16}{targets.TEMP_SUFFIX}"
+    (target / held).write_text("half a file\n", encoding="utf-8")
+    (target / "docs").chmod(0o555)
+
+    try:
+        first = targets.remove_temporaries(str(target), (held, gone))
+    finally:
+        (target / "docs").chmod(0o755)
+    second = targets.remove_temporaries(str(target), first[1])
+
+    # What is still there stays in the record; what is not there leaves it.
+    assert first == (0, (held,))
+    assert second == (1, ())
+    assert not (target / held).exists()
+
+
+def test_a_file_already_at_a_temporary_name_stops_the_write_and_stays(
+    tmp_path: Path,
+) -> None:
+    target, stage = tmp_path / "target", tmp_path / "stage"
+    target.mkdir()
+    stage.mkdir()
+    (stage / "new.md").write_text("new\n", encoding="utf-8")
+    after = targets.snapshot(str(stage), skip_top=())
+    plan = targets.plan_changes(str(target), str(stage), {}, after)
+    taken = target / plan.temporaries[0]
+    taken.write_text("somebody's file\n", encoding="utf-8")
+
+    with pytest.raises(targets.Interrupted, match="FileExistsError"):
+        targets.apply_plan(plan)
+
+    assert taken.read_text(encoding="utf-8") == "somebody's file\n"
+    assert not (target / "new.md").exists()
+
+
+def test_adopt_keeps_recorded_temporary_files_for_the_same_repository_only(
+    fork: support.Fork,
+) -> None:
+    project = adopted_project(fork)
+    name = f"{targets.TEMP_PREFIX}{'c' * 16}{targets.TEMP_SUFFIX}"
+    path = fork.paths.state_dir / distribute.LEDGER_FILE
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["adopted"][str(project)]["temporaries"] = [name]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    release(fork, RELEASE, "change a rule")
+
+    again, said, _ = adopt_project(fork, project)
+    same_repository = record(fork)["adopted"][str(project)]["temporaries"]
+    commit_all(project, "take the update")
+    # Another clone takes the path: a file of that name there is not the
+    # job's, whatever the earlier record says.
+    project.rename(project.with_name("alpha-before"))
+    shutil.copytree(project.with_name("alpha-before"), project, symlinks=True)
+    release(fork, {RULE_REL: NEWER_TEXT}, "change it again")
+    other, said_other, _ = adopt_project(fork, project)
+
+    assert again == common.EXIT_OK, said
+    assert same_repository == [name]
+    assert other == common.EXIT_OK, said_other
+    assert record(fork)["adopted"][str(project)]["temporaries"] == []
+
+
+def test_a_record_that_could_not_be_written_is_not_kept_in_memory_either(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = adopted_project(fork)
+    book = ledger.Ledger(fork.paths)
+    kept = book.adoptions[str(project)]
+    marked = ledger.Adoption(**{**vars(kept), "interrupted": "f" * 40})
+
+    def no_space(*_args: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(common, "write_text_atomic", no_space)
+
+    with pytest.raises(OSError, match="No space left"):
+        book.put(str(project), marked)
+
+    # A later write of this object must not record a write that never began.
+    assert book.adoptions[str(project)] == kept
+
+
+def test_a_record_from_before_temporary_files_were_recorded_is_still_read(
+    fork: support.Fork,
+) -> None:
+    project = adopted_project(fork)
+    path = fork.paths.state_dir / distribute.LEDGER_FILE
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document["adopted"][str(project)]["temporaries"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    book = ledger.Ledger(fork.paths)
+
+    assert book.adoptions[str(project)].temporaries == ()
+
+
+# --------------------------------------------------------------------------
+# Directories the updater only makes sure exist
+# --------------------------------------------------------------------------
+
+
+def test_the_directories_the_updater_makes_are_the_ones_checked_in_a_project() -> None:
+    updater = support.REAL_UPDATER.read_text(encoding="utf-8").replace("\\\n", " ")
+    made: set[str] = set()
+    for line in updater.splitlines():
+        words = line.split()
+        if words[:2] == ["mkdir", "-p"]:
+            prefix = '"${PROJECT_ROOT}/'
+            made.update(
+                word[len(prefix) : -1] for word in words[2:] if word.startswith(prefix)
+            )
+
+    # `.claude` itself is on the way to every guarded path already.
+    assert made - {".claude"} == set(staging.MADE_DIRS)
+
+
+def test_layout_problem_wants_a_made_directory_to_be_one_or_absent(
+    tmp_path: Path,
+) -> None:
+    target, outside = tmp_path / "target", tmp_path / "outside"
+    (target / ".claude" / "logs" / ".git").mkdir(parents=True)
+    outside.mkdir()
+    made = (".claude/logs", ".claude/checkpoints", ".claude/docs/research")
+
+    def problem() -> str | None:
+        return targets.layout_problem(str(target), (), made)
+
+    plain = problem()
+    (target / ".claude" / "checkpoints").write_text("a file\n", encoding="utf-8")
+    a_file = problem()
+    (target / ".claude" / "checkpoints").unlink()
+    (target / ".claude" / "docs").symlink_to(outside)
+    linked_parent = problem()
+    (target / ".claude" / "docs").unlink()
+    (target / ".claude" / "docs").mkdir()
+    (target / ".claude" / "docs" / "research").symlink_to(outside)
+    linked = problem()
+
+    # What a project keeps inside one of them is its own business.
+    assert plain is None
+    assert a_file == "has a file where the directory .claude/checkpoints belongs"
+    assert linked_parent == "has a link at .claude/docs"
+    assert linked == "has a link at .claude/docs/research"
+
+
+@pytest.mark.parametrize(
+    ("rel", "shape"),
+    [
+        (".claude/logs", "a-link"),
+        (".claude/checkpoints", "a-file"),
+        (".claude/docs/research", "a-link"),
+    ],
+)
+def test_a_link_or_a_file_where_the_updater_makes_a_directory_is_refused_unasked(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch, rel: str, shape: str
+) -> None:
+    # Nothing can be written through it, and nothing has failed: the project
+    # has a shape its owner must change, and is told so before any question.
+    outside = outside_world(fork)
+    project = adopted_project(fork)
+    path = project / rel
+    if path.is_dir():
+        shutil.rmtree(path)
+    if shape == "a-link":
+        path.symlink_to(outside / "a-directory")
+        why = f"has a link at {rel}"
+    else:
+        path.write_text("not a directory\n", encoding="utf-8")
+        why = f"has a file where the directory {rel} belongs"
+    if porcelain(project):
+        commit_all(project, "an odd place for logs")
+    release(fork, RELEASE, "change a rule")
+    before, world = support.tree_digest(project), support.tree_digest(outside)
+    real_stage, prepared = staging.stage_update, []
+
+    def stage_and_note(*args: object) -> staging.Staged:
+        prepared.append(args[-1])
+        return real_stage(*args)
+
+    monkeypatch.setattr(staging, "stage_update", stage_and_note)
+
+    result = distribute.run(fork.context())
+    code, said, prompts = adopt_project(fork, project)
+
+    # Before any copy is made, and so before the updater runs on one.
+    assert prepared == []
+    assert states(fork) == {"alpha": "refused"}, detail_of(fork, "alpha")
+    assert result.exit_code == common.EXIT_NEEDS_OWNER
+    assert why in detail_of(fork, "alpha")
+    assert (code, prompts) == (common.EXIT_NEEDS_OWNER, [])
+    assert why in said
+    assert support.tree_digest(project) == before
+    assert support.tree_digest(outside) == world
+
+
+# --------------------------------------------------------------------------
+# A project that stays busy
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reason", ["a-stale-marker", "a-session-at-every-run"])
+def test_a_project_that_stays_busy_becomes_the_owners_in_time(
+    fork: support.Fork, reason: str
+) -> None:
+    day = common.SECONDS_PER_DAY
+    limit = distribute.WAITING_OVERDUE_DAYS
+    project = adopted_project(fork)
+    approved = release(fork, RELEASE, "change a rule")
+    slug = "".join(char if char.isalnum() else "-" for char in str(project))
+    session = Path(fork.env["HOME"], ".claude", "projects", slug, "session.jsonl")
+    marker = project / ".git" / "BISECT_LOG"
+
+    def run_at(now: float) -> common.StepResult:
+        if reason == "a-session-at-every-run":
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_text("{}\n", encoding="utf-8")
+            os.utime(session, (now - 60, now - 60))
+        return distribute.run(fork.context(now=now))
+
+    if reason == "a-stale-marker":
+        marker.write_text("git bisect start\n", encoding="utf-8")
+    before = support.tree_digest(project)
+    start = 1_800_000_000.0
+
+    first = run_at(start)
+    row = record(fork)["last"][0]
+    within = run_at(start + limit * day)
+    overdue = run_at(start + (limit + 1) * day)
+    detail = detail_of(fork, "alpha")
+
+    for result in (first, within):
+        assert (result.result, result.exit_code) == ("waiting", common.EXIT_OK)
+        assert result.counts == {"targets": 1, "busy": 1}
+    assert (row["state"], row["pending"], row["since"]) == ("busy", approved, start)
+    assert (overdue.result, overdue.exit_code) == (
+        "needs-owner",
+        common.EXIT_NEEDS_OWNER,
+    )
+    assert overdue.counts == {"targets": 1, "busy": 1, "overdue": 1}
+    assert f"waiting {limit + 1}.0 days" in detail
+    if reason == "a-stale-marker":
+        assert "delete a stale .git/BISECT_LOG" in detail
+    else:
+        assert "session wrote here within the hour" in detail
+    assert support.tree_digest(project) == before
+    status = ledger.status_lines(fork.paths)[1]
+    assert f"target busy  {project}  waits for {approved[:12]} since " in status
+    # The wait ends when the project is updated, and so does the clock.
+    marker.unlink(missing_ok=True)
+    session.unlink(missing_ok=True)
+    done = distribute.run(fork.context(now=start + (limit + 2) * day))
+    adoption = record(fork)["adopted"][str(project)]
+    assert done.result == "distributed"
+    assert (adoption["waiting_revision"], adoption["waiting_since"]) == ("", 0.0)
+
+
+# --------------------------------------------------------------------------
+# Without the sandbox
+# --------------------------------------------------------------------------
+
+
+def test_run_without_a_usable_sandbox_counts_it_in_the_detail_and_in_status(
+    fork: support.Fork,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = adopted_project(fork)
+    make_project(fork, "beta")
+    release(fork, RELEASE, "change a rule")
+    monkeypatch.setattr(staging, "SANDBOX", str(fork.root / "no-such-program"))
+    ctx = fork.context()
+
+    result = distribute.run(ctx)
+    maint_run.write_last_run(ctx, [result], result.exit_code)
+    for name, value in fork.env.items():
+        monkeypatch.setenv(name, value)
+    capsys.readouterr()
+    code = maint_run.cmd_status(fork.paths)
+    printed = capsys.readouterr().out
+
+    assert states(fork) == {"alpha": "updated", "beta": "not-adopted"}
+    assert (project / RULE_REL).read_text(encoding="utf-8") == RULE_TEXT
+    # First in the detail, so that a line that is cut never loses it.
+    assert result.detail.startswith("unsandboxed 1; ")
+    assert "no sandbox here" in fork.log_file.read_text(encoding="utf-8")
+    assert code == common.EXIT_OK
+    assert "\ndistribute: distributed (exit 0) unsandboxed 1; " in printed
+
+
+def test_run_that_starts_no_updater_reports_nothing_about_the_sandbox(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing new to write: the sandbox is not there, and it was not needed.
+    adopted_project(fork)
+    monkeypatch.setattr(staging, "SANDBOX", str(fork.root / "no-such-program"))
+
+    result = distribute.run(fork.context())
+
+    assert (result.result, states(fork)) == ("up-to-date", {"alpha": "up-to-date"})
+    assert "unsandboxed" not in result.detail
