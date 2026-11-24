@@ -15,8 +15,11 @@ updater never runs there at all, see ``staging.py``). What this module adds:
 * **A write is planned whole, then made** (:func:`plan_changes`,
   :func:`apply_plan`). The plan fails, with nothing written, unless every path
   it touches is right now what the update was prepared from and every step of
-  it is possible. Files go in beside their destination under a name nobody
-  can predict and are renamed into place; no git command runs. What fails
+  it is possible. A file may become a directory and a directory a file, and a
+  name may change in nothing but its case: the old entry goes before the new
+  one is made. Files go in beside their destination under a name nobody can
+  predict, which is part of the plan so that it can be recorded before the
+  file exists, and are renamed into place; no git command runs. What fails
   after the first change is reported as an interrupted write, never as "not
   written".
 
@@ -30,10 +33,12 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
 
 import common
+import promote
 
 REGISTRY_FILE = "targets.txt"
 GIT_DIR = ".git"
@@ -56,6 +61,7 @@ JUNK_FILES = (".DS_Store",)
 JUNK_SUFFIXES = (".pyc",)
 AGENT_FILE_RE = re.compile(r"\.claude/agents/[^/]+\.md")
 MODEL_LINE_PREFIX = b"model:"
+FRONTMATTER_FENCE = b"---"
 
 KIND_FILE, KIND_LINK, KIND_DIR, KIND_OTHER = "file", "link", "dir", "other"
 EXEC_BITS = 0o111
@@ -183,25 +189,36 @@ def recent_session(target: str, home: str, now: float) -> bool:
     return newest is not None and now - newest < SESSION_QUIET_SEC
 
 
-def layout_problem(target: str, rels: tuple[str, ...]) -> str | None:
+def layout_problem(
+    target: str, rels: tuple[str, ...], made: tuple[str, ...] = ()
+) -> str | None:
     """Why the updater's paths cannot be written here: one of them, or a
     directory on the way to it, is a link or holds a repository of its own.
-    None when every one is a plain chain of directories below the target."""
-    for rel in rels:
+    None when every one is a plain chain of directories below the target.
+
+    ``made`` are directories the updater only makes sure exist. They are not
+    copied, so this is the one place their shape is looked at: each must be a
+    directory or absent. What is inside one is not the job's business.
+    """
+    for rel, is_made in [*((r, False) for r in rels), *((m, True) for m in made)]:
         current = target
         parts = rel.split("/")
         for index, part in enumerate(parts):
             current = os.path.join(current, part)
             shown = "/".join(parts[: index + 1])
+            last = index == len(parts) - 1
             if os.path.islink(current):
                 return f"has a link at {shown}"
             if not os.path.lexists(current):
                 break
-            if os.path.isdir(current):
+            if not os.path.isdir(current):
+                if is_made and last:
+                    return f"has a file where the directory {shown} belongs"
+                if not last:
+                    return f"has something that is not a directory at {shown}"
+            elif not (is_made and last):
                 if os.path.lexists(os.path.join(current, GIT_DIR)):
                     return f"has a repository of its own at {shown}"
-            elif index < len(parts) - 1:
-                return f"has something that is not a directory at {shown}"
     return None
 
 
@@ -230,11 +247,17 @@ def is_junk(rel: str) -> bool:
 
 
 def _file_digest(path: str, without_model_line: bool) -> str:
+    """The digest of a file's bytes; ``without_model_line`` leaves out the
+    ``model:`` lines of a frontmatter block the file opens with, and nothing
+    after that block."""
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         if without_model_line:
-            for line in handle:
-                if not line.startswith(MODEL_LINE_PREFIX):
+            inside = False
+            for number, line in enumerate(handle):
+                fence = line.rstrip(b"\r\n") == FRONTMATTER_FENCE
+                inside = fence if number == 0 else inside and not fence
+                if not (inside and line.startswith(MODEL_LINE_PREFIX)):
                     digest.update(line)
         else:
             for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
@@ -286,20 +309,30 @@ def snapshot(root: str, skip_top: tuple[str, ...] = (GIT_DIR,)) -> dict[str, Ent
 
 
 def fingerprint(
-    root: str, dirs: tuple[str, ...], files: tuple[str, ...], version_rel: str
+    root: str,
+    dirs: tuple[str, ...],
+    files: tuple[str, ...],
+    version_rel: str,
+    exact: bool = False,
 ) -> str:
     """One digest of the template-owned content below ``root``: every file
     and link under ``dirs``, each of ``files``, and the version stamp.
 
     The lists themselves are part of it, so a path that becomes template-owned
-    changes the digest. Left out: files that appear by themselves (bytecode,
-    Finder's index) and the ``model:`` line of an agent definition, which the
-    manifest tool renders per project.
+    changes the digest. Files that appear by themselves (bytecode, Finder's
+    index) are always left out.
+
+    There are two digests, for two questions. "Is this the approved
+    template?" cannot count the ``model:`` line in the frontmatter of an agent
+    definition, which the manifest tool renders per project: that is the
+    default. "Is this still what the job left here?" counts every byte
+    (``exact``), so that no edit of the owner's, to that line or to any
+    other, is ever taken for the job's own output.
     """
     lines = ["dirs\0" + "\0".join(dirs), "files\0" + "\0".join(files)]
 
     def record(name: str, entry: Entry | None) -> None:
-        if entry is not None and entry.kind == KIND_FILE:
+        if not exact and entry is not None and entry.kind == KIND_FILE:
             if AGENT_FILE_RE.fullmatch(name) is not None:
                 entry = entry_at(os.path.join(root, name), without_model_line=True)
         if entry is not None and entry.kind != KIND_DIR:
@@ -335,14 +368,68 @@ def changed_paths(before: dict[str, Entry], after: dict[str, Entry]) -> list[str
     )
 
 
-def _require_real_parents(target: str, rel: str) -> None:
-    current = target
+def _require_real_parents(
+    target: str, rel: str, making: AbstractSet[str] = frozenset()
+) -> None:
+    """Raise unless every directory on the way to ``rel`` is a real one.
+    ``making`` are paths the same plan makes a directory before it writes
+    below them, where a file answers now: such a parent is checked as a path
+    of its own, and nothing can be below it yet."""
+    current, walked = target, ""
     for part in rel.split("/")[:-1]:
         current = os.path.join(current, part)
+        walked = f"{walked}/{part}" if walked else part
         if os.path.islink(current):
             raise Conflict(f"{rel}: a directory on the way to it is a link")
         if os.path.lexists(current) and not os.path.isdir(current):
+            if walked in making:
+                return
             raise Conflict(f"{rel}: a parent of it is not a directory")
+
+
+def spelled_on_disk(target: str, rel: str) -> str | None:
+    """``rel`` as the directories on the way to it really spell it; None when
+    nothing is there. On a volume that folds case a path answers to more
+    spellings than the one it has, so "is something at this path?" cannot tell
+    a name the update adds from the name it takes away."""
+    current, found = target, []
+    for part in rel.split("/"):
+        try:
+            names = os.listdir(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if part not in names:
+            other = _answering_name(current, part, names)
+            if other is None:
+                return None
+            part = other
+        found.append(part)
+        current = os.path.join(current, part)
+    return "/".join(found)
+
+
+def _answering_name(directory: str, name: str, names: list[str]) -> str | None:
+    """The entry of ``directory`` that answers to ``name`` without being
+    spelled like it; None when none does."""
+    try:
+        wanted = os.lstat(os.path.join(directory, name))
+    except OSError:
+        return None
+    same: list[str] = []
+    for other in names:
+        try:
+            if os.path.samestat(os.lstat(os.path.join(directory, other)), wanted):
+                same.append(other)
+        except OSError:
+            continue
+    # Two hard links are one file under two names: the one meant is the one
+    # that reads the same. When that does not single one out, nothing is
+    # said to answer, and the caller treats the name as taken by a stranger.
+    wanted_name = promote.casefold_path(name)
+    folded = [other for other in same if promote.casefold_path(other) == wanted_name]
+    if len(folded) == 1:
+        return folded[0]
+    return same[0] if len(same) == 1 else None
 
 
 def _file_mode(destination: str, executable: bool) -> int:
@@ -355,20 +442,26 @@ def _file_mode(destination: str, executable: bool) -> int:
     return base | ((base & READ_BITS) >> 2) if executable else base
 
 
-def _temporary(destination: str) -> str:
+def _temporary(rel: str) -> str:
+    """A name beside ``rel`` that nobody can predict, for the file that is
+    written first and then renamed onto it."""
     name = f"{TEMP_PREFIX}{secrets.token_hex(TEMP_TOKEN_BYTES)}{TEMP_SUFFIX}"
-    return os.path.join(os.path.dirname(destination), name)
+    return f"{rel.rpartition('/')[0]}/{name}".lstrip("/")
 
 
-def _place(source: str, destination: str, executable: bool) -> None:
-    """Put one prepared file in place: written beside the destination under a
-    name nobody can predict, then renamed over it. However this ends, by an
-    error or an interrupt, the temporary file does not stay behind."""
-    temporary = _temporary(destination)
+def _place(source: str, destination: str, executable: bool, temporary: str) -> None:
+    """Put one prepared file in place: written beside the destination under
+    the name the plan chose for it, then renamed over it. However this ends,
+    by an error or an interrupt, the temporary file does not stay behind;
+    after a kill it does, and its name is in the record (see
+    :func:`remove_temporaries`). A file that is already there under that name
+    is not this call's: the write fails and the file stays."""
+    created = False
     try:
         mode = _file_mode(destination, executable)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         descriptor = os.open(temporary, flags, common.PRIVATE_FILE_MODE)
+        created = True
         try:
             with open(source, "rb") as handle:
                 for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
@@ -378,7 +471,7 @@ def _place(source: str, destination: str, executable: bool) -> None:
             os.close(descriptor)
         os.replace(temporary, destination)
     finally:
-        if os.path.lexists(temporary):
+        if created and os.path.lexists(temporary):
             os.unlink(temporary)
 
 
@@ -386,17 +479,24 @@ def _place(source: str, destination: str, executable: bool) -> None:
 class Plan:
     """Every change one update makes to a project, in the order it is made:
     files that go away, emptied directories from the deepest up, new
-    directories from the top down, then the files to put in place."""
+    directories from the top down, then the files to put in place, each as
+    (path, executable, the temporary name it is written under first)."""
 
     target: str
     stage: str
     unlink: tuple[str, ...]
     rmdir: tuple[str, ...]
     mkdir: tuple[str, ...]
-    place: tuple[tuple[str, bool], ...]
+    place: tuple[tuple[str, bool, str], ...]
 
     def __bool__(self) -> bool:
         return bool(self.unlink or self.rmdir or self.mkdir or self.place)
+
+    @property
+    def temporaries(self) -> tuple[str, ...]:
+        """Every file this plan creates beside the ones it places. They are
+        chosen here so that they can be recorded before the first exists."""
+        return tuple(temporary for _, _, temporary in self.place)
 
 
 def plan_changes(
@@ -408,18 +508,59 @@ def plan_changes(
     Raises :class:`Conflict` unless every path that differs between the two
     snapshots is, right now, what ``before`` recorded; every prepared file is
     what ``after`` recorded; and every directory that has to make room for a
-    file holds nothing but what the update removes.
+    file, or for the same name in another case, holds nothing but what the
+    update removes.
+
+    Three shapes need more than "compare, then write". A file that becomes a
+    directory is in the way of everything the update puts below it: it is
+    checked as a path of its own, and goes first. A directory that becomes a
+    file goes last of what is removed. A name that changes only in its case
+    is, on a volume that folds case, already "there" under its old spelling:
+    it counts as absent when the entry that answers to it is one the update
+    removes, and that removal comes before anything is created.
     """
     changed = changed_paths(before, after)
     directory = Entry(KIND_DIR)
+    # Two names the result keeps that a folding disk holds as one cannot both
+    # be written. Said here, for any disk, before anything is looked at: the
+    # second `mkdir` or rename would otherwise find it out after the first.
+    # The comparison is promotion's own; it approximates what such disks do,
+    # and is used to refuse early, never to allow.
+    spellings: dict[str, list[str]] = {}
+    for rel in sorted(after):
+        spellings.setdefault(promote.casefold_path(rel), []).append(rel)
+    for rel in changed:
+        folded = spellings.get(promote.casefold_path(rel), [])
+        twins = [name for name in folded if name != rel]
+        if rel in after and twins:
+            why = f"is the same name as {twins[0]} on a disk that folds case"
+            raise Conflict(f"{rel}: {why}, and the update keeps both")
+    # Where the update makes a directory and a file is in the way: one it
+    # replaces under the same name, or (added below) under another case.
+    making = {
+        rel
+        for rel in changed
+        if rel in before and before[rel] != directory and after.get(rel) == directory
+    }
     # Directories the update made that the project already has: the updater
     # creates a few it never fills, and those were not staged from.
     present: set[str] = set()
+    # A new name -> the entry that answers to it now and goes in this update.
+    respelled: dict[str, str] = {}
     for rel in changed:
         wanted, now = after.get(rel), entry_at(os.path.join(target, rel))
         if wanted is not None and wanted.kind not in (KIND_FILE, KIND_DIR):
             raise Conflict(f"{rel}: the update produced something that is not a file")
-        _require_real_parents(target, rel)
+        _require_real_parents(target, rel, making)
+        if before.get(rel) is None and now is not None:
+            other = spelled_on_disk(target, rel)
+            if other is not None and other != rel and other in before:
+                if other in after:
+                    why = f"is the same name as {other} on this disk, which stays"
+                    raise Conflict(f"{rel}: {why}")
+                respelled[rel] = other
+                making.add(rel)
+                now = None
         if before.get(rel) is None and wanted == directory and now == directory:
             present.add(rel)
         elif now != before.get(rel):
@@ -457,11 +598,18 @@ def plan_changes(
             kept.append(rel)
         else:
             rmdir.append(rel)
+    for other in respelled.values():
+        # The old spelling must really go, or the new one would be written
+        # into it, or onto it.
+        if before[other] == directory and other not in rmdir:
+            raise Conflict(f"{other}: holds something the update did not stage")
     mkdir = [
         rel for rel in changed if becomes(rel) == KIND_DIR and was(rel) != KIND_DIR
     ]
     place = [
-        (rel, after[rel].executable) for rel in changed if becomes(rel) == KIND_FILE
+        (rel, after[rel].executable, _temporary(rel))
+        for rel in changed
+        if becomes(rel) == KIND_FILE
     ]
     return Plan(target, stage, tuple(unlink), tuple(rmdir), tuple(mkdir), tuple(place))
 
@@ -481,10 +629,12 @@ def apply_plan(plan: Plan) -> None:
             path = os.path.join(plan.target, rel)
             os.mkdir(path)
             os.chmod(path, NEW_DIR_MODE)
-        for rel, executable in plan.place:
+        for rel, executable, temporary in plan.place:
             _require_real_parents(plan.target, rel)
             source = os.path.join(plan.stage, rel)
-            _place(source, os.path.join(plan.target, rel), executable)
+            destination = os.path.join(plan.target, rel)
+            beside = os.path.join(plan.target, temporary)
+            _place(source, destination, executable, beside)
     except (OSError, Conflict) as exc:
         raise Interrupted(f"{type(exc).__name__}: {exc}") from exc
 
@@ -497,32 +647,44 @@ def apply_changes(
     apply_plan(plan_changes(target, stage, before, after))
 
 
-def remove_leftovers(target: str, rels: tuple[str, ...]) -> int:
-    """Delete the temporary files a killed write of this job left under the
-    given paths, and beside them; return how many. Only names this module
-    makes up are touched, and no link is followed to find them."""
-    directories: set[str] = set()
-    for rel in rels:
-        try:
-            _require_real_parents(target, rel)
-        except Conflict:
+def remove_temporaries(
+    target: str, recorded: tuple[str, ...]
+) -> tuple[int, tuple[str, ...]]:
+    """Delete what a killed write of this job left behind, by the paths that
+    were recorded before the files were created. Returns how many files were
+    removed, and the recorded paths that still hold a file which could not
+    be: those stay in the record, for the next run.
+
+    Nothing is looked for by name: a file that merely looks like one of the
+    job's is somebody else's. A recorded path is removed only when it still
+    has the job's own kind of name, lies below the target behind real
+    directories, and is a regular file.
+    """
+    removed = 0
+    left: list[str] = []
+    for rel in recorded:
+        parts = rel.split("/")
+        plain = all(part not in ("", ".", "..") for part in parts)
+        if not plain or LEFTOVER_RE.fullmatch(parts[-1]) is None:
             continue
         path = os.path.join(target, rel)
-        directories.add(os.path.dirname(path))
-        if os.path.isdir(path) and not os.path.islink(path):
-            directories.update(found[0] for found in os.walk(path))
-    removed = 0
-    for folder in sorted(directories):
         try:
-            names = os.listdir(folder)
-        except OSError:
+            _require_real_parents(target, rel)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+        except (Conflict, FileNotFoundError, NotADirectoryError):
             continue
-        for name in names:
-            path = os.path.join(folder, name)
-            if LEFTOVER_RE.fullmatch(name) and not os.path.isdir(path):
-                os.unlink(path)
-                removed += 1
-    return removed
+        except OSError:
+            left.append(rel)
+            continue
+        try:
+            os.unlink(path)
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            left.append(rel)
+    return removed, tuple(left)
 
 
 def applied_problem(
@@ -535,6 +697,10 @@ def applied_problem(
             return f"{rel} is not what the update produced"
     for rel in sorted(set(before) - set(after)):
         left = entry_at(os.path.join(target, rel))
+        # On a volume that folds case, the new spelling of a name answers to
+        # the old one too. Gone means that what answers now is a path the
+        # update produced, which the loop above has already compared.
         if left is not None and left.kind != KIND_DIR:
-            return f"{rel} should be gone"
+            if spelled_on_disk(target, rel) not in after:
+                return f"{rel} should be gone"
     return None

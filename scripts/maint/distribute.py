@@ -16,7 +16,8 @@ that into the project, as uncommitted changes.
   uncommitted, a project that tracks the template waits until its owner
   commits: that is the state ``waiting-dirty``, reported with the revision
   that waits and since when. It is not an error, until it has lasted
-  ``WAITING_OVERDUE_DAYS``.
+  ``WAITING_OVERDUE_DAYS``. A project that is ``busy`` (git in the middle of
+  something, a session writing there) waits by the same clock.
 * **Never a commit.** The updater runs on a private copy of the paths it
   manages (``staging.py``). The difference between that copy before and after
   is carried into the project with plain file operations
@@ -27,11 +28,13 @@ that into the project, as uncommitted changes.
   The adoption is recorded outside the project (``ledger.py``), with the file
   system's own numbers for the directory and its repository.
 * **Its own output only.** A scheduled run replaces template-owned files only
-  while they are byte for byte what the job left there. Beyond them it creates
-  a missing seed file, and changes a settings file only when the documents
-  before and after differ in the manifest's model keys and in nothing else
-  (:func:`only_model_keys_differ`). Anything more (a migration, a deletion
-  outside the template's paths, a local edit) goes back to ``adopt``.
+  while they are byte for byte what the job left there: the record keeps a
+  digest of every byte, the rendered ``model:`` lines included. Beyond them
+  it creates a missing seed file, and changes a settings file only when the
+  documents before and after differ in the manifest's model keys and in
+  nothing else (:func:`only_model_keys_differ`). Anything more (a migration,
+  a deletion outside the template's paths, a local edit) goes back to
+  ``adopt``.
 
 Nothing of a project is executed: see ``target_git.py`` and ``staging.py``.
 
@@ -84,7 +87,7 @@ TARGET_STATES: dict[str, tuple[int, ...]] = {
     UNCOMMITTED: (common.EXIT_OK,),
     UPDATED: (common.EXIT_OK,),
     WAITING_DIRTY: (common.EXIT_OK, common.EXIT_NEEDS_OWNER),
-    BUSY: (common.EXIT_OK,),
+    BUSY: (common.EXIT_OK, common.EXIT_NEEDS_OWNER),
     NOT_ADOPTED: (common.EXIT_OK,),
     LOCAL_CHANGES: (common.EXIT_NEEDS_OWNER,),
     REFUSED: (common.EXIT_NEEDS_OWNER,),
@@ -102,8 +105,28 @@ WAITING_OVERDUE_DAYS = promote.PROMOTION_OVERDUE_DAYS
 JSON_MODEL_KEYS = ("model",)
 JSON_MODEL_ENV_KEYS = ("CLAUDE_CODE_SUBAGENT_MODEL", "CODEX_MODEL")
 TOML_MODEL_KEYS = ("model", "model_reasoning_effort")
-TOML_TABLE_RE = re.compile(r"\s*\[")
-TOML_MODEL_LINE_RE = re.compile(rf"\s*({'|'.join(TOML_MODEL_KEYS)})\s*=")
+TOML_MODEL_NAMES = "|".join(TOML_MODEL_KEYS)
+# A line ends at a line feed and nowhere else: a form feed or a Unicode line
+# separator is legal inside a string and must not start a "line" here.
+TOML_LINE_RE = re.compile(r"[^\n]*\n|[^\n]+")
+TOML_TABLE_RE = re.compile(r"[ \t]*\[")
+# The one spelling of a model line the manifest tool edits, and so the only
+# one that is left out of the comparison.
+TOML_MODEL_LINE_RE = re.compile(
+    rf'({TOML_MODEL_NAMES})[ \t]*=[ \t]*"[^"\\]*"[ \t]*(#.*)?'
+)
+# Any other way a line can name a model key: quoted, dotted, indented.
+TOML_LOOSE_MODEL_RE = re.compile(rf"""\s*["']?({TOML_MODEL_NAMES})["']?\s*[.=]""")
+# One name of a key: bare, a basic string, or a literal string.
+TOML_NAME = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
+# A whole line that is a table header, with its first name. A line that only
+# starts like one (inside a string further down) names no table.
+TOML_HEADER_RE = re.compile(
+    rf"[ \t]*\[\[?[ \t]*(?P<first>{TOML_NAME})(?:[ \t]*\.[ \t]*{TOML_NAME})*"
+    r"[ \t]*\]\]?[ \t]*(#.*)?"
+)
+TOML_KEY_NOISE_RE = re.compile(r"""[\s"']""")
+TOML_MULTILINE_QUOTES = ('"""', "'''")
 JSON_SUFFIX, TOML_SUFFIX = ".json", ".toml"
 
 HALF_WRITTEN_HELP = (
@@ -111,7 +134,15 @@ HALF_WRITTEN_HELP = (
     "them), then run launchd.sh adopt"
 )
 ADOPT_HINT = "run launchd.sh adopt for it"
+NOT_LEFT_WHY = "template-owned files are not what the job left there"
+JSON_NUMBER = "number"
 MOVED_WHY = "the project changed while the update was being prepared"
+# What to do about a wait that has lasted too long, by what the wait is for.
+DIRTY_ADVICE = "commit or clean the tree"
+MARKER_ADVICE = "finish or abort what git is doing there, or delete a stale .git/{}"
+SESSION_ADVICE = "it is never quiet when the job runs; run launchd.sh adopt for it"
+MOVED_ADVICE = "something keeps changing it; run launchd.sh adopt for it"
+COUNT_UNSANDBOXED = "unsandboxed"
 
 CREATE, CHANGE, DELETE = staging.CREATE, staging.CHANGE, staging.DELETE
 
@@ -121,11 +152,35 @@ CREATE, CHANGE, DELETE = staging.CREATE, staging.CHANGE, staging.DELETE
 # --------------------------------------------------------------------------
 
 
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """A JSON object, refusing a key that is there twice. The usual parser
+    keeps the last of them, so the others could be rewritten unseen."""
+    found: dict[str, object] = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError(f"duplicate key {key!r}")
+        found = {**found, key: value}
+    return found
+
+
+def _as_written(text: str) -> tuple[str, str]:
+    """A JSON number as the document spells it. Parsed, ``1`` equals ``true``
+    and two long fractions round to one float; spelled, neither does."""
+    return JSON_NUMBER, text
+
+
 def _json_without_models(text: str) -> object:
     """A settings document with the manifest's model values taken out; None
-    when it is not a JSON object."""
+    when it is not a JSON object, or holds a key twice at any depth. Numbers
+    stay as they are written."""
     try:
-        data = json.loads(text)
+        data = json.loads(
+            text,
+            object_pairs_hook=_unique_object,
+            parse_int=_as_written,
+            parse_float=_as_written,
+            parse_constant=_as_written,
+        )
     except ValueError:
         return None
     if not isinstance(data, dict):
@@ -139,27 +194,68 @@ def _json_without_models(text: str) -> object:
     return kept
 
 
-def _toml_without_models(text: str) -> str:
+def _toml_names_a_model_table(body: str) -> bool:
+    """Whether a table header's first name is a model key, or cannot be
+    compared with one (a quoted name with an escape in it)."""
+    header = TOML_HEADER_RE.fullmatch(body)
+    if header is None:
+        return False
+    first = header.group("first")
+    if first.startswith('"') and "\\" in first:
+        return True
+    return first.strip("\"'") in TOML_MODEL_KEYS
+
+
+def _toml_without_models(text: str) -> str | None:
     """A configuration file without its top-level model lines; every other
-    byte stays, so any other difference shows."""
+    byte stays, so any other difference shows.
+
+    None when a line cannot be told from a model line with certainty, by the
+    manifest tool's own rules and without a parser (Python 3.9 has none): a
+    multi-line string before the first table, which could hold a line that
+    only looks like one; a top-level key that is there twice, or spelled with
+    an escape, which could hide that it is; a model key spelled any other way
+    than ``key = "value"``; or a later table that carries a model key's name.
+    """
     kept: list[str] = []
+    seen: set[str] = set()
     top_level = True
-    for line in text.splitlines(keepends=True):
-        top_level = top_level and TOML_TABLE_RE.match(line) is None
-        if not (top_level and TOML_MODEL_LINE_RE.match(line)):
+    for line in TOML_LINE_RE.findall(text):
+        body = line.rstrip("\r\n")
+        if TOML_TABLE_RE.match(body):
+            top_level = False
+            if _toml_names_a_model_table(body):
+                return None
+        if not top_level or not body.strip() or body.lstrip().startswith("#"):
             kept.append(line)
+            continue
+        if any(quote in body for quote in TOML_MULTILINE_QUOTES):
+            return None
+        if "=" in body:
+            name = body.split("=", 1)[0]
+            key = TOML_KEY_NOISE_RE.sub("", name)
+            if key in seen or "\\" in name:
+                return None
+            seen.add(key)
+        if TOML_MODEL_LINE_RE.fullmatch(body):
+            continue
+        if TOML_LOOSE_MODEL_RE.match(body):
+            return None
+        kept.append(line)
     return "".join(kept)
 
 
 def only_model_keys_differ(rel: str, old: str, new: str) -> bool:
     """Whether two versions of a settings file differ in the manifest's model
     keys and in nothing else. False for a file of a kind not known here, and
-    for one that cannot be parsed."""
+    for one that cannot be read with certainty: not parsable, or holding a
+    key twice."""
     if rel.endswith(JSON_SUFFIX):
         before, after = _json_without_models(old), _json_without_models(new)
         return before is not None and before == after
     if rel.endswith(TOML_SUFFIX):
-        return _toml_without_models(old) == _toml_without_models(new)
+        was, now = _toml_without_models(old), _toml_without_models(new)
+        return was is not None and was == now
     return False
 
 
@@ -223,9 +319,17 @@ def write_update(
 
     The whole change is planned and proven possible first; then git is asked
     once more whether the project is still what ``seen`` describes. Only then
-    is the record marked ``interrupted`` and the first change made. From that
-    point on nothing reports "not written": the mark stays until every path
-    and the repository's own state have been checked.
+    is the record marked ``interrupted``, together with the name of every
+    temporary file the write is going to create, and the first change made.
+    From that point on nothing reports "not written": the mark stays until
+    every path and the repository's own state have been checked.
+
+    What the record keeps of the project afterwards is a digest of every byte
+    the job wrote, taken from the private copy after the manifest tool
+    rendered the model lines, and only once every path in the project has
+    been compared with that copy. A model bump the job itself wrote is its
+    own output on the next run; an edit saved in the project at any moment,
+    even right after the comparison, is not in the copy and stays the owner's.
     """
     target = git.target
     try:
@@ -235,7 +339,9 @@ def write_update(
     if target_git.git_state(git) != seen.state or target_git.dirt(git) != seen.dirt:
         return Visit(target, BUSY, f"{MOVED_WHY}; nothing was written")
     changed = len(staged.changes())
-    book.put(target, replace(adoption, interrupted=source.revision))
+    recorded = (*adoption.temporaries, *plan.temporaries)
+    marked = replace(adoption, interrupted=source.revision, temporaries=recorded)
+    book.put(target, marked)
     try:
         targets.apply_plan(plan)
         problem = targets.applied_problem(target, staged.before, staged.after)
@@ -250,7 +356,7 @@ def write_update(
         adoption,
         revision=source.revision,
         source_print=source.fingerprint,
-        target_print=source.fingerprint_of(target),
+        target_print=staged.after_print,
         updated_at=ctx.now,
         waiting_revision="",
         waiting_since=0.0,
@@ -262,27 +368,36 @@ def write_update(
     return Visit(target, UPDATED, f"{changed} paths changed, left uncommitted")
 
 
-def _waiting(
+def _held(
     ctx: common.Context,
     source: staging.Source,
     book: ledger.Ledger,
     target: str,
     adoption: Adoption,
-    dirt: target_git.Dirt,
+    found: tuple[str, str, str],
 ) -> Visit:
-    """A revision waits for a tree that is not clean. The wait is counted
-    from the first revision that had to wait, not from the newest."""
+    """A revision waits for this project: ``found`` is the state, why, and
+    what to do once it has lasted too long. The wait is counted from the
+    first revision that had to wait, not from the newest, and by one clock
+    whatever the project was waiting for on each run: a tree that is not
+    clean, git in the middle of something, a session writing there."""
+    state, detail, advice = found
     since = adoption.waiting_since if adoption.waiting_revision else ctx.now
     waiting = replace(adoption, waiting_revision=source.revision, waiting_since=since)
     if waiting != adoption:
         book.put(target, waiting)
     days = max(ctx.now - since, 0.0) / common.SECONDS_PER_DAY
     overdue = days > WAITING_OVERDUE_DAYS
+    if overdue:
+        detail = f"waiting {days:.1f} days: {advice}; {detail}"
+    return Visit(target, state, detail, source.revision, since, overdue)
+
+
+def _dirty(dirt: target_git.Dirt) -> tuple[str, str, str]:
+    """What a tree that is not clean is reported as."""
     first = [*dirt.visible, *dirt.hidden][0]
     detail = f"{dirt.summary()}; first: {target_git.shown(first)}"
-    if overdue:
-        detail = f"waiting {days:.1f} days: commit or clean the tree; {detail}"
-    return Visit(target, WAITING_DIRTY, detail, source.revision, since, overdue)
+    return WAITING_DIRTY, detail, DIRTY_ADVICE
 
 
 def visit_target(
@@ -293,8 +408,9 @@ def visit_target(
     name: str,
 ) -> Visit:
     """Decide what an adopted project needs, and do it when every guard
-    holds. Each early return leaves the project exactly as it was found
-    (an interrupted write's own temporary files apart)."""
+    holds. Each early return leaves the project exactly as it was found (the
+    temporary files a killed write of the job's own left there apart, and of
+    those only the ones whose paths were recorded before they existed)."""
     adoption = book.adoptions[target]
     problem = targets.path_problem(target, ctx.paths)
     if problem is not None:
@@ -304,11 +420,20 @@ def visit_target(
         return Visit(target, REFUSED, why)
     git = target_git.TargetGit(ctx, target)
     problem = target_git.repository_problem(git)
-    problem = problem or targets.layout_problem(target, source.guarded)
+    problem = problem or targets.layout_problem(
+        target, source.guarded, staging.MADE_DIRS
+    )
     if problem is not None:
         return Visit(target, REFUSED, problem)
+    if adoption.temporaries:
+        removed, left = targets.remove_temporaries(target, adoption.temporaries)
+        ctx.log.line(
+            f"distribute: removed {removed} temporary files of its own; "
+            f"{len(left)} could not be removed and stay recorded"
+        )
+        adoption = replace(adoption, temporaries=left)
+        book.put(target, adoption)
     if adoption.interrupted:
-        targets.remove_leftovers(target, source.scope(target))
         short = common.short_sha(adoption.interrupted)
         why = f"an update to {short} stopped half-way: {HALF_WRITTEN_HELP}"
         return Visit(target, LOCAL_CHANGES, why)
@@ -316,7 +441,7 @@ def visit_target(
     if state is None or dirt is None:
         return Visit(target, FAILED, "git could not report on the project")
 
-    have = source.fingerprint_of(target)
+    have = source.left_print_of(target)
     if adoption.source_print == source.fingerprint:
         # Nothing new to write: the job last wrote this very template here
         # (the approved SHA may still have moved, by a promotion that ships
@@ -330,23 +455,33 @@ def visit_target(
         note = "template files differ from what the job left" if differs else ""
         return Visit(target, UNCOMMITTED if dirt else UP_TO_DATE, note)
     if dirt:
-        return _waiting(ctx, source, book, target, adoption, dirt)
+        return _held(ctx, source, book, target, adoption, _dirty(dirt))
     marker = targets.operation_in_progress(target)
     if marker is not None:
-        return Visit(target, BUSY, f"git is in the middle of something ({marker})")
+        why = f"git is in the middle of something (.git/{marker})"
+        found = (BUSY, why, MARKER_ADVICE.format(marker))
+        return _held(ctx, source, book, target, adoption, found)
     if targets.recent_session(target, ctx.env.get("HOME", ""), ctx.now):
-        return Visit(target, BUSY, "a Claude Code session wrote here within the hour")
+        why = "a Claude Code session wrote here within the hour"
+        return _held(ctx, source, book, target, adoption, (BUSY, why, SESSION_ADVICE))
     if have != adoption.target_print:
-        why = "template-owned files are not what the job left there"
-        return Visit(target, LOCAL_CHANGES, f"{why}; {ADOPT_HINT}")
+        return Visit(target, LOCAL_CHANGES, f"{NOT_LEFT_WHY}; {ADOPT_HINT}")
     try:
         staged = staging.stage_update(ctx, source, target, name)
     except staging.StageProblem as exc:
         return Visit(target, REFUSED if exc.refused else FAILED, exc.detail)
+    if staged.before_print != adoption.target_print:
+        # Saved between the look above and the copy: the copy is what the
+        # update is prepared from, so the copy is what has to be the job's.
+        return Visit(target, LOCAL_CHANGES, f"{NOT_LEFT_WHY}; {ADOPT_HINT}")
     problem = unattended_problem(source, staged, target)
     if problem is not None:
         return Visit(target, LOCAL_CHANGES, f"{problem}; {ADOPT_HINT}")
-    return write_update(ctx, source, book, git, adoption, staged, Seen(state, dirt))
+    visit = write_update(ctx, source, book, git, adoption, staged, Seen(state, dirt))
+    if visit.state == BUSY:
+        found = (BUSY, visit.detail, MOVED_ADVICE)
+        return _held(ctx, source, book, target, adoption, found)
+    return visit
 
 
 def _guarded_visit(
@@ -394,7 +529,16 @@ def _aside_note(asides: list[Path]) -> str:
     )
 
 
-def _summary(visits: list[Visit], asides: list[Path]) -> common.StepResult:
+def _unsandboxed_note(unsandboxed: int) -> str:
+    """The first words of the step's detail when the updater ran without the
+    kernel sandbox: on how many private copies. ``status`` prints the detail,
+    and a line that is cut is cut at its end."""
+    return f"{COUNT_UNSANDBOXED} {unsandboxed}" if unsandboxed else ""
+
+
+def _summary(
+    visits: list[Visit], asides: list[Path], unsandboxed: int = 0
+) -> common.StepResult:
     counts = {COUNT_TARGETS: len(visits)}
     for visit in visits:
         counts = {**counts, visit.state: counts.get(visit.state, 0) + 1}
@@ -419,7 +563,8 @@ def _summary(visits: list[Visit], asides: list[Path]) -> common.StepResult:
         + (f" ({visit.detail})" if visit.detail else "")
         for visit in visits
     ]
-    detail = "; ".join([line for line in [_aside_note(asides), *lines] if line])
+    notes = [_unsandboxed_note(unsandboxed), _aside_note(asides), *lines]
+    detail = "; ".join([line for line in notes if line])
     return _result(result, worst, detail, counts)
 
 
@@ -455,12 +600,14 @@ def run(ctx: common.Context) -> common.StepResult:
             found[entry] = Visit(entry, NOT_ADOPTED, ADOPT_HINT)
     adopted = [entry for entry in entries if entry not in found]
     failure = ""
+    unsandboxed = 0
     if adopted:
         try:
             with staging.open_source(ctx, approved) as source:
                 for index, entry in enumerate(adopted):
                     name = f"stage-{index}"
                     found[entry] = _guarded_visit(ctx, source, book, entry, name)
+                unsandboxed = len(source.unfenced)
         except staging.SourceError as exc:
             failure = str(exc)
     unvisited = Visit("", FAILED, f"not visited: {failure}")
@@ -470,4 +617,4 @@ def run(ctx: common.Context) -> common.StepResult:
         ctx.log.line(f"distribute: {visit.state}: {visit.target} {visit.detail}")
     if failure:
         return _result("source-failed", common.EXIT_FAILED, failure)
-    return _summary(visits, asides)
+    return _summary(visits, asides, unsandboxed)
