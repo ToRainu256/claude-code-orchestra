@@ -31,7 +31,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # The macOS runner takes about 20 minutes for the full suite (2,695 tests
+    # on 2026-11-24); the limit leaves room for growth without letting a hung
+    # job run for the default six hours.
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
