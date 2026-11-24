@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
-"""What the distribution step may learn about an installed project, and the
-only code that writes into one.
+"""An installed project as files: where it is, what it holds, and the only
+code that writes into one.
 
 A target is somebody's working repository. Everything in it is treated as
-hostile until shown otherwise, and four rules follow from that:
+hostile until shown otherwise (git there is ``target_git.py``'s business; the
+updater never runs there at all, see ``staging.py``). What this module adds:
 
-* **Nothing of the target is executed.** git runs there through
-  :class:`TargetGit` only: five reading subcommands, the job's hardened
-  options and environment, no optional index refresh, no lazy fetch, no
-  transport. Before any command that looks at the work tree, the repository's
-  own configuration must consist of keys from a list of inert ones
-  (:func:`config_problem`): a filter, a diff driver, an include or a promisor
-  remote there is a refusal, not a risk to weigh. The updater itself never
-  runs in a target; it runs on a private copy, and :func:`apply_changes`
-  carries the result over.
-* **git state is never written.** No function here can commit, stage, stash,
-  reset or check out. :func:`git_state` hashes ``HEAD``, the index and the ref
-  list so the caller can prove that afterwards.
-* **Writes stay inside the project.** Every path written is checked, part by
-  part, to be a real directory chain below the target: a link or a nested
-  repository on the way is a refusal. Files are staged beside their
-  destination under an unpredictable name and renamed into place.
-* **Nothing is replaced blind.** :func:`apply_changes` first compares every
-  path it is about to touch with what was staged from, and changes nothing
-  when one differs.
+* **The path is vetted before anything else** (:func:`path_problem`,
+  :func:`layout_problem`): a real directory with a repository of its own,
+  outside the job's directory, with no link and no nested repository on the
+  way to a path the updater manages.
+* **Content is compared, never assumed** (:func:`snapshot`,
+  :func:`fingerprint`): by bytes, without following a link.
+* **A write is planned whole, then made** (:func:`plan_changes`,
+  :func:`apply_plan`). The plan fails, with nothing written, unless every path
+  it touches is right now what the update was prepared from and every step of
+  it is possible. Files go in beside their destination under a name nobody
+  can predict and are renamed into place; no git command runs. What fails
+  after the first change is reported as an interrupted write, never as "not
+  written".
 
 Standard library only; runs on Python 3.9.
 """
@@ -34,7 +29,6 @@ import hashlib
 import os
 import re
 import secrets
-import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,79 +37,11 @@ import common
 
 REGISTRY_FILE = "targets.txt"
 GIT_DIR = ".git"
-STATUS_TIMEOUT_SEC = 300
 HASH_CHUNK = 1 << 20
-
-# The only git subcommands ever run in a target. All of them read.
-READ_COMMANDS = ("rev-parse", "config", "status", "ls-files", "for-each-ref")
-# On top of the job's own options: `git status` never summarises submodules
-# (that runs git inside them), and nothing refreshes the index as a side effect.
-TARGET_GIT_OPTIONS = (
-    "-c", "status.submoduleSummary=false",
-    "-c", "diff.autoRefreshIndex=false",
-)  # fmt: skip
-# No optional lock (so no index rewrite), no fetch of a missing object, and no
-# transport of any kind: the protocol list names none that exists.
-TARGET_GIT_ENV = {
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_NO_LAZY_FETCH": "1",
-    "GIT_ALLOW_PROTOCOL": "none",
-}
-COMMAND_SCOPE = "command"
-
-EVERY = frozenset({"*"})
-NONE: frozenset[str] = frozenset()
-# section -> (variables allowed without a subsection, with a subsection).
-# A key is on this list because no reading command acts on it by running a
-# program or by reading outside the repository. `core.hooksPath` and
-# `core.fsmonitor` are here because the command line overrides both.
-INERT_CONFIG: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "core": (
-        frozenset(
-            {
-                "repositoryformatversion", "filemode", "bare", "logallrefupdates",
-                "ignorecase", "precomposeunicode", "symlinks", "autocrlf", "eol",
-                "safecrlf", "quotepath", "trustctime", "checkstat", "preloadindex",
-                "untrackedcache", "hookspath", "fsmonitor", "sparsecheckout",
-                "sparsecheckoutcone", "abbrev", "compression", "excludesfile",
-                "splitindex", "sharedrepository", "commitgraph", "multipackindex",
-            }
-        ),
-        NONE,
-    ),
-    "remote": (
-        frozenset({"pushdefault"}),
-        frozenset(
-            {
-                "url", "pushurl", "fetch", "push", "tagopt", "prune", "prunetags",
-                "mirror", "skipdefaultupdate", "skipfetchall", "gh-resolved",
-            }
-        ),
-    ),
-    "submodule": (
-        frozenset({"recurse", "active", "fetchjobs"}),
-        frozenset({"url", "active", "branch", "update", "ignore"}),
-    ),
-    "extensions": (frozenset({"worktreeconfig", "objectformat", "refstorage"}), NONE),
-    "merge": (EVERY, NONE),
-    **{
-        name: (EVERY, EVERY)
-        for name in ("branch", "color", "gc", "maintenance", "lfs", "gpg")
-    },
-    **{
-        name: (EVERY, NONE)
-        for name in (
-            "user", "author", "committer", "pull", "push", "fetch", "init", "rebase",
-            "commit", "tag", "column", "advice", "gui", "github", "log", "format",
-            "status", "index", "pack", "stash", "checkout", "switch", "clean",
-            "rerere", "repack", "feature", "commitgraph", "receive",
-        )
-    },
-}  # fmt: skip
 
 # Present in the repository while git is in the middle of something.
 GIT_OPERATION_MARKERS = (
-    "rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+    "rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "CHERRY_PICK_HEAD",
     "REVERT_HEAD", "BISECT_LOG", "index.lock",
 )  # fmt: skip
 SESSION_QUIET_SEC = 3600
@@ -140,10 +66,20 @@ KEPT_MODE_BITS = 0o666
 TEMP_PREFIX = ".orchestra-maint-"
 TEMP_SUFFIX = ".tmp"
 TEMP_TOKEN_BYTES = 8
+LEFTOVER_RE = re.compile(
+    re.escape(TEMP_PREFIX)
+    + f"[0-9a-f]{{{2 * TEMP_TOKEN_BYTES}}}"
+    + re.escape(TEMP_SUFFIX)
+)
 
 
 class Conflict(Exception):
-    """A path in the target is not what the update was prepared from."""
+    """A path in the target is not what the update was prepared from. Raised
+    before anything is written."""
+
+
+class Interrupted(Exception):
+    """A write stopped after it had begun: the target may be half-updated."""
 
 
 # --------------------------------------------------------------------------
@@ -216,128 +152,6 @@ def identity(target: str) -> list[int]:
     root = os.lstat(target)
     repository = os.lstat(os.path.join(target, GIT_DIR))
     return [root.st_dev, root.st_ino, repository.st_dev, repository.st_ino]
-
-
-# --------------------------------------------------------------------------
-# git in a target: reading only
-# --------------------------------------------------------------------------
-
-
-class TargetGit:
-    """git in one target. Reading subcommands only, with the job's hardened
-    options and environment; anything else is refused before it starts."""
-
-    def __init__(self, ctx: common.Context, target: str) -> None:
-        self.target = target
-        self.log = ctx.log
-        self.env = {**ctx.env, **TARGET_GIT_ENV}
-
-    def run(
-        self, args: list[str], timeout: float | None = None
-    ) -> common.CommandResult:
-        if not args or args[0] not in READ_COMMANDS:
-            raise common.Refused(
-                f"git {' '.join(args[:1])} is not a reading command; "
-                "nothing else runs in a target"
-            )
-        deadline = common.GIT_TIMEOUT_SEC if timeout is None else timeout
-        options = [*common.GIT_OPTIONS, *TARGET_GIT_OPTIONS]
-        argv = ["git", *options, "-C", self.target, *args]
-        result = common.run_command(argv, deadline, env=self.env)
-        if not result.ok:
-            self.log.line(f"target git failed: {args[0]} -- {result.failure()}")
-        return result
-
-    def text(self, args: list[str]) -> str | None:
-        result = self.run(args)
-        return result.stdout.strip() if result.ok else None
-
-
-def config_key_is_inert(key: str) -> bool:
-    """Whether a configuration key (as ``git config --list`` names it) is on
-    the list of keys no reading command acts on."""
-    section, _, rest = key.partition(".")
-    plain, scoped = INERT_CONFIG.get(section, (NONE, NONE))
-    if "." in rest:
-        variable, allowed = rest.rsplit(".", 1)[1], scoped
-    else:
-        variable, allowed = rest, plain
-    return allowed == EVERY or variable in allowed
-
-
-def config_problem(git: TargetGit) -> str | None:
-    """Why the repository's own configuration rules it out; None when every
-    key it sets is inert. The keys this job passes on the command line are
-    not the repository's and are skipped."""
-    listed = git.run(["config", "--list", "--show-scope", "-z"])
-    if not listed.ok:
-        return "has a git configuration that cannot be read"
-    # Records are `scope NUL key LF value NUL`; a key cannot hold a line break.
-    fields = listed.stdout.split("\0")
-    for index in range(0, len(fields) - 1, 2):
-        if fields[index] == COMMAND_SCOPE:
-            continue
-        key = fields[index + 1].split("\n", 1)[0]
-        if not config_key_is_inert(key):
-            return f"sets the git configuration key {key}, which the job does not allow"
-    return None
-
-
-def repository_problem(git: TargetGit) -> str | None:
-    """Why git must not look at this work tree; None when it may. Listing the
-    configuration reads files only, so it comes first."""
-    problem = config_problem(git)
-    if problem is not None:
-        return problem
-    top = git.text(["rev-parse", "--show-toplevel"])
-    if top is None or os.path.realpath(top) != git.target:
-        return "is not the top level of its own work tree"
-    if git.text(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) is None:
-        return "has no commit yet"
-    return None
-
-
-def uncommitted(git: TargetGit) -> list[str] | None:
-    """Every staged, unstaged or untracked-and-not-ignored path, as git
-    reports it; None when git could not say. Changes inside a submodule's own
-    work tree are not looked at: that would run git inside it."""
-    done = git.run(
-        [
-            "status", "--porcelain=v1", "-z", "--untracked-files=all",
-            "--ignore-submodules=dirty",
-        ],
-        timeout=STATUS_TIMEOUT_SEC,
-    )  # fmt: skip
-    if not done.ok:
-        return None
-    return [entry for entry in done.stdout.split("\0") if entry]
-
-
-def tracked_paths(git: TargetGit) -> set[str] | None:
-    """Every path in the index; None when git could not say."""
-    done = git.run(["ls-files", "-z"])
-    if not done.ok:
-        return None
-    return {name for name in done.stdout.split("\0") if name}
-
-
-def git_state(git: TargetGit) -> str | None:
-    """A digest of where ``HEAD`` points, every ref and the index, byte for
-    byte. Equal digests mean nothing was committed, staged, stashed or checked
-    out in between."""
-    refs = git.run(["for-each-ref", "--format=%(objectname) %(refname)"])
-    head = git.text(["rev-parse", "--verify", "--quiet", "HEAD"])
-    if not refs.ok or head is None:
-        return None
-    digest = hashlib.sha256()
-    digest.update(head.encode("ascii", "replace") + b"\0" + refs.stdout.encode())
-    for name in ("HEAD", "index"):
-        try:
-            data = Path(git.target, GIT_DIR, name).read_bytes()
-        except OSError:
-            data = b""
-        digest.update(b"\0" + hashlib.sha256(data).digest())
-    return digest.hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -433,7 +247,8 @@ def entry_at(path: str, without_model_line: bool = False) -> Entry | None:
     there."""
     try:
         status = os.lstat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # Not there, or below something that is not a directory: absent.
         return None
     if stat.S_ISLNK(status.st_mode):
         return Entry(KIND_LINK, os.readlink(path))
@@ -512,28 +327,6 @@ def fingerprint(
 # --------------------------------------------------------------------------
 
 
-def copy_scope(target: str, stage: str, rels: tuple[str, ...]) -> None:
-    """Copy each of ``rels`` that exists from the target into ``stage``.
-    Links are copied as links and nothing is followed. Raises ``OSError`` or
-    ``shutil.Error`` for a file that cannot be read or is not a file, a
-    directory or a link."""
-    for rel in rels:
-        source = os.path.join(target, rel)
-        if not os.path.lexists(source):
-            continue
-        destination = os.path.join(stage, rel)
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
-        if os.path.islink(source):
-            if not os.path.lexists(destination):
-                os.symlink(os.readlink(source), destination)
-        elif os.path.isdir(source):
-            shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
-        elif os.path.isfile(source):
-            shutil.copy2(source, destination)
-        else:
-            raise OSError(f"{rel} is not a file, a directory or a link")
-
-
 def changed_paths(before: dict[str, Entry], after: dict[str, Entry]) -> list[str]:
     """Every path whose entry differs between two snapshots, sorted, so a
     directory comes before what is inside it."""
@@ -567,93 +360,169 @@ def _temporary(destination: str) -> str:
     return os.path.join(os.path.dirname(destination), name)
 
 
-def _place(source: str, destination: str, entry: Entry) -> None:
-    """Put one staged file or link in place: written beside the destination
-    under a name nobody can predict, then renamed over it."""
+def _place(source: str, destination: str, executable: bool) -> None:
+    """Put one prepared file in place: written beside the destination under a
+    name nobody can predict, then renamed over it. However this ends, by an
+    error or an interrupt, the temporary file does not stay behind."""
     temporary = _temporary(destination)
     try:
-        if entry.kind == KIND_LINK:
-            os.symlink(entry.value, temporary)
-        else:
-            mode = _file_mode(destination, entry.executable)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            descriptor = os.open(temporary, flags, common.PRIVATE_FILE_MODE)
-            try:
-                with open(source, "rb") as handle:
-                    for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
-                        os.write(descriptor, chunk)
-                os.fchmod(descriptor, mode)
-            finally:
-                os.close(descriptor)
+        mode = _file_mode(destination, executable)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, common.PRIVATE_FILE_MODE)
+        try:
+            with open(source, "rb") as handle:
+                for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
+                    os.write(descriptor, chunk)
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
         os.replace(temporary, destination)
-    except OSError:
+    finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)
-        raise
 
 
-def apply_changes(
+@dataclass(frozen=True)
+class Plan:
+    """Every change one update makes to a project, in the order it is made:
+    files that go away, emptied directories from the deepest up, new
+    directories from the top down, then the files to put in place."""
+
+    target: str
+    stage: str
+    unlink: tuple[str, ...]
+    rmdir: tuple[str, ...]
+    mkdir: tuple[str, ...]
+    place: tuple[tuple[str, bool], ...]
+
+    def __bool__(self) -> bool:
+        return bool(self.unlink or self.rmdir or self.mkdir or self.place)
+
+
+def plan_changes(
     target: str, stage: str, before: dict[str, Entry], after: dict[str, Entry]
-) -> None:
-    """Make the target's paths what ``after`` says, from the files in
-    ``stage``. Only paths that differ between the two snapshots are touched.
+) -> Plan:
+    """Work out, and prove possible, everything that makes the target's paths
+    what ``after`` says. Nothing is written here.
 
-    Nothing is written unless every one of them is, right now, what ``before``
-    recorded: otherwise :class:`Conflict` is raised first. Uses plain file
-    operations only; no git command runs.
+    Raises :class:`Conflict` unless every path that differs between the two
+    snapshots is, right now, what ``before`` recorded; every prepared file is
+    what ``after`` recorded; and every directory that has to make room for a
+    file holds nothing but what the update removes.
     """
     changed = changed_paths(before, after)
     directory = Entry(KIND_DIR)
     # Directories the update made that the project already has: the updater
     # creates a few it never fills, and those were not staged from.
-    present = set()
+    present: set[str] = set()
     for rel in changed:
         wanted, now = after.get(rel), entry_at(os.path.join(target, rel))
-        if wanted is not None and wanted.kind == KIND_OTHER:
+        if wanted is not None and wanted.kind not in (KIND_FILE, KIND_DIR):
             raise Conflict(f"{rel}: the update produced something that is not a file")
         _require_real_parents(target, rel)
         if before.get(rel) is None and wanted == directory and now == directory:
             present.add(rel)
         elif now != before.get(rel):
             raise Conflict(f"{rel}: changed since the update was prepared")
+        if wanted is not None and wanted.kind == KIND_FILE:
+            if entry_at(os.path.join(stage, rel)) != wanted:
+                raise Conflict(f"{rel}: the prepared file is not the one checked")
 
-    def becomes(rel: str, kinds: tuple[str, ...]) -> bool:
-        wanted = after.get(rel)
-        return wanted is not None and wanted.kind in kinds
-
-    def was(rel: str, kinds: tuple[str, ...]) -> bool:
+    def was(rel: str) -> str | None:
         had = directory if rel in present else before.get(rel)
-        return had is not None and had.kind in kinds
+        return None if had is None else had.kind
 
-    plain = (KIND_FILE, KIND_LINK, KIND_OTHER)
-    # What goes away first: files and links, then emptied directories from the
-    # deepest up. A directory that still holds something the job did not
-    # stage is left where it is.
-    for rel in changed:
-        if was(rel, plain) and not becomes(rel, plain):
-            _require_real_parents(target, rel)
-            os.unlink(os.path.join(target, rel))
-    for rel in reversed(changed):
-        if was(rel, (KIND_DIR,)) and not becomes(rel, (KIND_DIR,)):
-            try:
-                os.rmdir(os.path.join(target, rel))
-            except OSError:
-                if after.get(rel) is not None:
-                    raise
-    for rel in changed:
-        _require_real_parents(target, rel)
-        destination = os.path.join(target, rel)
+    def becomes(rel: str) -> str | None:
         wanted = after.get(rel)
-        if wanted is None:
+        return None if wanted is None else wanted.kind
+
+    unlink = [
+        rel
+        for rel in changed
+        if was(rel) not in (None, KIND_DIR) and becomes(rel) != KIND_FILE
+    ]
+    # A directory goes only when everything in it is part of the update.
+    # One that holds something else stays, and so does every parent of it;
+    # where a file has to take its place, that is a conflict, found now.
+    rmdir: list[str] = []
+    kept: list[str] = []
+    for rel in reversed(changed):
+        if was(rel) != KIND_DIR or becomes(rel) == KIND_DIR:
             continue
-        if wanted.kind == KIND_DIR:
-            if not was(rel, (KIND_DIR,)):
-                # The job runs with a private umask; a project's new
-                # directory gets a normal mode all the same.
-                os.mkdir(destination)
-                os.chmod(destination, NEW_DIR_MODE)
+        names = os.listdir(os.path.join(target, rel))
+        foreign = [name for name in names if f"{rel}/{name}" not in before]
+        if foreign or any(inner.startswith(f"{rel}/") for inner in kept):
+            if becomes(rel) == KIND_FILE:
+                raise Conflict(f"{rel}: holds something the update did not stage")
+            kept.append(rel)
         else:
-            _place(os.path.join(stage, rel), destination, wanted)
+            rmdir.append(rel)
+    mkdir = [
+        rel for rel in changed if becomes(rel) == KIND_DIR and was(rel) != KIND_DIR
+    ]
+    place = [
+        (rel, after[rel].executable) for rel in changed if becomes(rel) == KIND_FILE
+    ]
+    return Plan(target, stage, tuple(unlink), tuple(rmdir), tuple(mkdir), tuple(place))
+
+
+def apply_plan(plan: Plan) -> None:
+    """Make the planned changes, with plain file operations; no git command
+    runs. Whatever fails here fails after the first change may have been
+    made, so it is raised as :class:`Interrupted`, never as a conflict."""
+    try:
+        for rel in plan.unlink:
+            os.unlink(os.path.join(plan.target, rel))
+        for rel in plan.rmdir:
+            os.rmdir(os.path.join(plan.target, rel))
+        for rel in plan.mkdir:
+            # The job runs with a private umask; a project's new directory
+            # gets a normal mode all the same.
+            path = os.path.join(plan.target, rel)
+            os.mkdir(path)
+            os.chmod(path, NEW_DIR_MODE)
+        for rel, executable in plan.place:
+            _require_real_parents(plan.target, rel)
+            source = os.path.join(plan.stage, rel)
+            _place(source, os.path.join(plan.target, rel), executable)
+    except (OSError, Conflict) as exc:
+        raise Interrupted(f"{type(exc).__name__}: {exc}") from exc
+
+
+def apply_changes(
+    target: str, stage: str, before: dict[str, Entry], after: dict[str, Entry]
+) -> None:
+    """Plan and make the changes in one call. :class:`Conflict` means nothing
+    was written; :class:`Interrupted` means the write stopped part-way."""
+    apply_plan(plan_changes(target, stage, before, after))
+
+
+def remove_leftovers(target: str, rels: tuple[str, ...]) -> int:
+    """Delete the temporary files a killed write of this job left under the
+    given paths, and beside them; return how many. Only names this module
+    makes up are touched, and no link is followed to find them."""
+    directories: set[str] = set()
+    for rel in rels:
+        try:
+            _require_real_parents(target, rel)
+        except Conflict:
+            continue
+        path = os.path.join(target, rel)
+        directories.add(os.path.dirname(path))
+        if os.path.isdir(path) and not os.path.islink(path):
+            directories.update(found[0] for found in os.walk(path))
+    removed = 0
+    for folder in sorted(directories):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if LEFTOVER_RE.fullmatch(name) and not os.path.isdir(path):
+                os.unlink(path)
+                removed += 1
+    return removed
 
 
 def applied_problem(

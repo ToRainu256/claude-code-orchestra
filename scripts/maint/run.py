@@ -40,6 +40,7 @@ from pathlib import Path
 import adopt
 import common
 import distribute
+import ledger
 import model_watch
 import promote
 import report
@@ -256,6 +257,8 @@ def cmd_promote(paths: common.Paths) -> int:
 def cmd_adopt(paths: common.Paths, target: str) -> int:
     if launcher_result():
         # Same rule as a run: nothing is distributed from a fallback revision.
+        # The launcher already stops before this; the check is for a start
+        # that reaches this file some other way.
         print("adopt: the approved revision could not be checked out; nothing done")
         return common.EXIT_FAILED
     ctx = attended_context(paths, "adopt")
@@ -306,7 +309,7 @@ def cmd_status(paths: common.Paths) -> int:
             f"(exit {step.get('exit_code')}) {step.get('detail') or ''}"
         )
         print(common.one_line(line))
-    for line in distribute.status_lines(paths):
+    for line in ledger.status_lines(paths):
         print(common.one_line(line))
     return common.EXIT_OK
 

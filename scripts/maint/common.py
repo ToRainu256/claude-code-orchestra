@@ -40,6 +40,7 @@ import calendar
 import fcntl
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -516,6 +517,17 @@ class Git:
         """A file's content at a revision. Data only: nothing is checked out."""
         result = self.run(["show", f"{revision}:{rel}"])
         return result.stdout if result.ok else None
+
+
+def remove_scratch_worktree(git: Git, tree: Path) -> None:
+    """Drop a scratch worktree of the clone and forget it. Safe when there is
+    none, and refused for anything that is not below the run directory."""
+    checked = require_scratch(git.paths, tree)
+    if checked.exists():
+        git.run(["worktree", "remove", "--force", str(checked)])
+    if checked.exists():
+        shutil.rmtree(str(checked))
+    git.run(["worktree", "prune"])
 
 
 def unexpected_refs(git: Git) -> list[str] | None:

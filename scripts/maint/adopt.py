@@ -3,23 +3,25 @@
 
 The scheduled run never touches a project that was not adopted. Adopting is
 typed at a terminal (``launchd.sh adopt <project>``), once per project and
-again whenever a scheduled run sends a project back (``local-changes``,
-``not-adopted``). It is also the migration an old installation needs.
+again whenever a scheduled run sends a project back (``local-changes``, or a
+``refused`` that says so). It is also the migration an old installation needs.
 
 What the screen shows is not a prediction. The approved updater is run on a
 private copy of the paths it manages, and the screen lists the difference
 between that copy before and after: counts per directory, every path in a
 private file, and one line for each file that would be deleted or overwritten
-while git does not track it, because git could not bring that content back.
-After a typed ``yes`` exactly that difference is written into the project,
-and only while the project still is what the copy was taken from.
+while git could not bring its present content back, because git does not
+track it or was told not to look at it. After a typed ``yes`` exactly that
+difference is written into the project, and only while the project still is
+what the copy was taken from.
 
 The same rules as the scheduled step hold here: the approved revision only, a
 clean tree only, nothing committed or staged, nothing of the project executed.
 
 Exit codes: 0 adopted, or declined · 1 not listed, or no approved revision ·
-2 the project must be fixed first (not clean, a link, a configuration key) ·
-3 the update could not be prepared or written.
+2 the project must be fixed first (not clean, a link, a configuration key),
+or it changed while the screen was up · 3 the update could not be prepared or
+written.
 """
 
 from __future__ import annotations
@@ -30,7 +32,10 @@ from pathlib import Path
 
 import common
 import distribute
+import ledger
 import promote
+import staging
+import target_git
 import targets
 
 CONFIRM_WORD = "yes"
@@ -38,8 +43,8 @@ SCREEN_WIDTH = common.DISPLAY_LIMIT
 GROUPS_SHOWN = 40
 PATHS_SHOWN = 30
 GROUP_DEPTH = 2
-ENTRY_WIDTH = 100
-VERSION_STAMP = distribute.VERSION_STAMP_REL
+VERSION_STAMP = staging.VERSION_STAMP_REL
+TRACKED, UNTRACKED, HIDDEN = "tracked", "untracked", "hidden"
 
 Say = Callable[..., None]
 Ask = Callable[[str], str]
@@ -49,8 +54,20 @@ def _group(rel: str) -> str:
     return "/".join(rel.split("/")[:GROUP_DEPTH])
 
 
+def _standing(rel: str, tracked: set[str], hidden: set[str]) -> str:
+    """How git stands to a path: it tracks it, it does not, or it tracks it
+    and was told not to look at its changes."""
+    if rel in hidden:
+        return HIDDEN
+    return TRACKED if rel in tracked else UNTRACKED
+
+
 def _show_plan(
-    ctx: common.Context, staged: distribute.Staged, tracked: set[str], say: Say
+    ctx: common.Context,
+    staged: staging.Staged,
+    tracked: set[str],
+    hidden: set[str],
+    say: Say,
 ) -> None:
     """What typing ``yes`` would do: counts per directory, every path in a
     private file, and each file whose present content git could not restore."""
@@ -61,7 +78,7 @@ def _show_plan(
         return
     listing = ctx.paths.logs_dir / f"{common.utc_stamp(ctx.now)}.adopt.log"
     rows = [
-        f"{what}\t{'tracked' if rel in tracked else 'untracked'}\t"
+        f"{what}\t{_standing(rel, tracked, hidden)}\t"
         f"{common.safe_text(rel, SCREEN_WIDTH)}\n"
         for what, rel in changes
     ]
@@ -81,23 +98,27 @@ def _show_plan(
     junk = sum(1 for _, rel in changes if targets.is_junk(rel))
     if junk:
         say(f"  ({junk} of these are bytecode caches or Finder index files)")
+    if any(rel.endswith("/") for _, rel in changes):
+        say("  (a path ending in / is a directory that holds no file)")
     say(f"Every path, one per line: {listing}")
 
     lost = [
-        (what, rel)
+        (what, rel, _standing(rel, tracked, hidden))
         for what, rel in changes
-        if what != distribute.CREATE and rel not in tracked and not targets.is_junk(rel)
+        if what != staging.CREATE and not rel.endswith("/") and not targets.is_junk(rel)
     ]
+    lost = [entry for entry in lost if entry[2] != TRACKED]
     if not lost:
         return
     say()
-    say(f"Git does not track {len(lost)} of the files that would be deleted or")
-    say("overwritten, so git cannot bring their present content back:")
-    for what, rel in lost[:PATHS_SHOWN]:
-        say(f"  {what}  {rel}")
+    say(f"Git cannot bring back the present content of {len(lost)} of the files that")
+    say("would be deleted or overwritten: it does not track them, or it was told")
+    say("not to look at them (assume-unchanged, skip-worktree):")
+    for what, rel, standing in lost[:PATHS_SHOWN]:
+        say(f"  {what}  {rel}  ({standing})")
     if len(lost) > PATHS_SHOWN:
         more = len(lost) - PATHS_SHOWN
-        say(f'  ({more} more, marked "untracked" in the file above)')
+        say(f"  ({more} more, marked {UNTRACKED} or {HIDDEN} in the file above)")
 
 
 def _stamp(target: str) -> str:
@@ -142,20 +163,30 @@ def run(ctx: common.Context, raw: str, ask: Ask, out: Callable[[str], None]) -> 
         say(f"adopt: the template is not installed there (no {VERSION_STAMP}).")
         say("Install it first with scripts/install.sh; adopt only updates.")
         return common.EXIT_NEEDS_OWNER
-    git = targets.TargetGit(ctx, target)
     try:
-        with distribute.open_source(ctx, approved) as source:
-            return _adopt_from(ctx, source, git, ask, say)
-    except distribute.SourceError as exc:
+        book = ledger.Ledger(ctx.paths)
+    except ledger.Unreadable as exc:
+        aside = ledger.set_aside(ctx.paths, ctx.now)
+        ctx.log.line(f"adopt: unreadable record ({exc}); moved to {aside}")
+        say("adopt: the record of adoptions could not be read. It was set aside as")
+        say(f"  {aside}")
+        say("Nothing was changed. Run adopt again, for every project that was")
+        say("adopted before; delete that file when you are done.")
+        return common.EXIT_NEEDS_OWNER
+    git = target_git.TargetGit(ctx, target)
+    try:
+        with staging.open_source(ctx, approved) as source:
+            return _adopt_from(ctx, source, git, book, ask, say)
+    except staging.SourceError as exc:
         say(f"adopt: {exc}")
         return common.EXIT_FAILED
 
 
-def _fixable_problem(source: distribute.Source, git: targets.TargetGit) -> str | None:
+def _fixable_problem(source: staging.Source, git: target_git.TargetGit) -> str | None:
     """What the owner has to put right in the project before it can be
     adopted; None when nothing."""
     target = git.target
-    problem = targets.repository_problem(git)
+    problem = target_git.repository_problem(git)
     problem = problem or targets.layout_problem(target, source.guarded)
     if problem is not None:
         return f"the project {problem}"
@@ -167,8 +198,9 @@ def _fixable_problem(source: distribute.Source, git: targets.TargetGit) -> str |
 
 def _adopt_from(
     ctx: common.Context,
-    source: distribute.Source,
-    git: targets.TargetGit,
+    source: staging.Source,
+    git: target_git.TargetGit,
+    book: ledger.Ledger,
     ask: Ask,
     say: Say,
 ) -> int:
@@ -177,22 +209,22 @@ def _adopt_from(
     if problem is not None:
         say(f"adopt: {problem}")
         return common.EXIT_NEEDS_OWNER
-    dirty, tracked = targets.uncommitted(git), targets.tracked_paths(git)
-    head = git.text(["rev-parse", "--verify", "--quiet", "HEAD"])
-    if dirty is None or tracked is None:
+    state, dirt = target_git.git_state(git), target_git.dirt(git)
+    index = target_git.index_paths(git)
+    if state is None or dirt is None or index is None:
         say("adopt: git could not report on the project")
         return common.EXIT_FAILED
-    if dirty:
-        say(f"adopt: the project has {len(dirty)} uncommitted paths:")
-        for entry in dirty[:PATHS_SHOWN]:
-            say(f"  {common.one_line(entry, ENTRY_WIDTH)}")
+    if dirt.visible:
+        say(f"adopt: the project has {len(dirt.visible)} uncommitted paths:")
+        for entry in dirt.visible[:PATHS_SHOWN]:
+            say(f"  {target_git.shown(entry)}")
         say("An update is only ever written into a clean tree, and it is left")
         say("uncommitted. Commit or clean these first, then run adopt again.")
         return common.EXIT_NEEDS_OWNER
     try:
-        staged = distribute.stage_update(ctx, source, target, "stage")
-    except distribute.StageProblem as exc:
-        if exc.state == distribute.REFUSED:
+        staged = staging.stage_update(ctx, source, target, "stage")
+    except staging.StageProblem as exc:
+        if exc.refused:
             say(f"adopt: the project {exc.detail}")
             return common.EXIT_NEEDS_OWNER
         say(f"adopt: {exc.detail}; see the newest file in {ctx.paths.logs_dir}")
@@ -200,10 +232,17 @@ def _adopt_from(
 
     say(f"Revision:  {source.revision} (template {source.version})")
     say(f"Installed: template {_stamp(target)}")
-    say(f"Tree:      clean, at {common.short_sha(head)}")
+    say(f"Tree:      clean, at {common.short_sha(git.text(['rev-parse', 'HEAD']))}")
     say()
-    _show_plan(ctx, staged, tracked, say)
+    _show_plan(ctx, staged, index[0], index[1], say)
     say()
+    if dirt.hidden:
+        say(
+            f"{len(dirt.hidden)} paths here are hidden from git status (assume-unchanged"
+        )
+        say(
+            "or skip-worktree). Scheduled runs treat the tree as not clean while they are."
+        )
     say("Nothing is committed, staged or stashed. The result stays as uncommitted")
     say("changes for you to review and commit; until you do, the revisions that")
     say("follow wait for this project.")
@@ -215,14 +254,12 @@ def _adopt_from(
     if answer.strip() != CONFIRM_WORD:
         say("adopt: not confirmed; nothing was changed")
         return common.EXIT_OK
-    # The screen was true when it was drawn. Both of these can have moved.
+    # The screen was true when it was drawn. The approved revision can have
+    # moved since; whether the project did is asked again by the write itself.
     if promote.read_approved(ctx.paths) != source.revision:
         say("adopt: the approved revision moved while you were reading; run it again")
         return common.EXIT_FAILED
-    if targets.uncommitted(git) != []:
-        say("adopt: the tree is no longer clean; nothing was changed")
-        return common.EXIT_NEEDS_OWNER
-    adoption = distribute.Adoption(
+    adoption = ledger.Adoption(
         identity=tuple(targets.identity(target)),
         adopted_at=ctx.now,
         revision=source.revision,
@@ -230,9 +267,12 @@ def _adopt_from(
         target_print="",
         updated_at=ctx.now,
     )
-    ledger = distribute.Ledger(ctx.paths)
-    visit = distribute.write_update(ctx, source, ledger, target, adoption, staged)
+    seen = distribute.Seen(state, dirt)
+    visit = distribute.write_update(ctx, source, book, git, adoption, staged, seen)
     ctx.log.line(f"adopt: {visit.state}: {target} {visit.detail}")
+    if visit.state == distribute.BUSY:
+        say(f"adopt: {visit.detail}. Run it again.")
+        return common.EXIT_NEEDS_OWNER
     if visit.state == distribute.FAILED:
         say(f"adopt: {visit.detail}")
         return common.EXIT_FAILED

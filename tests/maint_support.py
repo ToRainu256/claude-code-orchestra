@@ -27,6 +27,7 @@ import json
 import os
 import pty
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -84,10 +85,13 @@ import bump  # noqa: E402
 import common  # noqa: E402
 import distribute  # noqa: E402
 import gh  # noqa: E402
+import ledger  # noqa: E402
 import model_watch  # noqa: E402
 import promote  # noqa: E402
 import report  # noqa: E402
 import run as maint_run  # noqa: E402
+import staging  # noqa: E402
+import target_git  # noqa: E402
 import targets  # noqa: E402
 
 MODULES: tuple[ModuleType, ...] = (
@@ -96,20 +100,25 @@ MODULES: tuple[ModuleType, ...] = (
     common,
     distribute,
     gh,
+    ledger,
     promote,
     model_watch,
     report,
     maint_run,
+    staging,
+    target_git,
     targets,
 )
 
 # The git stand-in. `{real}` is the real git, `{bare}` the scratch fork.
 # A file named `<this script>.stall` holding one word makes any command with
 # that word as an argument hang, for the deadline tests; `<this script>.fail`
-# makes it fail.
+# makes it fail. With `FAKE_GIT_LOG` set, every command line is appended to
+# that file.
 FAKE_GIT = """#!/bin/sh
 GIT_ALLOW_PROTOCOL=file
 export GIT_ALLOW_PROTOCOL
+[ -n "${{FAKE_GIT_LOG:-}}" ] && printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
 stall=""
 [ -f "$0.stall" ] && stall="$(cat "$0.stall")"
 fail=""
@@ -789,14 +798,17 @@ def make_project(directory: Path) -> Path:
 
 def tree_digest(root: Path) -> dict[str, str]:
     """Every path below ``root``, the repository's own files included, with
-    what it holds: two equal digests are a byte-identical tree."""
+    what it holds and its mode: two equal digests are a tree in which no
+    byte and no permission changed."""
     found: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
         rel = str(path.relative_to(root))
+        mode = stat.S_IMODE(path.lstat().st_mode)
         if path.is_symlink():
             found[rel] = f"link:{os.readlink(path)}"
         elif path.is_file():
-            found[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+            content = hashlib.sha256(path.read_bytes()).hexdigest()
+            found[rel] = f"{mode:o}:{content}"
         else:
-            found[rel] = "dir"
+            found[rel] = f"{mode:o}:dir"
     return found
