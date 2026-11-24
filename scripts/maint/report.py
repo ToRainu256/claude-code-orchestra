@@ -35,7 +35,7 @@ OUTCOMES: dict[str, tuple[int, ...]] = {
     "auth-or-tool": (common.EXIT_FAILED,),
     "github-failed": (common.EXIT_FAILED,),
 }
-MARKER = "<!-- job:local-maint -->"
+MARKER = common.job_marker(common.LOCAL_JOB)
 # The only shape a step outcome or a count name may have in a public comment.
 PUBLIC_WORD_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 REDACTED_WORD = "unprintable"

@@ -140,6 +140,12 @@ LABELS = {
     LABEL_NEEDS_OWNER: ("d93f0b", "An automation job needs a decision"),
     LABEL_STATUS: ("0e8a16", "The automation status dashboard"),
 }
+# How every issue, comment and pull request body written by a job starts.
+# Jobs act under the owner's GitHub account, so an author cannot tell the
+# owner's words from a job's; the first characters of the body can. The
+# issue worker refuses any issue whose body starts with this prefix.
+JOB_MARKER_PREFIX = "<!-- job:"
+LOCAL_JOB = "local-maint"
 PULL_URL_RE = re.compile(re.escape(FORK_WEB_URL) + r"/pull/([1-9][0-9]{0,8})")
 ISSUE_URL_RE = re.compile(re.escape(FORK_WEB_URL) + r"/issues/([1-9][0-9]{0,8})")
 GITHUB_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -661,6 +667,11 @@ def make_context(
         git=Git(paths, clean, log),
         github=gh.GitHub(clean, log),
     )
+
+
+def job_marker(job: str, detail: str = "") -> str:
+    """The first line of a body written by ``job``."""
+    return f"{JOB_MARKER_PREFIX}{job}{' ' + detail if detail else ''} -->"
 
 
 def short_sha(value: object) -> str:
