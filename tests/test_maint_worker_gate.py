@@ -41,16 +41,14 @@ SYSTEM_PYTHON = Path("/usr/bin/python3")
 VERIFIER_NEEDS = (3, 11)
 GIT_REDIRECTS = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE")
 ALLOWED, NEEDS_OWNER, REFUSED, FAILED = 0, 2, 1, 3
-UNIT_TEST = "src/test_unit.py"
+MAIN_REF = "refs/remotes/origin/main"
+OLD_NOTE = ".claude/docs/research/old.md"
 BASE_FILES = {
     ".gitignore": ".claude/logs/\n__pycache__/\n",
     "README.md": "# Project\n\nWhat it is.\n",
+    OLD_NOTE: "# An older note\n\nfound earlier\n",
     "docs/guide.md": "# Guide\n\nline one\n",
     "src/app.py": "def answer() -> int:\n    return 42\n",
-    UNIT_TEST: (
-        "from app import answer\n\n\n"
-        "def test_answer() -> None:\n    assert answer() == 42\n"
-    ),
     "scripts/tool.sh": "#!/bin/sh\necho tool\n",
     "tests/test_tool.py": "def test_tool() -> None:\n    assert 1 + 1 == 2\n",
     "AGENTS.md": "# Contract\n",
@@ -70,6 +68,9 @@ def git(root: Path, *args: str) -> str:
             "user.email=test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            # The developer's own ignore file must not hide a fixture file.
+            "-c",
+            "core.excludesFile=/dev/null",
             "-C",
             str(root),
             *args,
@@ -88,9 +89,16 @@ def write(root: Path, rel: str, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def publish_main(root: Path) -> str:
+    """Make the remote-tracking ref say what `main` is, as a fetch would."""
+    git(root, "update-ref", MAIN_REF, "refs/heads/main")
+    return git(root, "rev-parse", MAIN_REF)
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A repository whose `main` carries the real verifier."""
+    """A repository whose `main` carries the real verifier, with the
+    remote-tracking ref the gate reads."""
     root = tmp_path / "repo"
     root.mkdir()
     git(root, "init", "--quiet", "--initial-branch=main")
@@ -101,31 +109,37 @@ def repo(tmp_path: Path) -> Path:
     shutil.copyfile(REPO_ROOT / worker_gate.VERIFIER, verifier)
     git(root, "add", "--all")
     git(root, "commit", "--quiet", "-m", "main")
+    publish_main(root)
     return root
 
 
-def propose(root: Path, changes: dict[str, str | None]) -> tuple[str, str]:
+def branch_off(root: Path) -> None:
+    git(root, "switch", "--quiet", "-c", "agent/issue-1-change", MAIN_REF)
+
+
+def commit(root: Path, message: str = "the change") -> str:
+    git(root, "add", "--all")
+    git(root, "commit", "--quiet", "--allow-empty", "-m", message)
+    return git(root, "rev-parse", "HEAD")
+
+
+def propose(root: Path, changes: dict[str, str | None]) -> str:
     """Commit ``changes`` on a branch off `main` (None deletes a path), leave
-    that commit checked out, and return (main's commit, the head commit)."""
-    base = git(root, "rev-parse", "refs/heads/main")
-    git(root, "switch", "--quiet", "-c", "agent/issue-1-change", base)
+    that commit checked out, and return it."""
+    branch_off(root)
     for rel, text in changes.items():
         if text is None:
             (root / rel).unlink()
         else:
             write(root, rel, text)
-    git(root, "add", "--all")
-    git(root, "commit", "--quiet", "--allow-empty", "-m", "the change")
-    return base, git(root, "rev-parse", "HEAD")
+    return commit(root)
 
 
 def judge(
-    capsys: pytest.CaptureFixture[str], root: Path, base: str, head: str
+    capsys: pytest.CaptureFixture[str], root: Path, head: str, *extra: str
 ) -> tuple[int, dict[str, Any], str]:
     capsys.readouterr()
-    code = worker_gate.main(
-        ["--base", base, "--head", head, "--project-root", str(root)]
-    )
+    code = worker_gate.main(["--head", head, "--project-root", str(root), *extra])
     captured = capsys.readouterr()
     return code, json.loads(captured.out), captured.err
 
@@ -133,35 +147,29 @@ def judge(
 def proposed(
     capsys: pytest.CaptureFixture[str], root: Path, changes: dict[str, str | None]
 ) -> tuple[int, dict[str, Any], str]:
-    return judge(capsys, root, *propose(root, changes))
+    return judge(capsys, root, propose(root, changes))
 
 
-# --- what may merge unattended ---
+# --- documentation only: what may merge unattended ---
+
+ALLOWED_CHANGES = [
+    "README.md",
+    "TEMPLATE_DESIGN_LOG.md",
+    OLD_NOTE,
+    ".claude/docs/research/new-finding.md",
+    ".claude/docs/research/deep/er/notes.md",
+    ".claude/docs/reviews/review-of-something.md",
+]
 
 
-@pytest.mark.parametrize(
-    "rel",
-    [
-        "README.md",
-        "docs/new.md",
-        "docs/deep/er/notes.md",
-        "TEMPLATE_DESIGN_LOG.md",
-        ".claude/docs/DESIGN.md",
-        ".claude/STATE.md",
-        "VERSION",
-        "src/app.py",
-        "scripts.md",
-        "tests-notes.md",
-        ".claude/settings.json.md",
-        "docs/AGENTS.md.txt",
-    ],
-)
-def test_change_outside_the_stop_list_may_merge(
+@pytest.mark.parametrize("rel", ALLOWED_CHANGES)
+def test_documentation_on_the_allow_list_may_merge(
     capsys: pytest.CaptureFixture[str], repo: Path, rel: str
 ) -> None:
-    base, head = propose(repo, {rel: "new text\n"})
+    main = git(repo, "rev-parse", MAIN_REF)
+    head = propose(repo, {rel: "new text\n"})
 
-    code, payload, _ = judge(capsys, repo, base, head)
+    code, payload, _ = judge(capsys, repo, head)
 
     assert (code, payload["result"], payload["ok"]) == (
         ALLOWED,
@@ -169,43 +177,73 @@ def test_change_outside_the_stop_list_may_merge(
         True,
     )
     assert payload["reasons"] == []
-    assert (payload["base"], payload["head"], payload["merge_base"]) == (
-        base,
+    assert (payload["main"], payload["head"], payload["merge_base"]) == (
+        main,
         head,
-        base,
+        main,
     )
     assert payload["changed"] == 1
 
 
-@pytest.mark.parametrize(
-    ("rel", "entry"),
-    [
-        (".github/workflows/ci.yml", ".github/"),
-        (".GitHub/workflows/ci.yml", ".github/"),
-        (".github", ".github/"),
-        (".claude/settings.json", ".claude/settings.json"),
-        (".claude/hooks/new.py", ".claude/hooks/"),
-        (".claude/rules/new.md", ".claude/rules/"),
-        (".claude/skills/new/SKILL.md", ".claude/skills/"),
-        (".claude/agents/new.md", ".claude/agents/"),
-        (".agents/AGENTS.md", ".agents/"),
-        (".codex/config.toml", ".codex/"),
-        (".mcp.json", ".mcp.json"),
-        ("AGENTS.md", "AGENTS.md"),
-        ("docs/AGENTS.md", "AGENTS.md"),
-        ("CLAUDE.md", "CLAUDE.md"),
-        ("docs/CLAUDE.md", "CLAUDE.md"),
-        ("docs/claude.md", "CLAUDE.md"),
-        ("src/CLAUDE.local.md", "CLAUDE.local.md"),
-        ("scripts/tool.sh", "scripts/"),
-        ("scripts/maint/worker_gate.py", "scripts/"),
-        ("tests/test_tool.py", "tests/"),
-        ("pyproject.toml", "pyproject.toml"),
-        ("uv.lock", "uv.lock"),
-    ],
-)
-def test_change_on_the_stop_list_waits_for_the_owner(
-    capsys: pytest.CaptureFixture[str], repo: Path, rel: str, entry: str
+def test_every_allowed_path_together_may_merge(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    code, payload, _ = proposed(capsys, repo, dict.fromkeys(ALLOWED_CHANGES, "text\n"))
+
+    assert (code, payload["changed"]) == (ALLOWED, len(ALLOWED_CHANGES))
+
+
+# What the security review got `self-merge-allowed` for under the stop-list
+# (N1: a deny-list over an open set; N2: what every session loads), then what
+# the stop-list of the round before let through, then names no list ever had.
+ONCE_SELF_MERGEABLE = [
+    "conftest.py",
+    "src/conftest.py",
+    "pytest.ini",
+    ".claude/settings.local.json",
+    ".claude/commands/x.md",
+    ".claude/output-styles/x.md",
+    ".claude/agent-memory/x.md",
+    ".gitattributes",
+    ".gitmodules",
+    ".gitignore",
+    "ruff.toml",
+    "uv.toml",
+    ".python-version",
+    "tox.ini",
+    "setup.cfg",
+    "sitecustomize.py",
+    "evil.pth",
+    "Makefile",
+    "package.json",
+    ".pre-commit-config.yaml",
+    ".envrc",
+    "GEMINI.md",
+    ".cursorrules",
+    "opencode.json",
+    ".claude/STATE.md",
+    "PROGRESS.md",
+    ".claude/docs/DESIGN.md",
+    ".claude/docs/plans/a-plan.md",
+    ".claude/docs/libraries/a-library.md",
+    ".claude/docs/change_main.md",
+    ".claude/docs/INDEX.md",
+    "docs/new.md",
+    "docs/guide.md",
+    "src/app.py",
+    "src/new_module.py",
+    "VERSION",
+    "scripts.md",
+    "noxfile.py",
+    "justfile",
+    ".editorconfig",
+    "LICENSE",
+]
+
+
+@pytest.mark.parametrize("rel", ONCE_SELF_MERGEABLE)
+def test_everything_off_the_allow_list_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path, rel: str
 ) -> None:
     code, payload, err = proposed(capsys, repo, {rel: "changed by the worker\n"})
 
@@ -214,135 +252,208 @@ def test_change_on_the_stop_list_waits_for_the_owner(
         "needs-owner",
         False,
     )
-    assert f"stop-list {entry}: {rel}" in payload["reasons"]
-    assert f"reason: stop-list {entry}: {rel}" in err
-
-
-def test_one_stop_list_path_among_harmless_ones_is_enough(
-    capsys: pytest.CaptureFixture[str], repo: Path
-) -> None:
-    changes = {f"docs/page-{n}.md": "text\n" for n in range(5)}
-
-    code, payload, _ = proposed(capsys, repo, {**changes, "scripts/tool.sh": "x\n"})
-
-    assert (code, payload["changed"]) == (NEEDS_OWNER, 6)
-    assert payload["reasons"] == ["stop-list scripts/: scripts/tool.sh"]
-
-
-def test_moving_a_file_off_the_stop_list_is_still_a_change_to_it(
-    capsys: pytest.CaptureFixture[str], repo: Path
-) -> None:
-    """A rename is a deletion and an addition: both names are judged."""
-    base = git(repo, "rev-parse", "HEAD")
-    git(repo, "switch", "--quiet", "-c", "agent/issue-1-move")
-    git(repo, "mv", "scripts/tool.sh", "docs/tool.sh")
-    git(repo, "commit", "--quiet", "-m", "move")
-
-    code, payload, _ = judge(capsys, repo, base, git(repo, "rev-parse", "HEAD"))
-
-    assert code == NEEDS_OWNER
-    assert "stop-list scripts/: scripts/tool.sh" in payload["reasons"]
-
-
-def test_only_the_branchs_own_change_is_judged(
-    capsys: pytest.CaptureFixture[str], repo: Path
-) -> None:
-    """`main` moved on after the branch was cut, and its commit touches the
-    stop-list. That is not the pull request's change."""
-    fork_point, head = propose(repo, {"docs/new.md": "new\n"})
-    git(repo, "switch", "--quiet", "main")
-    write(repo, "scripts/tool.sh", "#!/bin/sh\necho changed on main\n")
-    git(repo, "commit", "--quiet", "--all", "-m", "main moves on")
-    base = git(repo, "rev-parse", "HEAD")
-    git(repo, "switch", "--quiet", "agent/issue-1-change")
-
-    code, payload, _ = judge(capsys, repo, base, head)
-
-    assert (code, payload["result"]) == (ALLOWED, "self-merge-allowed")
-    assert payload["merge_base"] == fork_point
-
-
-# --- other reasons to leave it to the owner ---
-
-
-def test_deleted_test_file_waits_for_the_owner(
-    capsys: pytest.CaptureFixture[str], repo: Path
-) -> None:
-    code, payload, _ = proposed(capsys, repo, {UNIT_TEST: None})
-
-    assert code == NEEDS_OWNER
-    assert f"a test file is deleted: {UNIT_TEST}" in payload["reasons"]
+    assert f"not on the allow-list: `{rel}`" in payload["reasons"]
+    assert f"reason: not on the allow-list: `{rel}`" in err
 
 
 @pytest.mark.parametrize(
-    ("text", "pattern"),
+    "rel",
     [
-        (
-            BASE_FILES[UNIT_TEST].replace("def test", "@pytest.mark.skip\ndef test"),
-            "skip-marker",
-        ),
-        (
-            BASE_FILES[UNIT_TEST].replace("assert answer() == 42", "answer()"),
-            "assertions-removed",
-        ),
-        (BASE_FILES[UNIT_TEST] + "    assert True\n", "tautological-assertion"),
+        ".github/workflows/ci.yml",
+        ".claude/hooks/new.py",
+        ".claude/rules/new.md",
+        ".claude/skills/new/SKILL.md",
+        ".claude/agents/new.md",
+        ".agents/AGENTS.md",
+        ".codex/config.toml",
+        ".mcp.json",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "scripts/maint/worker_gate.py",
+        "tests/test_tool.py",
+        "pyproject.toml",
+        "uv.lock",
     ],
 )
-def test_weakened_test_waits_for_the_owner(
-    capsys: pytest.CaptureFixture[str], repo: Path, text: str, pattern: str
+def test_what_defines_the_checks_or_instructs_a_session_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path, rel: str
 ) -> None:
-    code, payload, _ = proposed(capsys, repo, {UNIT_TEST: text})
+    code, payload, _ = proposed(capsys, repo, {rel: "changed by the worker\n"})
 
-    assert (code, payload["result"]) == (NEEDS_OWNER, "needs-owner")
-    assert f"weakened test ({pattern}): {UNIT_TEST}" in payload["reasons"]
+    assert code == NEEDS_OWNER
+    assert payload["reasons"][0] == f"not on the allow-list: `{rel}`"
+
+
+def test_one_path_off_the_allow_list_among_allowed_ones_is_enough(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    changes = dict.fromkeys(ALLOWED_CHANGES, "text\n")
+
+    code, payload, _ = proposed(capsys, repo, {**changes, "docs/one-more.md": "x\n"})
+
+    assert (code, payload["changed"]) == (NEEDS_OWNER, len(ALLOWED_CHANGES) + 1)
+    assert payload["reasons"] == ["not on the allow-list: `docs/one-more.md`"]
 
 
 @pytest.mark.parametrize(
-    ("rel", "text", "pattern"),
+    "rel",
     [
-        ("docs/new.md", "TODO: write this\n", "todo-marker"),
-        (
-            "src/app.py",
-            "def answer() -> int:\n    raise NotImplementedError\n",
-            "not-implemented",
-        ),
-        (
-            "src/app.py",
-            "def answer() -> int:\n    try:\n        return 42\n    except Exception: pass\n",
-            "swallowed-exception",
-        ),
+        "Template_Design_Log.md",
+        "template_design_log.md",
+        ".claude/docs/Reviews/review.md",
+        ".claude/docs/REVIEWS/review.md",
     ],
 )
-def test_placeholder_waits_for_the_owner(
-    capsys: pytest.CaptureFixture[str], repo: Path, rel: str, text: str, pattern: str
+def test_case_variant_of_an_allowed_path_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path, rel: str
 ) -> None:
-    code, payload, _ = proposed(capsys, repo, {rel: text})
+    """To git it is another path, and on the owner's disk it is the allowed
+    one's twin: neither reading makes it the path that was allowed."""
+    code, payload, _ = proposed(capsys, repo, {rel: "text\n"})
 
-    assert (code, payload["result"]) == (NEEDS_OWNER, "needs-owner")
-    assert f"placeholder ({pattern}): {rel}" in payload["reasons"]
+    assert (code, payload["reasons"]) == (
+        NEEDS_OWNER,
+        [f"not on the allow-list: `{rel}`"],
+    )
 
 
-def test_link_waits_for_the_owner(
+@pytest.mark.parametrize(
+    ("path", "is_allowed"),
+    [
+        ("README.md", True),
+        ("TEMPLATE_DESIGN_LOG.md", True),
+        (".claude/docs/research/a.md", True),
+        (".claude/docs/reviews/deep/a.md", True),
+        ("readme.md", False),
+        ("README.MD", False),
+        ("docs/README.md", False),
+        ("README.md/x", False),
+        ("README.md.sh", False),
+        (".claude/docs/research", False),
+        (".claude/docs/researchers/a.md", False),
+        (".Claude/docs/research/a.md", False),
+        (".claude/docs/Research/a.md", False),
+        (".claude/docs/plans/a.md", False),
+        (".claude/docs/DESIGN.md", False),
+        ("x/.claude/docs/research/a.md", False),
+        ("", False),
+    ],
+)
+def test_allow_list_matches_the_exact_path_and_nothing_near_it(
+    path: str, is_allowed: bool
+) -> None:
+    assert worker_gate.allowed(path) is is_allowed
+
+
+def test_allow_list_is_exactly_what_was_decided() -> None:
+    assert worker_gate.ALLOWED_FILES == ("README.md", "TEMPLATE_DESIGN_LOG.md")
+    assert worker_gate.ALLOWED_DIRECTORIES == (
+        ".claude/docs/research",
+        ".claude/docs/reviews",
+    )
+    assert worker_gate.ALLOWED_MODE == "100644"
+
+
+# --- an allowed path is still held to what it is and how it changed ---
+
+
+def test_deleting_an_allowed_file_waits_for_the_owner(
     capsys: pytest.CaptureFixture[str], repo: Path
 ) -> None:
-    base = git(repo, "rev-parse", "HEAD")
-    git(repo, "switch", "--quiet", "-c", "agent/issue-1-link")
-    (repo / "docs" / "link.md").symlink_to("guide.md")
-    git(repo, "add", "--all")
-    git(repo, "commit", "--quiet", "-m", "a link")
+    code, payload, _ = proposed(capsys, repo, {"README.md": None})
 
-    code, payload, _ = judge(capsys, repo, base, git(repo, "rev-parse", "HEAD"))
+    assert (code, payload["reasons"]) == (NEEDS_OWNER, ["deleted: `README.md`"])
+
+
+def test_renaming_an_allowed_file_is_a_deletion_and_waits(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """A rename is two changes, and both names are judged: here both are on
+    the allow-list, and the old one is gone."""
+    branch_off(repo)
+    git(repo, "mv", OLD_NOTE, ".claude/docs/research/renamed.md")
+
+    code, payload, _ = judge(capsys, repo, commit(repo))
+
+    assert (code, payload["changed"]) == (NEEDS_OWNER, 2)
+    assert payload["reasons"] == [f"deleted: `{OLD_NOTE}`"]
+
+
+def test_moving_a_file_onto_the_allow_list_judges_where_it_came_from(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    branch_off(repo)
+    git(repo, "mv", "scripts/tool.sh", ".claude/docs/research/tool.md")
+
+    code, payload, _ = judge(capsys, repo, commit(repo))
 
     assert code == NEEDS_OWNER
-    assert "not a plain file (mode 120000): docs/link.md" in payload["reasons"]
+    assert payload["reasons"] == ["not on the allow-list: `scripts/tool.sh`"]
+
+
+@pytest.mark.parametrize("rel", ["README.md", ".claude/docs/research/run-me.md"])
+def test_executable_bit_on_an_allowed_file_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path, rel: str
+) -> None:
+    branch_off(repo)
+    write(repo, rel, "#!/bin/sh\necho run\n")
+    (repo / rel).chmod(0o755)
+
+    code, payload, _ = judge(capsys, repo, commit(repo))
+
+    assert code == NEEDS_OWNER
+    assert any(
+        reason.endswith(f"-> 100755, not 100644: `{rel}`")
+        for reason in payload["reasons"]
+    )
+
+
+def test_link_at_an_allowed_path_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    branch_off(repo)
+    (repo / ".claude/docs/research/link.md").symlink_to("old.md")
+
+    code, payload, _ = judge(capsys, repo, commit(repo))
+
+    assert code == NEEDS_OWNER
+    assert (
+        "not a plain file (mode 120000): `.claude/docs/research/link.md`"
+        in payload["reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("rel", "entry"),
+    [
+        (".claude/docs/research/CLAUDE.md", "CLAUDE.md"),
+        (".claude/docs/research/deep/AGENTS.md", "AGENTS.md"),
+        (".claude/docs/reviews/conftest.py", "conftest.py"),
+        (".claude/docs/reviews/.gitattributes", ".gitattributes"),
+        (".claude/docs/research/evil.pth", "*.pth"),
+    ],
+)
+def test_name_a_tool_reads_anywhere_waits_even_below_an_allowed_directory(
+    capsys: pytest.CaptureFixture[str], repo: Path, rel: str, entry: str
+) -> None:
+    code, payload, _ = proposed(capsys, repo, {rel: "text\n"})
+
+    assert code == NEEDS_OWNER
+    assert payload["reasons"] == [f"read by a tool wherever it lies ({entry}): `{rel}`"]
 
 
 @pytest.mark.parametrize(
     ("rel", "shown"),
     [
-        ("docs/two words.md", r"docs/two\x20words.md"),
-        ("docs/a'$(id)'.md", r"docs/a\x27\x24\x28id\x29\x27.md"),
-        ("docs/-rf.md", "docs/-rf.md"),
+        (
+            ".claude/docs/research/two words.md",
+            r".claude/docs/research/two\x20words.md",
+        ),
+        (
+            ".claude/docs/research/a'$(id)'.md",
+            r".claude/docs/research/a\x27\x24\x28id\x29\x27.md",
+        ),
+        (".claude/docs/research/-rf.md", ".claude/docs/research/-rf.md"),
     ],
 )
 def test_name_outside_the_supported_characters_waits_and_is_shown_inert(
@@ -351,8 +462,23 @@ def test_name_outside_the_supported_characters_waits_and_is_shown_inert(
     code, payload, err = proposed(capsys, repo, {rel: "text\n"})
 
     assert code == NEEDS_OWNER
-    assert payload["reasons"] == [f"a name outside A-Za-z0-9._/+@-: {shown}"]
+    assert payload["reasons"] == [f"a name outside A-Za-z0-9._/+@-: `{shown}`"]
     assert "$(id)" not in json.dumps(payload) + err
+
+
+def test_path_in_a_reason_is_in_a_code_span_so_it_can_be_posted(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """A supported name may read as a link and a mention in prose. A reason
+    is posted as it is, so it carries the span itself."""
+    rel = "www.evil.example/@octocat"
+
+    code, payload, _ = proposed(capsys, repo, {rel: "text\n"})
+
+    assert (code, payload["reasons"]) == (
+        NEEDS_OWNER,
+        [f"not on the allow-list: `{rel}`"],
+    )
 
 
 def test_nothing_changed_is_not_permission(
@@ -363,20 +489,200 @@ def test_nothing_changed_is_not_permission(
     assert (code, payload["reasons"]) == (NEEDS_OWNER, ["nothing is changed"])
 
 
+# --- the change is read from the two trees, not from what the tree says ---
+
+
+def add_entry(root: Path, mode: str, rel: str, content: str = "") -> None:
+    stored = subprocess.run(
+        ["git", "-C", str(root), "hash-object", "-w", "--stdin"],
+        input=content,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    git(root, "update-index", "--add", "--cacheinfo", f"{mode},{stored},{rel}")
+
+
+def test_gitlink_hidden_by_the_pull_requests_own_gitmodules_is_seen(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """The pull request adds a submodule entry and tells git, in its own
+    `.gitmodules`, to ignore it. `git diff` then lists one changed path. The
+    gate reads the two trees and lists both."""
+    branch_off(repo)
+    write(
+        repo,
+        ".gitmodules",
+        '[submodule "vendor"]\n\tpath = vendor\n\turl = ./x\n\tignore = all\n',
+    )
+    add_entry(repo, "160000", "vendor")
+    (repo / "vendor").mkdir()
+    head = commit(repo)
+    seen_by_diff = git(repo, "diff", "--name-only", MAIN_REF, head).split("\n")
+    assert seen_by_diff == [".gitmodules"]
+
+    code, payload, _ = judge(capsys, repo, head)
+
+    assert (code, payload["changed"]) == (NEEDS_OWNER, 2)
+    assert payload["reasons"] == [
+        "not on the allow-list: `.gitmodules`",
+        "not a plain file (mode 160000): `vendor`",
+        "not on the allow-list: `vendor`",
+    ]
+
+
+def test_gitlink_below_an_allowed_directory_is_not_a_document(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    branch_off(repo)
+    add_entry(repo, "160000", ".claude/docs/research/vendor")
+    (repo / ".claude/docs/research/vendor").mkdir()
+
+    code, payload, _ = judge(capsys, repo, commit(repo))
+
+    assert code == NEEDS_OWNER
+    assert payload["reasons"][0] == (
+        "not a plain file (mode 160000): `.claude/docs/research/vendor`"
+    )
+
+
+def test_attributes_in_the_pull_request_cannot_hide_a_change(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    code, payload, _ = proposed(
+        capsys, repo, {".gitattributes": "* -diff\n", "scripts/tool.sh": "changed\n"}
+    )
+
+    assert code == NEEDS_OWNER
+    assert "not on the allow-list: `scripts/tool.sh`" in payload["reasons"]
+    assert "not on the allow-list: `.gitattributes`" in payload["reasons"]
+
+
+# --- the base is main, worked out here ---
+
+
+def test_base_argument_is_not_accepted(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """There is no way to tell the gate where the branch started."""
+    head = propose(repo, {"README.md": "text\n"})
+
+    with pytest.raises(SystemExit) as stopped:
+        worker_gate.main(["--head", head, "--base", head, "--project-root", str(repo)])
+
+    assert stopped.value.code == REFUSED
+    assert json.loads(capsys.readouterr().out)["result"] == "refused"
+
+
+def test_earlier_commit_of_the_branch_is_part_of_what_is_judged(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """The branch first adds a script, then touches the README. Judged from
+    its own previous commit it would be documentation only."""
+    branch_off(repo)
+    write(repo, "scripts/evil.py", "print('x')\n")
+    commit(repo, "first: a script")
+    write(repo, "README.md", "# Project\n\nreworded\n")
+    head = commit(repo, "second: the README")
+
+    code, payload, _ = judge(capsys, repo, head)
+
+    assert (code, payload["changed"]) == (NEEDS_OWNER, 2)
+    assert payload["reasons"] == ["not on the allow-list: `scripts/evil.py`"]
+    assert payload["merge_base"] == git(repo, "rev-parse", MAIN_REF)
+
+
+def test_local_branch_named_main_does_not_decide_where_main_is(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """The local branch `main` is the session's to move. The gate reads the
+    remote-tracking ref, by its full name."""
+    head = propose(repo, {"scripts/tool.sh": "changed\n"})
+    git(repo, "branch", "--force", "main", head)
+    git(repo, "tag", "origin/main", head)
+
+    code, payload, _ = judge(capsys, repo, head)
+
+    assert code == NEEDS_OWNER
+    assert payload["reasons"] == ["not on the allow-list: `scripts/tool.sh`"]
+
+
+def test_missing_remote_tracking_main_is_refused(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    head = propose(repo, {"README.md": "text\n"})
+    git(repo, "update-ref", "-d", MAIN_REF)
+
+    code, payload, _ = judge(capsys, repo, head)
+
+    assert (code, payload["result"]) == (REFUSED, "refused")
+    assert MAIN_REF in payload["detail"]
+
+
+def test_only_the_branchs_own_change_is_judged(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    """`main` moved on after the branch was cut, and its commit touches a
+    script. That is not the pull request's change."""
+    fork_point = git(repo, "rev-parse", MAIN_REF)
+    head = propose(repo, {"README.md": "reworded\n"})
+    git(repo, "switch", "--quiet", "main")
+    write(repo, "scripts/tool.sh", "#!/bin/sh\necho changed on main\n")
+    git(repo, "commit", "--quiet", "--all", "-m", "main moves on")
+    moved = publish_main(repo)
+    git(repo, "switch", "--quiet", "agent/issue-1-change")
+
+    code, payload, _ = judge(capsys, repo, head)
+
+    assert (code, payload["result"]) == (ALLOWED, "self-merge-allowed")
+    assert (payload["main"], payload["merge_base"]) == (moved, fork_point)
+
+
 def test_history_unrelated_to_main_waits_for_the_owner(
     capsys: pytest.CaptureFixture[str], repo: Path
 ) -> None:
-    base = git(repo, "rev-parse", "HEAD")
     git(repo, "checkout", "--quiet", "--orphan", "agent/issue-1-orphan")
     git(repo, "commit", "--quiet", "-m", "no history")
 
-    code, payload, _ = judge(capsys, repo, base, git(repo, "rev-parse", "HEAD"))
+    code, payload, _ = judge(capsys, repo, git(repo, "rev-parse", "HEAD"))
 
     assert code == NEEDS_OWNER
-    assert payload["reasons"] == ["0 merge bases between --base and --head"]
+    assert payload["reasons"] == ["0 merge bases between main and --head"]
 
 
 # --- the verifier is main's, and its failure is never permission ---
+
+
+@pytest.mark.parametrize(
+    ("text", "pattern"),
+    [
+        ("TODO: write this\n", "todo-marker"),
+        ("def f():\n    raise NotImplementedError\n", "not-implemented"),
+    ],
+)
+def test_placeholder_in_a_document_waits_for_the_owner(
+    capsys: pytest.CaptureFixture[str], repo: Path, text: str, pattern: str
+) -> None:
+    rel = ".claude/docs/research/note.md"
+
+    code, payload, _ = proposed(capsys, repo, {rel: text})
+
+    assert (code, payload["result"]) == (NEEDS_OWNER, "needs-owner")
+    assert payload["reasons"] == [f"placeholder ({pattern}): `{rel}`"]
+
+
+def test_weakened_test_is_reported_by_mains_verifier(
+    capsys: pytest.CaptureFixture[str], repo: Path
+) -> None:
+    code, payload, _ = proposed(
+        capsys, repo, {"tests/test_tool.py": "def test_tool() -> None:\n    pass\n"}
+    )
+
+    assert code == NEEDS_OWNER
+    assert (
+        "weakened test (assertions-removed): `tests/test_tool.py`" in payload["reasons"]
+    )
+
 
 FAKE_VERIFIER = """import json, pathlib
 pathlib.Path({marker!r}).write_text("the pull request's verifier ran")
@@ -384,23 +690,23 @@ print(json.dumps({{"ok": True, "weakened_tests": [], "placeholders": []}}))
 """
 
 
-def test_verifier_is_read_out_of_the_base_commit_not_the_pull_request(
+def test_verifier_is_read_out_of_main_not_the_pull_request(
     capsys: pytest.CaptureFixture[str], repo: Path, tmp_path: Path
 ) -> None:
     """The pull request replaces the verifier with one that finds nothing,
-    and weakens a test. The verifier that runs is the one `main` has."""
+    and leaves a placeholder in a note. The verifier that runs is main's."""
     marker = tmp_path / "wrong-verifier-ran"
-    weakened = BASE_FILES[UNIT_TEST].replace("def test", "@pytest.mark.skip\ndef test")
+    note = ".claude/docs/research/note.md"
     changes = {
         worker_gate.VERIFIER: FAKE_VERIFIER.format(marker=str(marker)),
-        UNIT_TEST: weakened,
+        note: "TODO: later\n",
     }
 
     code, payload, _ = proposed(capsys, repo, changes)
 
     assert not marker.exists()
     assert code == NEEDS_OWNER
-    assert f"weakened test (skip-marker): {UNIT_TEST}" in payload["reasons"]
+    assert f"placeholder (todo-marker): `{note}`" in payload["reasons"]
 
 
 @pytest.mark.parametrize(
@@ -422,8 +728,9 @@ def test_verifier_that_cannot_report_is_a_failure_never_permission(
     else:
         write(repo, worker_gate.VERIFIER, verifier)
     git(repo, "commit", "--quiet", "--all", "-m", "main's verifier is broken")
+    publish_main(repo)
 
-    code, payload, _ = proposed(capsys, repo, {"docs/new.md": "new\n"})
+    code, payload, _ = proposed(capsys, repo, {"README.md": "new\n"})
 
     assert (code, payload["result"], payload["ok"]) == (FAILED, "tool-failed", False)
 
@@ -431,14 +738,14 @@ def test_verifier_that_cannot_report_is_a_failure_never_permission(
 def test_bug_in_the_gate_is_exit_three_not_permission(
     capsys: pytest.CaptureFixture[str], repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    base, head = propose(repo, {"docs/new.md": "new\n"})
+    head = propose(repo, {"README.md": "new\n"})
 
     def broken(*args: object) -> None:
         raise TypeError("a bug")
 
     monkeypatch.setattr(worker_gate, "path_reasons", broken)
 
-    code, payload, err = judge(capsys, repo, base, head)
+    code, payload, err = judge(capsys, repo, head)
 
     assert (code, payload["result"], payload["ok"]) == (FAILED, "crashed", False)
     assert "Traceback" in err
@@ -450,35 +757,33 @@ def test_bug_in_the_gate_is_exit_three_not_permission(
 def test_head_that_is_not_checked_out_is_refused(
     capsys: pytest.CaptureFixture[str], repo: Path
 ) -> None:
-    base, head = propose(repo, {"docs/new.md": "new\n"})
+    head = propose(repo, {"README.md": "new\n"})
     git(repo, "switch", "--quiet", "main")
 
-    code, payload, _ = judge(capsys, repo, base, head)
+    code, payload, _ = judge(capsys, repo, head)
 
     assert (code, payload["result"]) == (REFUSED, "refused")
 
 
-@pytest.mark.parametrize("rel", ["docs/uncommitted.md", "scripts/uncommitted.sh"])
+@pytest.mark.parametrize("rel", ["README.md", "scripts/uncommitted.sh", "notes.txt"])
 def test_work_tree_with_anything_beside_the_commit_is_refused(
     capsys: pytest.CaptureFixture[str], repo: Path, rel: str
 ) -> None:
-    base, head = propose(repo, {"docs/new.md": "new\n"})
+    head = propose(repo, {".claude/docs/research/new.md": "new\n"})
     write(repo, rel, "not in the commit\n")
 
-    code, payload, _ = judge(capsys, repo, base, head)
+    code, payload, _ = judge(capsys, repo, head)
 
     assert (code, payload["result"]) == (REFUSED, "refused")
 
 
-@pytest.mark.parametrize("which", ["--base", "--head"])
 @pytest.mark.parametrize("name", ["main", "HEAD", "abc1234", "f" * 40])
-def test_revisions_are_full_shas_of_commits_that_exist(
-    capsys: pytest.CaptureFixture[str], repo: Path, which: str, name: str
+def test_head_is_the_full_sha_of_a_commit_that_exists(
+    capsys: pytest.CaptureFixture[str], repo: Path, name: str
 ) -> None:
-    base, head = propose(repo, {"docs/new.md": "new\n"})
-    given = {"--base": base, "--head": head, which: name}
+    propose(repo, {"README.md": "new\n"})
 
-    code, payload, _ = judge(capsys, repo, given["--base"], given["--head"])
+    code, payload, _ = judge(capsys, repo, name)
 
     assert (code, payload["result"]) == (REFUSED, "refused")
 
@@ -488,12 +793,12 @@ def test_gate_judges_a_clean_checkout_made_for_it(
 ) -> None:
     """As the prompt runs it: the session's own directory holds review notes
     and other leftovers, so the commit is checked out again beside it."""
-    base, head = propose(repo, {"docs/new.md": "new\n"})
+    head = propose(repo, {"README.md": "new\n"})
     write(repo, "docs/review-notes.md", "left by the session\n")
     tree = tmp_path / "gate-tree"
     git(repo, "worktree", "add", "--quiet", "--detach", str(tree), head)
 
-    code, payload, _ = judge(capsys, tree, base, head)
+    code, payload, _ = judge(capsys, tree, head)
 
     assert (code, payload["result"]) == (ALLOWED, "self-merge-allowed")
 
@@ -504,7 +809,7 @@ def test_gate_follows_no_inherited_git_variable_and_runs_no_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    base, head = propose(repo, {"scripts/tool.sh": "changed\n"})
+    head = propose(repo, {"scripts/tool.sh": "changed\n"})
     decoy = tmp_path / "decoy"
     git(tmp_path, "init", "--quiet", str(decoy))
     marker = tmp_path / "a-hook-ran"
@@ -516,7 +821,7 @@ def test_gate_follows_no_inherited_git_variable_and_runs_no_hook(
     monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
 
-    code, payload, _ = judge(capsys, repo, base, head)
+    code, payload, _ = judge(capsys, repo, head)
 
     assert (code, payload["result"]) == (NEEDS_OWNER, "needs-owner")
     assert not marker.exists()
@@ -540,21 +845,27 @@ def python_version(python: str) -> tuple[int, int]:
 @pytest.mark.parametrize(
     "python", [sys.executable, str(SYSTEM_PYTHON)], ids=["this-python", "system-python"]
 )
-def test_gate_runs_as_a_single_file_from_anywhere(
+def test_gate_runs_as_a_single_file_in_isolated_mode(
     repo: Path, tmp_path: Path, python: str
 ) -> None:
-    """The worker runs it as `git show` wrote it: one file in a directory of
-    its own, with nothing of the repository beside it. Under a Python older
-    than the verifier needs it still answers, and the answer is not yes."""
+    """The worker runs it as `git show` wrote it, with `python3 -I`: one file
+    in a directory of its own, nothing of the repository beside it, and no
+    directory of the session on the import path. A module of the gate's own
+    name planted beside it and in the checkout is not imported. Under a
+    Python older than the verifier needs it still answers, and not yes."""
     if python != sys.executable and not SYSTEM_PYTHON.exists():
         pytest.skip(f"{SYSTEM_PYTHON} is not installed; the oldest Python is not run")
-    base, head = propose(repo, {"docs/new.md": "new\n"})
+    head = propose(repo, {"README.md": "new\n"})
     alone = tmp_path / "elsewhere" / "gate.py"
     alone.parent.mkdir()
     shutil.copyfile(GATE, alone)
+    marker = tmp_path / "a-planted-module-ran"
+    planted = f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+    for module in ("json.py", "argparse.py", "shutil.py"):
+        (alone.parent / module).write_text(planted, encoding="utf-8")
 
     done = subprocess.run(
-        [python, str(alone), "--base", base, "--head", head],
+        [python, "-I", str(alone), "--head", head],
         capture_output=True,
         text=True,
         timeout=180,
@@ -562,6 +873,7 @@ def test_gate_runs_as_a_single_file_from_anywhere(
     )
 
     payload = json.loads(done.stdout)
+    assert not marker.exists()
     if python_version(python) >= VERIFIER_NEEDS:
         assert (done.returncode, payload["result"]) == (ALLOWED, "self-merge-allowed")
     else:
@@ -579,7 +891,7 @@ def test_gate_imports_nothing_from_the_repository() -> None:
 
 def test_usage_error_is_json_and_exit_one(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as stopped:
-        worker_gate.main(["--base", "a" * 40])
+        worker_gate.main([])
 
     assert stopped.value.code == REFUSED
     assert json.loads(capsys.readouterr().out)["result"] == "refused"
@@ -588,6 +900,76 @@ def test_usage_error_is_json_and_exit_one(capsys: pytest.CaptureFixture[str]) ->
 def test_outcome_that_was_not_declared_cannot_be_reported() -> None:
     with pytest.raises(ValueError, match="undeclared outcome"):
         worker_gate.report({}, "self-merge-allowed", NEEDS_OWNER, "x")
+
+
+# --- the sensitive list: what a person reading a pull request is shown ---
+
+
+@pytest.mark.parametrize(
+    ("rel", "entry"),
+    [
+        (".github/workflows/ci.yml", ".github/"),
+        (".GitHub/workflows/ci.yml", ".github/"),
+        (".claude/hooks/x.py", ".claude/hooks/"),
+        (".claude/commands/x.md", ".claude/commands/"),
+        (".claude/output-styles/x.md", ".claude/output-styles/"),
+        (".claude/agent-memory/x.md", ".claude/agent-memory/"),
+        (".claude/docs/plans/p.md", ".claude/docs/plans/"),
+        (".claude/docs/libraries/l.md", ".claude/docs/libraries/"),
+        (".claude/docs/DESIGN.md", ".claude/docs/*"),
+        (".claude/docs/change_main.md", ".claude/docs/*"),
+        (".claude/docs/INDEX.md", ".claude/docs/*"),
+        (".claude/STATE.md", ".claude/STATE.md"),
+        ("PROGRESS.md", "PROGRESS.md"),
+        (".claude/settings.json", ".claude/settings.json"),
+        (".claude/settings.local.json", ".claude/settings.local.json"),
+        ("scripts/update.sh", "scripts/"),
+        ("tests/test_x.py", "tests/"),
+        ("conftest.py", "conftest.py"),
+        ("src/pkg/conftest.py", "conftest.py"),
+        ("pytest.ini", "pytest.ini"),
+        ("tox.ini", "tox.ini"),
+        ("setup.cfg", "setup.cfg"),
+        ("ruff.toml", "ruff.toml"),
+        ("uv.toml", "uv.toml"),
+        (".python-version", ".python-version"),
+        ("sitecustomize.py", "sitecustomize.py"),
+        ("src/evil.pth", "*.pth"),
+        ("Makefile", "Makefile"),
+        ("package.json", "package.json"),
+        (".pre-commit-config.yaml", ".pre-commit-config.yaml"),
+        (".envrc", ".envrc"),
+        (".gitattributes", ".gitattributes"),
+        ("docs/.gitattributes", ".gitattributes"),
+        (".gitmodules", ".gitmodules"),
+        (".gitignore", ".gitignore"),
+        ("GEMINI.md", "GEMINI.md"),
+        (".cursorrules", ".cursorrules"),
+        ("opencode.json", "opencode.json"),
+        ("docs/CLAUDE.md", "CLAUDE.md"),
+        ("docs/claude.local.md", "CLAUDE.local.md"),
+        ("docs/AGENTS.md", "AGENTS.md"),
+    ],
+)
+def test_sensitive_list_names_what_a_session_or_a_tool_loads(
+    rel: str, entry: str
+) -> None:
+    assert worker_gate.sensitive_entry(rel) == entry
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "README.md",
+        "TEMPLATE_DESIGN_LOG.md",
+        ".claude/docs/research/a.md",
+        ".claude/docs/reviews/a.md",
+        "docs/guide.md",
+        "src/app.py",
+    ],
+)
+def test_sensitive_list_does_not_name_plain_documents_and_sources(rel: str) -> None:
+    assert worker_gate.sensitive_entry(rel) is None
 
 
 # --- pinned to what repeats it ---
@@ -599,6 +981,13 @@ OUTCOME_ROW_RE = re.compile(r"^\| `([a-z0-9-]+)` \| ([0-9]( / [0-9])*) \|")
 def readme_gate_section() -> str:
     text = README.read_text(encoding="utf-8")
     return text.split("\n### Issue worker\n", 1)[1].split("\n### ", 1)[0]
+
+
+def listed_between(section: str, start: str, end: str) -> set[str]:
+    flat_section = " ".join(section.split())
+    return set(
+        re.findall(r"`([^`]+)`", flat_section.split(start, 1)[1].split(end, 1)[0])
+    )
 
 
 def test_readme_gate_table_matches_what_the_gate_can_report() -> None:
@@ -613,14 +1002,35 @@ def test_readme_gate_table_matches_what_the_gate_can_report() -> None:
     assert documented == worker_gate.OUTCOMES
 
 
-def test_readme_names_the_stop_list_the_gate_enforces() -> None:
+def test_readme_names_the_allow_list_the_gate_enforces() -> None:
+    documented = listed_between(
+        readme_gate_section(), "The allow-list is", ". Nothing else"
+    )
+
+    assert documented == set(worker_gate.ALLOWED_FILES) | {
+        f"{name}/" for name in worker_gate.ALLOWED_DIRECTORIES
+    }
+
+
+def test_readme_says_plainly_what_the_worker_merges_by_itself() -> None:
     section = " ".join(readme_gate_section().split())
-    listed = section.split("The stop-list, any path", 1)[1].split(". These", 1)[0]
-    documented = set(re.findall(r"`([^`]+)`", listed))
+
+    assert (
+        "**The worker merges documentation-only changes by itself; everything "
+        "else waits for the owner.**" in section
+    )
+
+
+def test_readme_names_the_sensitive_list_the_helper_reports() -> None:
+    text = README.read_text(encoding="utf-8")
+    section = text.split("\n### What the result carries\n", 1)[1].split("\n### ", 1)[0]
+    documented = listed_between(section, "The sensitive list:", ". It is a deny-list")
     enforced = (
-        {f"{name}/" for name in worker_gate.STOP_DIRECTORIES}
-        | set(worker_gate.STOP_FILES)
-        | set(worker_gate.STOP_NAMES)
+        {f"{name}/" for name in worker_gate.SENSITIVE_DIRECTORIES}
+        | {f"{name}/*" for name in worker_gate.SENSITIVE_FLAT_DIRECTORIES}
+        | set(worker_gate.SENSITIVE_FILES)
+        | set(worker_gate.SENSITIVE_NAMES)
+        | {f"*{suffix}" for suffix in worker_gate.SENSITIVE_SUFFIXES}
     )
 
     assert documented == enforced
@@ -629,11 +1039,13 @@ def test_readme_names_the_stop_list_the_gate_enforces() -> None:
 def test_gate_shows_a_name_the_way_the_intake_helper_does() -> None:
     for name in ("docs/guide.md", "a b", "x'$(id)'`y`", "-rf", "caf" + chr(0xE9)):
         assert worker_gate.inert(name) == scratch_repo.inert_path(name), name
+        assert worker_gate.spanned(name) == scratch_repo.code_span(name), name
 
 
 def test_gate_and_intake_helper_agree_on_what_a_name_may_be() -> None:
     assert worker_gate.NAME_RE.pattern == scratch_repo.NAME_RE.pattern
     assert worker_gate.PLAIN_MODES == scratch_repo.PLAIN_MODES
+    assert worker_gate.MAIN_REF == common.MAIN_REF
 
 
 # --- the prompt ---
@@ -709,9 +1121,16 @@ PINNED_SENTENCES = (
     "state (D), post the question, implement nothing.",
     "Any later commit, whatever its reason, goes through steps 7 and 8 again "
     "before it is pushed, and becomes the new `<HEAD_SHA>`.",
+    "You merge documentation-only changes yourself; everything else waits for "
+    "the owner.",
+    "A task that changes anything but documentation is still done: it ends in "
+    "state (C), because the gate of step 11 leaves it to the owner.",
     "The gate script comes out of `refs/remotes/origin/main`, never out of your "
     "branch.",
-    "- Any other exit, a missing script included: state (C). No merge call.",
+    "- Go to step 12 only when both hold: the chain printed `gate exit: 0`, and "
+    'its stdout holds `"result": "self-merge-allowed"`.',
+    "- Anything else, a missing script or no output included: state (C). No "
+    "merge call.",
     "never start a second copy while one runs, and never wait with a `sleep` of "
     "your own. Run it at most five times (40 minutes).",
     "Then steps 7 and 8 for the fix, an ordinary push, and steps 11 and 12 from "
@@ -796,7 +1215,7 @@ def test_prompt_sentence_a_step_rests_on_is_word_for_word(sentence: str) -> None
 def test_prompt_is_versioned_and_has_every_section() -> None:
     text = prompt()
 
-    assert re.search(r"(?m)^Prompt-Version: 2$", text)
+    assert re.search(r"(?m)^Prompt-Version: 3$", text)
     for heading in (
         "## Hard rules",
         "## Steps",
@@ -884,24 +1303,27 @@ def test_prompt_reads_one_issue_body_and_no_comment_body() -> None:
     assert len(hashed) == 1 and "hashlib.sha256" in hashed[0]
 
 
-def test_prompt_asks_the_gate_from_main_before_any_merge_call() -> None:
+def test_prompt_asks_the_gate_from_main_in_one_chain_before_any_merge_call() -> None:
+    """One chain: if the script cannot be read out of `main`, or is empty,
+    nothing runs and the exit code printed is not 0. An empty file run by
+    `python3` would exit 0 without a gate ever having run."""
     text = prompt()
-    show = (
-        "git show refs/remotes/origin/main:scripts/maint/worker_gate.py "
-        "> /tmp/orchestra-worker-gate.py"
-    )
-    run = (
-        "python3 /tmp/orchestra-worker-gate.py --project-root /tmp/orchestra-gate-tree "
-        "--base <BASE> --head <HEAD_SHA>"
+    chain = (
+        "d=$(mktemp -d) && git show refs/remotes/origin/main:scripts/maint/"
+        'worker_gate.py > "$d/gate.py" && test -s "$d/gate.py" && python3 -I '
+        '"$d/gate.py" --project-root /tmp/orchestra-gate-tree --head <HEAD_SHA>; '
+        'echo "gate exit: $?"'
     )
 
-    assert text.count(show) == 1 and text.count(run) == 1
+    assert text.count(f"\n{chain}\n") == 1
+    assert "--base" not in chain and "<BASE>" not in text
     assert "git worktree add --detach /tmp/orchestra-gate-tree <HEAD_SHA>" in text
-    assert text.index(show) < text.index(run) < text.index("check-runs")
-    assert text.index("check-runs") < text.index("merge_method=squash")
-    assert "scripts/maint/worker_gate.py" not in text.replace(show, "").replace(
-        "`scripts/maint/worker_gate.py`", ""
+    assert (
+        text.index(chain) < text.index("check-runs") < text.index("merge_method=squash")
     )
+    # The script is named where it is read out of `main`, and nowhere as a
+    # file of the branch to run.
+    assert not re.search(r"(?m)^\s*python3 [^\n]*scripts/maint/worker_gate\.py", text)
 
 
 def test_prompt_waits_for_both_required_checks_from_github_actions() -> None:

@@ -20,9 +20,13 @@ happens instead:
   characters, a name that collides with another on a case-insensitive file
   system.
 * :func:`inert_path` and :func:`inert_text` are what every string from a
-  tree, a tool or git goes through before it is reported. What comes out can
-  be pasted into a shell or into Markdown that is posted under the owner's
-  name: no quote, no backtick, no mention, no reference, no link.
+  tree, a tool or git goes through before it is reported. The contract of
+  what comes out: safe as ONE quoted argument or an argv element, and in
+  Markdown prose; never unquoted in a shell. It holds no quote of either
+  kind, no backtick, no ``$``, no mention, no reference and no link, but it
+  does hold spaces, ``;`` and parentheses. A path is the exception to
+  "Markdown prose": whoever posts one puts it in a code span
+  (:func:`code_span`), because ``@`` and ``www.`` are legal in a name.
 
 Objects made here stay here. The fork's repository gets one finished commit,
 fetched from the scratch repository at the very end.
@@ -53,7 +57,7 @@ NAME_RE = re.compile(r"[A-Za-z0-9._/+@-]+")
 OPTION_PREFIX = "-"
 # What a sentence may additionally hold. `@` is left out: in prose it is a
 # mention.
-TEXT_CHARACTERS = (NAME_CHARACTERS - {"@"}) | frozenset(" ,:;()=_'\"")
+TEXT_CHARACTERS = (NAME_CHARACTERS - {"@"}) | frozenset(" ,:;()=_")
 # Character sequences GitHub turns into a link or a reference although every
 # character of them is harmless on its own: sequence -> the character in it
 # that is written as an escape.
@@ -143,18 +147,32 @@ def _only(text: str, allowed: frozenset[str]) -> str:
 def inert_path(name: str) -> str:
     """A path as reported: every character outside ``NAME_CHARACTERS`` is a
     visible escape, and so is a leading dash. A supported name comes out as
-    it went in; a refused one can still be shown without being acted on."""
+    it went in; a refused one can still be shown without being acted on.
+
+    Safe as ONE quoted argument or an argv element. In Markdown it must be
+    rendered inside a code span by whoever posts it (:func:`code_span`): a
+    supported name may be ``www.example.org/@someone``, which prose turns
+    into a link and a mention. It can hold no backtick, so a span closes."""
     made = _only(name, NAME_CHARACTERS)
     if made.startswith(OPTION_PREFIX):
         made = _escape(OPTION_PREFIX) + made[1:]
     return made if len(made) <= NOTE_LIMIT else made[: NOTE_LIMIT - 3] + "..."
 
 
+def code_span(name: str) -> str:
+    """A path the way it is written into anything a person reads or posts."""
+    return f"`{inert_path(name)}`"
+
+
 def inert_text(text: str, limit: int = NOTE_LIMIT) -> str:
-    """One line of prose from a tool, git, a commit or a note, with nothing
-    left that Markdown or a shell would act on: backticks, pipes, `#`, `@`,
-    brackets and quotes of command substitution become escapes, link-forming
-    sequences are broken, and the line cannot open a list or a quote."""
+    """One line of prose from a tool, git, a commit or a note.
+
+    Safe as ONE quoted argument or an argv element, and in Markdown prose;
+    never unquoted in a shell. Both kinds of quote, backticks, ``$``, pipes,
+    ``#``, ``@`` and brackets become escapes, so neither kind of shell quote
+    can be closed from inside and nothing is substituted; link-forming
+    sequences are broken, and the line cannot open a list or a quote. Spaces,
+    ``;``, ``=`` and parentheses stay: unquoted, the text is still words."""
     made = _only(" ".join(text.split()), TEXT_CHARACTERS)
     for pattern, char in AUTOLINKS:
         made = pattern.sub(
@@ -274,7 +292,9 @@ class Scratch:
             "rev-parse", "--path-format=absolute", "--git-path", "objects"
         )
         if "\n" in objects or objects.startswith(('"', "#")):
-            refuse("this repository's object directory has a name git cannot borrow")
+            refuse(
+                "the object directory of this repository has a name git cannot borrow"
+            )
         made = common.run_command(
             ["git", *GIT_OPTIONS, "init", "--quiet", "--template=", str(path)],
             common.GIT_TIMEOUT_SEC,
@@ -347,19 +367,19 @@ def unsupported_entries(repo: Repo, tree: str) -> list[str]:
         mode = meta.split(" ", 1)[0]
         parts = name.split("/")
         if mode not in PLAIN_MODES:
-            problems.append(f"{inert_path(name)}: mode {mode} is not a plain file")
+            problems.append(f"{code_span(name)}: mode {mode} is not a plain file")
         if parts[-1] == ATTRIBUTES_FILE:
-            problems.append(f"{inert_path(name)}: an attributes file")
+            problems.append(f"{code_span(name)}: an attributes file")
         if NAME_RE.fullmatch(name) is None:
-            problems.append(f"{inert_path(name)}: a character outside A-Za-z0-9._/+@-")
+            problems.append(f"{code_span(name)}: a character outside A-Za-z0-9._/+@-")
         if any(part.startswith(OPTION_PREFIX) for part in parts):
-            problems.append(f"{inert_path(name)}: a name that starts with a dash")
+            problems.append(f"{code_span(name)}: a name that starts with a dash")
         for depth in range(1, len(parts) + 1):
             prefix = "/".join(parts[:depth])
             if seen.setdefault(prefix.casefold(), prefix) != prefix:
                 problems.append(
-                    f"{inert_path(prefix)}: the same name as "
-                    f"{inert_path(seen[prefix.casefold()])} "
+                    f"{code_span(prefix)}: the same name as "
+                    f"{code_span(seen[prefix.casefold()])} "
                     "on a case-insensitive file system"
                 )
     return sorted(set(problems))

@@ -34,9 +34,10 @@ extracted into a private directory, so no file of the tree being merged is
 ever executed.
 
 Everything reported that came from a tree, a tool or git goes through
-``scratch_repo.inert_path`` or ``inert_text``: what is in the JSON can be
-pasted into a shell or posted as Markdown without acting there. Nothing here
-pushes, and nothing contacts a remote.
+``scratch_repo.inert_path`` or ``inert_text``. What is in the JSON is safe as
+ONE quoted argument or an argv element, and in Markdown prose; never unquoted
+in a shell. A path is posted inside a code span; the lines this prints for a
+person already do that. Nothing here pushes, and nothing contacts a remote.
 
 Standard library only; runs on Python 3.9. Needs git 2.40 or newer.
 
@@ -556,7 +557,7 @@ def report(command: str, payload: dict[str, object], exit_code: int) -> int:
         print(f"finding: {finding['invariant']}: {finding['detail']}", file=sys.stderr)
     for conflict in conflicts if isinstance(conflicts, list) else []:
         kinds = ", ".join(conflict["types"]) or "unmerged"
-        print(f"conflict: {conflict['path']}: {kinds}", file=sys.stderr)
+        print(f"conflict: `{conflict['path']}`: {kinds}", file=sys.stderr)
     print(f"{command}: {result}: {detail}", file=sys.stderr)
     body = {"ok": exit_code == common.EXIT_OK, "command": command, **payload}
     print(json.dumps({**body, "detail": detail, "exit_code": exit_code}))

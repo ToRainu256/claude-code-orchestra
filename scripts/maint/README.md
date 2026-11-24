@@ -421,7 +421,7 @@ first.
 | `manifest-applied` | Every rendered model value equals the manifest | `models.py check --strict` |
 | `manifest-needs-owner` | That tool does not refuse the tree. It refuses when the manifest names an agent the tree lacks, or the tree has one the manifest does not name. Rendering the manifest again cannot clear this, and the manifest is the owner's: the owner assigns the model | `models.py check --strict`, its `refused:` lines |
 | `seeds-pinned` | Each file under `scripts/scaffold/` has the SHA-256 that `tests/test_scaffold.py` pins | Read here, from that test file's `SEED_SHA256` |
-| `install-urls` | `scripts/update.sh` assigns `TEMPLATE_REPO` exactly once, whatever the indentation or keyword, and that line is the fork's default byte for byte; no README line clones upstream's default branch or fetches an installer from upstream (`curl`, `wget`, a raw URL) | Read here |
+| `install-urls` | `scripts/update.sh` assigns `TEMPLATE_REPO` exactly once, whatever the indentation or keyword, and that line is the fork's default byte for byte; no README line clones upstream's default branch or fetches an installer from upstream (`curl`, `wget`, a raw URL). A consistency check, not a proof: a shell script cannot be proven by a line pattern, and `ORCHESTRA_TEMPLATE_REPO=…` assigned above the default, or `true && TEMPLATE_REPO=…`, still passes. Any change to `scripts/update.sh` shows in `sensitive_changes` | Read here |
 | `no-claude-md` | None of the three files `scripts/check.sh` refuses exists | Read here, the same list |
 | `plain-entries` | (`check --rev` only) The commit holds no entry that is not checked out; see below | Read here |
 
@@ -474,9 +474,34 @@ request's, or the pull request is not the automatic merge. Otherwise
 
 Everything in the JSON that came from a tree, a tool or git is already inert:
 a path is given with every character outside `A-Za-z0-9._/+@-` as a `\xNN`
-escape, and a line of text with backticks, pipes, `#`, `@`, brackets and
-link-forming sequences escaped as well. It can be pasted into a shell or
-posted as Markdown under the owner's name without acting there.
+escape, and a line of text with both kinds of quote, backticks, `$`, pipes,
+`#`, `@`, brackets and link-forming sequences escaped as well. The contract:
+safe as ONE quoted argument or an argv element, and in Markdown prose; never
+unquoted in a shell (a line of text still holds spaces, `;` and parentheses).
+
+A path is the one thing that does not go into Markdown prose as it is.
+`www.example.org/@someone` is a supported name, and prose turns it into a
+link and a mention. Whoever posts a path puts it in a code span; a reported
+name can hold no backtick, so the span closes. What the helper and the gate
+print for a person (`conflict:` lines, refused entries, the gate's `reasons`)
+already carries the span.
+
+The sensitive list: `.github/`, `.claude/hooks/`, `.claude/rules/`,
+`.claude/skills/`, `.claude/agents/`, `.claude/commands/`,
+`.claude/output-styles/`, `.claude/agent-memory/`, `.claude/docs/plans/`,
+`.claude/docs/libraries/`, `.agents/`, `.codex/`, `scripts/`, `tests/`,
+`.claude/docs/*`, `.claude/settings.json`, `.claude/settings.local.json`,
+`.claude/STATE.md`, `PROGRESS.md`, `.mcp.json`, `pyproject.toml`, `uv.lock`,
+and in whatever directory `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`,
+`GEMINI.md`, `.cursorrules`, `opencode.json`, `conftest.py`, `pytest.ini`,
+`tox.ini`, `setup.cfg`, `ruff.toml`, `uv.toml`, `.python-version`,
+`sitecustomize.py`, `Makefile`, `package.json`, `.pre-commit-config.yaml`,
+`.envrc`, `.gitattributes`, `.gitmodules`, `.gitignore`, `*.pth`. It is a
+deny-list, in any letter case, and it only annotates: it is what
+`sensitive_changes` reports for the person reading a pull request, and a
+name it does not know costs a missing line there, not a merge. What may
+merge unattended is decided by another, short allow-list (the issue worker's
+gate, below).
 
 | Field | On | Holds |
 |-------|----|-------|
@@ -484,7 +509,7 @@ posted as Markdown under the owner's name without acting there.
 | `conflicts` | `intake` | Each conflicted path and what git called the conflict |
 | `conflicts_without_transform` | `intake` | How many paths a plain merge conflicts in; a measure, nothing more |
 | `findings` | `invariants-failed`, `violated`, `fork-not-clean` | Each failed invariant by name, with the checker's line |
-| `sensitive_changes` | `merged` | The paths this merge changes that define the required checks or that a later session executes or loads as instructions. It is the issue worker's stop-list (below), computed, so the list a reviewer reads first is not somebody's search |
+| `sensitive_changes` | `merged` | The paths this merge changes that define the required checks or that a later session executes or loads as instructions. The sensitive list above, computed, so the list a reviewer reads first is not somebody's search |
 | `edited_by_hand` | `seal` | Every path that differs from the automatic merge |
 | `resolutions`, `seed_pins_changed`, `ignored_files_left_out` | `seal` | The notes as given; whether a seed's pin changed; files `git add` left out because they are ignored |
 
@@ -586,6 +611,10 @@ ends by reporting in its own comment on the `automation:status` issue
 an exact sentence, and their number: an edit to a rule has to change the test
 in the same diff. Creating or changing the routine itself is the owner's.
 
+**The worker merges documentation-only changes by itself; everything else
+waits for the owner.** It still does the other work: it implements, runs the
+gates and the review, and opens the pull request. It does not merge it.
+
 A cloud session acts under the owner's GitHub account. Three things follow,
 and the prompt is built on them:
 
@@ -596,41 +625,86 @@ and the prompt is built on them:
   it or that carries an `automation:` label, never reads a comment, and
   checks in the issue's events that the owner's account applied the label.
 - **Whether a pull request may merge is not the session's to judge.** The
-  worker runs `worker_gate.py` as it is on `main`
-  (`git show refs/remotes/origin/main:scripts/maint/worker_gate.py`), never
-  as it is in the pull request, and merges only on exit 0. Everything else
-  stays open for the owner.
+  worker runs `worker_gate.py` as it is on `main`, never as it is in the pull
+  request, in one command that cannot succeed unless the gate ran
+  (`d=$(mktemp -d) && git show refs/remotes/origin/main:… > "$d/gate.py" &&
+  test -s "$d/gate.py" && python3 -I "$d/gate.py" …`), and goes on only when
+  the exit code is 0 and stdout holds `"result": "self-merge-allowed"`.
 - **The merge is pinned.** One REST squash call, at the commit the review
   read, the gate allowed and both required checks, produced by GitHub
   Actions, succeeded on.
 
-`worker_gate.py --base SHA --head SHA [--project-root DIR]` judges the change
-between the merge base of the two commits and `--head`, which must be the
-commit checked out, with nothing beside it. It is one file with no import
-from the repository, so that it can be read out of a commit and run; the
-verifier it starts, `verify_delegation.py`, is read out of `--base` the same
-way (it needs Python 3.11; under an older one the gate fails closed with
-`tool-failed`).
+`worker_gate.py --head SHA [--project-root DIR]` judges the change between
+`--head` and its merge base with `refs/remotes/origin/main`. It works that
+base out itself and takes it from nobody: there is no `--base`. `--head` must
+be the commit checked out, with nothing beside it. The change is listed by
+comparing `git ls-tree -r` of the two commits, so nothing in the pull
+request's tree is asked what changed: a `.gitmodules` that tells `git diff`
+to ignore a submodule hides nothing. The gate is one file with no import
+from the repository, so that it can be read out of a commit and run with
+`python3 -I`; the verifier it starts, `verify_delegation.py`, is read out of
+`main` the same way (it needs Python 3.11; under an older one the gate fails
+closed with `tool-failed`).
 
-The stop-list, any path below or equal to one of these, in any letter case:
-`.github/`, `.claude/hooks/`, `.claude/rules/`, `.claude/skills/`,
-`.claude/agents/`, `.agents/`, `.codex/`, `scripts/`, `tests/`,
-`.claude/settings.json`, `.mcp.json`, `pyproject.toml`, `uv.lock`, and any
-`AGENTS.md`, `CLAUDE.md` or `CLAUDE.local.md`, in whatever directory. These
-define the required checks, or are what a
-later session executes or loads as instructions: a pull request that changes
-one would certify itself, or instruct whoever merges the next one.
+The allow-list is `README.md`, `TEMPLATE_DESIGN_LOG.md`,
+`.claude/docs/research/` and `.claude/docs/reviews/`. Nothing else, and the
+match is on the exact path, case included: `readme.md` is not on it. It is a
+list of what may merge and not of what may not, so a file name nobody thought
+of, a `conftest.py`, a `pytest.ini`, a new settings file, is simply not on
+it. What every session loads through `context-loader` is deliberately left
+out: `PROGRESS.md`, `.claude/STATE.md`, `.claude/docs/DESIGN.md`, the plans,
+the library notes and the procedure documents directly under `.claude/docs/`.
+A run that records a design decision or writes a plan therefore ends with a
+pull request for the owner.
+
+An allowed path must also be a plain file of mode 100644 before and after,
+added or modified. A deletion, a rename (which deletes), an executable bit, a
+link, a submodule entry, a name outside `A-Za-z0-9._/+@-`, or a name tools
+read wherever it lies (a `CLAUDE.md` below `.claude/docs/research/`) waits
+for the owner. So does a placeholder or a weakened test the verifier finds.
 
 #### `worker_gate`
 
 | Outcome | Exit | Means | What to do |
 |---------|------|-------|------------|
-| `self-merge-allowed` | 0 | No changed path is on the stop-list, every one is a plain file with a supported name, no test file is deleted, and the verifier reports no weakened test and no placeholder | The worker may send its merge call |
-| `needs-owner` | 2 | At least one of those does not hold; `reasons` lists each | The pull request stays open; the owner merges or closes it |
-| `refused` | 1 | A revision is not a full SHA of a commit here, `--head` is not what is checked out, or the work tree holds anything else | Fix the call; the worker does not merge |
+| `self-merge-allowed` | 0 | Every changed path is on the allow-list, added or modified as a plain file of mode 100644 with a supported name, and the verifier reports no weakened test and no placeholder | The worker may send its merge call |
+| `needs-owner` | 2 | At least one of those does not hold; `reasons` lists each, with the path in a code span | The pull request stays open; the owner merges or closes it |
+| `refused` | 1 | `--head` is not a full SHA of a commit here or is not what is checked out, the work tree holds anything else, `refs/remotes/origin/main` is missing, or an argument such as `--base` is not one the gate has | Fix the call; the worker does not merge |
 | `git-failed` | 3 | A git command failed | The worker does not merge |
-| `tool-failed` | 3 | The verifier is not in `--base`, failed, or did not report | The worker does not merge |
+| `tool-failed` | 3 | The verifier is not on `main`, failed, or did not report | The worker does not merge |
 | `crashed` | 3 | The gate itself raised an unexpected error | The worker does not merge; report it |
+
+**Before labeling an issue `agent:ready`.** The whole body of the issue is
+the task, and the worker cannot tell which of its sentences are yours.
+
+- Do not label an issue whose body quotes text you did not write: a log, a
+  review, something from upstream. Put the task in your own words.
+- Read an issue before labeling it if a session may have written it. Only
+  issues a job opens through this repository's code carry the `<!-- job:`
+  marker; one a session opened by hand does not.
+- Beware a link that opens the new-issue form already filled in, with
+  `labels=agent:ready` in it: one click on "Submit" creates an issue you
+  authored and you labeled, with somebody else's text.
+- Keep the collaborator list at yourself: a collaborator can edit your issue
+  body and add the label, and the API does not show who edited.
+
+**What you accept by creating this routine.** The gate and the pinned checks
+bind a session that follows its prompt. A session that is talked out of its
+prompt acts as you, and these are open to it:
+
+- sending the merge call without running the gate. The two required checks
+  run the pull request's own `scripts/check.sh` and tests, so a pull request
+  can make them green;
+- pushing an already-green commit to `main`, which is the same thing;
+- adding `agent:ready` to an issue, or editing an issue body: writing its own
+  next task;
+- step 7 of the prompt runs the branch's code in the session before any gate.
+
+What does bind it: no force-push, no commit on `main` without the two checks,
+and checks accepted from GitHub Actions only (the branch protection pins
+them to that app). What limits the damage: the Mac executes only a promoted
+revision, so the reach is later cloud sessions and your own interactive
+checkouts.
 
 **Trigger and schedule.** The prompt does not depend on what starts it.
 Recommended: a schedule, daily at `37 18 * * *` UTC, which is 03:37 the next
@@ -648,7 +722,7 @@ weekly: `7 0 * * 1` UTC is Monday 09:07 in Asia/Tokyo.
 | `upstream_intake.py` | `T`, the merge, the protected paths, what is reported, `intake` |
 | `intake_seal.py` | `seal`: the automatic merge built again, the answers, the finished tree |
 | `scratch_repo.py` | git cut off from the user's configuration; the scratch repository; which trees are not checked out; the inert forms of a path and of text |
-| `worker_gate.py` | The issue worker's merge gate and the stop-list; one file, no imports from the repository |
+| `worker_gate.py` | The issue worker's merge gate (the allow-list) and the sensitive list `sensitive_changes` reports; one file, no imports from the repository |
 | `routines/issue-worker.md` | The issue worker's prompt |
 
 Tests: `tests/test_maint_fork_invariants.py`, on real scratch repositories

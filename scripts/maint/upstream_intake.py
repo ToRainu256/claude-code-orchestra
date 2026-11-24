@@ -221,7 +221,7 @@ def merge(scratch: Scratch, *args: str) -> tuple[str, list[Conflict]]:
     except (ValueError, IndexError):
         failed(scratch_repo.RESULT_GIT, "git merge-tree printed what this cannot read")
     if (result.returncode == 1) != bool(conflicts):
-        detail = "git merge-tree's exit code and its conflict list disagree"
+        detail = "the exit code of git merge-tree and its conflict list disagree"
         failed(scratch_repo.RESULT_GIT, detail)
     return tree, conflicts
 
@@ -293,13 +293,15 @@ def upstream_log(sides: Sides) -> list[dict[str, str]]:
 
 def sensitive_changes(repo: Repo, sides: Sides, tree: str) -> list[str]:
     """The changed paths a reviewer reads first: what defines the required
-    checks, and what a later session executes or loads as instructions. It is
-    the issue worker's stop-list, computed here so that the list in a pull
-    request is not somebody's own search."""
+    checks, and what a later session or a tool executes or loads. The list
+    is ``worker_gate.sensitive_entry``, a deny-list: it annotates a pull
+    request a person reads and decides nothing, so a name it does not know
+    costs a missing line, not a merge. Computed here so that the list in a
+    pull request is not somebody's own search."""
     return [
         inert_path(path)
         for path in changed_paths(repo, sides.fork, tree)
-        if worker_gate.stop_list_entry(path) is not None
+        if worker_gate.sensitive_entry(path) is not None
     ]
 
 
@@ -330,7 +332,7 @@ def protected_findings(repo: Repo, sides: Sides, tree: str) -> list[invariants.F
         found.append(invariants.Finding("workflows-untouched", detail))
     for rel in FORK_OWNED:
         if repo.blob_at(sides.fork, rel) != repo.blob_at(tree, rel):
-            detail = f"{rel} is no longer the fork's own file"
+            detail = f"{rel} is no longer the file the fork has"
             found.append(invariants.Finding("fork-owned-untouched", detail))
     return found
 
@@ -432,7 +434,7 @@ def preflight(sides: Sides) -> dict[str, object]:
         paths = [inert_path(path) for path in workflows]
         detail = f"upstream changed files under {WORKFLOWS}"
         needs_owner(invariants.RESULT_WORKFLOWS, detail, **known, paths=paths)
-    for name, tree in (("the merge base", base), ("upstream's tip", upstream)):
+    for name, tree in (("the merge base", base), ("the tip of upstream", upstream)):
         entries = scratch_repo.unsupported_entries(project, tree)
         if entries:
             detail = f"{name} holds entries this does not check out"
@@ -455,7 +457,7 @@ def merge_transformed(
         invariants.Target(tools, scratch.repo.path, scratch.repo.env)
     )
     if own:
-        detail = "the fork's own tree fails its invariants; fix that first"
+        detail = "the tree of the fork commit fails its invariants; fix that first"
         needs_owner(invariants.RESULT_FORK, detail, findings=invariants.as_json(own))
     base_tree, applied_to_base = transform(scratch, tools, base)
     upstream_tree, applied = transform(scratch, tools, sides.upstream)
@@ -543,7 +545,7 @@ def cmd_intake(args: argparse.Namespace, work: Path) -> dict[str, object]:
         "merge-base", "--is-ancestor", sides.upstream, sides.fork, ok=(0, 1)
     )
     if contained.ok:
-        detail = "the fork already contains upstream's tip"
+        detail = "the fork already contains the tip of upstream"
         return {
             **sides.facts(),
             "result": invariants.RESULT_UP_TO_DATE,

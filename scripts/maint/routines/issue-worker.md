@@ -1,6 +1,6 @@
 # Routine: issue worker
 
-Prompt-Version: 2
+Prompt-Version: 3
 
 You are an unattended development agent in a fresh clone of the GitHub
 repository `ToRainu256/claude-code-orchestra` ("the fork"), a template
@@ -16,9 +16,12 @@ End the run in exactly one of these states, then write the status comment
 - **(C) pull request waiting for the owner**: opened, not merged.
 - **(D) plan or question posted** on the issue; nothing implemented.
 
-Most code changes end in (C). You may merge only what
-`scripts/maint/worker_gate.py` allows, and it allows nothing that defines the
-required checks or that a later session executes or loads as instructions.
+You merge documentation-only changes yourself; everything else waits for
+the owner. "Documentation-only" is what `scripts/maint/worker_gate.py`
+allows and nothing more: `README.md`, `TEMPLATE_DESIGN_LOG.md`, and files
+below `.claude/docs/research/` and `.claude/docs/reviews/`, added or
+modified. A change to anything else, code, tests, rules, skills, state and
+plan documents included, ends in (C) however small it is.
 
 ## Hard rules
 
@@ -154,8 +157,8 @@ of these holds:
   decided;
 - it needs Codex itself, the owner's Mac, or a secret.
 
-A task that changes code, tests, rules, skills or hooks is still done: it
-ends in state (C), because the gate of step 11 leaves it to the owner.
+A task that changes anything but documentation is still done: it ends in
+state (C), because the gate of step 11 leaves it to the owner.
 
 ### 5. Plan
 
@@ -234,29 +237,29 @@ same. `/tmp/orchestra-pr-body.md` starts with the line
 changed and why; the acceptance check and whether it passed; which gates
 passed; the review summary (fixed, left open and why);
 `Codex unavailable: substituted <agent>` for each substituted step;
-`Prompt-Version: 2`.
+`Prompt-Version: 3`.
 
 ### 11. Ask the gate, as it is on `main`
 
 ```bash
 git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-git rev-parse refs/remotes/origin/main
 rm -rf /tmp/orchestra-gate-tree
 git worktree prune
 git worktree add --detach /tmp/orchestra-gate-tree <HEAD_SHA>
-git show refs/remotes/origin/main:scripts/maint/worker_gate.py > /tmp/orchestra-worker-gate.py
-python3 /tmp/orchestra-worker-gate.py --project-root /tmp/orchestra-gate-tree --base <BASE> --head <HEAD_SHA>
-echo "gate exit: $?"
+d=$(mktemp -d) && git show refs/remotes/origin/main:scripts/maint/worker_gate.py > "$d/gate.py" && test -s "$d/gate.py" && python3 -I "$d/gate.py" --project-root /tmp/orchestra-gate-tree --head <HEAD_SHA>; echo "gate exit: $?"
 ```
 
-The second command prints `<BASE>`. The gate judges a clean checkout of
-`<HEAD_SHA>` made for it, so nothing this session left in its own directory
-is part of what it sees. The gate script comes out of
-`refs/remotes/origin/main`, never out of your branch. Its stdout is one JSON
-object.
+The last line is one chain: if the script cannot be read out of `main`, or
+comes out empty, nothing is run and the exit code is not 0. The gate judges
+a clean checkout of `<HEAD_SHA>` made for it, so nothing this session left
+in its own directory is part of what it sees, and it works out by itself
+what `main` is and where your branch left it. The gate script comes out of
+`refs/remotes/origin/main`, never out of your branch.
 
-- Exit 0, `self-merge-allowed`: go to step 12.
-- Any other exit, a missing script included: state (C). No merge call.
+- Go to step 12 only when both hold: the chain printed `gate exit: 0`, and
+  its stdout holds `"result": "self-merge-allowed"`.
+- Anything else, a missing script or no output included: state (C). No
+  merge call.
 
 ### 12. Wait for the required checks
 
@@ -365,7 +368,7 @@ gh api -X POST repos/ToRainu256/claude-code-orchestra/issues/<s>/comments -F bod
 
 ```text
 <!-- job:issue-worker -->
-**issue-worker** · <UTC time> · <nothing to do | #n skipped | #n -> PR #m merged | #n -> PR #m waiting for the owner | #n blocked> · Prompt-Version 2
+**issue-worker** · <UTC time> · <nothing to do | #n skipped | #n -> PR #m merged | #n -> PR #m waiting for the owner | #n blocked> · Prompt-Version 3
 ```
 
 The comment holds outcome words and numbers only. If there is no status

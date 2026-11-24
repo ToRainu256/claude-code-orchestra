@@ -166,6 +166,9 @@ def git(root: Path, *args: str) -> str:
             "user.email=test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            # The developer's own ignore file must not hide a fixture file.
+            "-c",
+            "core.excludesFile=/dev/null",
             "-C",
             str(root),
             *args,
@@ -676,7 +679,8 @@ def test_genuine_conflict_is_reported_and_nothing_is_committed(world: World) -> 
 
     assert (code, payload["result"]) == (EXIT_NEEDS_OWNER, "conflicts")
     assert conflict_paths(payload) == {GUIDE: ["CONFLICT (contents)"]}
-    assert f"conflict: {GUIDE}: CONFLICT (contents)" in err
+    # For a person: the path is in a code span, as it must be when posted.
+    assert f"conflict: `{GUIDE}`: CONFLICT (contents)" in err
     assert "commit" not in payload and "branch" not in payload
     assert world.intake_branches() == []
     assert FORK_GUIDE_LINE in (world.fork / GUIDE).read_text(encoding="utf-8")
@@ -873,7 +877,9 @@ def test_tree_that_must_not_be_checked_out_is_refused(
     # a supported name may have, plus visible escapes.
     assert "\x1b" not in captured.out + captured.err
     for entry in payload["entries"]:
-        assert INERT_NAME_RE.fullmatch(entry.split(": ", 1)[0]), entry
+        name = entry.split(": ", 1)[0]
+        assert name.startswith("`") and name.endswith("`"), entry
+        assert INERT_NAME_RE.fullmatch(name.strip("`")), entry
     assert "PWNED)" not in captured.out + captured.err
     assert world.intake_branches() == []
 
@@ -1326,6 +1332,15 @@ def test_reported_path_cannot_act_in_a_shell_or_in_markdown(
         ("=======", r"\x3d======"),
         ("two\nlines\there", "two lines here"),
         ("$(id) && `id`", r"\x24(id) \x26\x26 \x60id\x60"),
+        (
+            "; rm -rf / ; echo 'x' \"y\" (z) a=b",
+            r"; rm -rf / ; echo \x27x\x27 \x22y\x22 (z) a=b",
+        ),
+        (
+            "- [ ] task; rm -rf / ' \" | cat",
+            r"\x2d \x5b \x5d task; rm -rf / \x27 \x22 \x7c cat",
+        ),
+        ('it\'s "quoted"', r"it\x27s \x22quoted\x22"),
     ],
 )
 def test_reported_text_cannot_form_markdown_or_a_command(
@@ -1337,6 +1352,49 @@ def test_reported_text_cannot_form_markdown_or_a_command(
     assert scratch_repo.inert_path(scratch_repo.inert_path(text)) == (
         scratch_repo.inert_path(text)
     )
+
+
+HOSTILE_ARGUMENTS = [
+    "'; touch {marker}; echo '",
+    '"; touch {marker}; echo "',
+    "$(touch {marker})",
+    "`touch {marker}`",
+    "x' \"$(touch {marker})\" 'y",
+    'a\\"; touch {marker}; "',
+    "!! && touch {marker}",
+]
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_ARGUMENTS)
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("inert", ["inert_text", "inert_path"])
+def test_reported_string_is_one_argument_inside_either_kind_of_quote(
+    tmp_path: Path, hostile: str, quote: str, inert: str
+) -> None:
+    """The contract, run through a real shell: quoted either way, the string
+    stays one argument, comes out as it went in, and runs nothing."""
+    marker = tmp_path / "ran"
+    made = getattr(scratch_repo, inert)(hostile.format(marker=marker))
+
+    done = subprocess.run(
+        ["sh", "-c", f"printf '%s|' {quote}{made}{quote} end"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == f"{made}|end|"
+    assert not marker.exists()
+    assert "'" not in made and '"' not in made
+
+
+def test_path_is_posted_in_a_code_span_because_a_name_may_read_as_a_link() -> None:
+    name = "www.evil.example/@octocat"
+
+    assert scratch_repo.inert_path(name) == name
+    assert scratch_repo.code_span(name) == f"`{name}`"
+    assert scratch_repo.code_span("a`b") == r"`a\x60b`"
 
 
 HOSTILE_SUBJECT = "``` Closes #1 @someone <!-- job:x --> [x](http://e) | GH-2"
