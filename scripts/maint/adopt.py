@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import common
@@ -38,6 +39,7 @@ import staging
 import target_git
 import targets
 
+COMMAND = "adopt"
 CONFIRM_WORD = "yes"
 SCREEN_WIDTH = common.DISPLAY_LIMIT
 GROUPS_SHOWN = 40
@@ -161,17 +163,10 @@ def run(ctx: common.Context, raw: str, ask: Ask, out: Callable[[str], None]) -> 
         # Updating is not installing: the installer asks before it replaces a
         # project's own Claude and Codex configuration, the updater does not.
         say(f"adopt: the template is not installed there (no {VERSION_STAMP}).")
-        say("Install it first with scripts/install.sh; adopt only updates.")
+        say("Install it with launchd.sh install-project <project>; adopt only updates.")
         return common.EXIT_NEEDS_OWNER
-    try:
-        book = ledger.Ledger(ctx.paths)
-    except ledger.Unreadable as exc:
-        aside = ledger.set_aside(ctx.paths, ctx.now)
-        ctx.log.line(f"adopt: unreadable record ({exc}); moved to {aside}")
-        say("adopt: the record of adoptions could not be read. It was set aside as")
-        say(f"  {aside}")
-        say("Nothing was changed. Run adopt again, for every project that was")
-        say("adopted before; delete that file when you are done.")
+    book = open_ledger(ctx, say, COMMAND)
+    if book is None:
         return common.EXIT_NEEDS_OWNER
     git = target_git.TargetGit(ctx, target)
     try:
@@ -182,13 +177,32 @@ def run(ctx: common.Context, raw: str, ask: Ask, out: Callable[[str], None]) -> 
         return common.EXIT_FAILED
 
 
-def _fixable_problem(source: staging.Source, git: target_git.TargetGit) -> str | None:
+def open_ledger(ctx: common.Context, say: Say, command: str) -> ledger.Ledger | None:
+    """The record of adoptions; None, after saying so, when it could not be
+    read and was set aside. It is never read as "nothing adopted"."""
+    try:
+        return ledger.Ledger(ctx.paths)
+    except ledger.Unreadable as exc:
+        aside = ledger.set_aside(ctx.paths, ctx.now)
+        ctx.log.line(f"{command}: unreadable record ({exc}); moved to {aside}")
+        say(
+            f"{command}: the record of adoptions could not be read. It was set aside as"
+        )
+        say(f"  {aside}")
+        say("Nothing was changed. Run adopt again, for every project that was")
+        say("adopted before; delete that file when you are done.")
+        return None
+
+
+def _fixable_problem(
+    source: staging.Source, git: target_git.TargetGit, tool: str
+) -> str | None:
     """What the owner has to put right in the project before it can be
     adopted; None when nothing."""
     target = git.target
     problem = target_git.repository_problem(git)
     problem = problem or targets.layout_problem(
-        target, source.guarded, staging.MADE_DIRS
+        target, source.guarded_for(tool), staging.MADE_DIRS
     )
     if problem is not None:
         return f"the project {problem}"
@@ -198,38 +212,56 @@ def _fixable_problem(source: staging.Source, git: target_git.TargetGit) -> str |
     return None
 
 
-def _adopt_from(
+@dataclass(frozen=True)
+class Prepared:
+    """A change rehearsed on the private copy and shown on the screen, with
+    what git said about the project when it was: asked again by the write."""
+
+    staged: staging.Staged
+    seen: distribute.Seen
+    identity: tuple[int, ...]
+    tool: str
+
+
+def prepare(
     ctx: common.Context,
     source: staging.Source,
     git: target_git.TargetGit,
-    book: ledger.Ledger,
-    ask: Ask,
     say: Say,
-) -> int:
+    command: str,
+    tool: str = staging.UPDATE,
+) -> Prepared | int:
+    """Check that the project can take the approved revision, rehearse the
+    change on a private copy with ``tool``, and show what typing ``yes``
+    would do. Returns the exit code instead when it cannot go on."""
     target = git.target
-    problem = _fixable_problem(source, git)
+    identity = tuple(targets.identity(target))
+    problem = _fixable_problem(source, git, tool)
     if problem is not None:
-        say(f"adopt: {problem}")
+        say(f"{command}: {problem}")
         return common.EXIT_NEEDS_OWNER
     state, dirt = target_git.git_state(git), target_git.dirt(git)
     index = target_git.index_paths(git)
     if state is None or dirt is None or index is None:
-        say("adopt: git could not report on the project")
+        say(f"{command}: git could not report on the project")
         return common.EXIT_FAILED
-    if dirt.visible:
-        say(f"adopt: the project has {len(dirt.visible)} uncommitted paths:")
-        for entry in dirt.visible[:PATHS_SHOWN]:
+    # A new installation wants a tree that is clean in every sense: nothing
+    # git was told not to look at either.
+    unclean = (*dirt.visible, *dirt.hidden) if tool == staging.INSTALL else dirt.visible
+    if unclean:
+        say(f"{command}: the project has {len(unclean)} uncommitted paths:")
+        for entry in unclean[:PATHS_SHOWN]:
             say(f"  {target_git.shown(entry)}")
-        say("An update is only ever written into a clean tree, and it is left")
-        say("uncommitted. Commit or clean these first, then run adopt again.")
+        say("A change is only ever written into a clean tree, and it is left")
+        say(f"uncommitted. Commit or clean these first, then run {command} again.")
         return common.EXIT_NEEDS_OWNER
     try:
-        staged = staging.stage_update(ctx, source, target, "stage")
+        staged = staging.stage_update(ctx, source, target, "stage", tool)
     except staging.StageProblem as exc:
         if exc.refused:
-            say(f"adopt: the project {exc.detail}")
+            say(f"{command}: the project {exc.detail}")
             return common.EXIT_NEEDS_OWNER
-        say(f"adopt: {exc.detail}; see the newest file in {ctx.paths.logs_dir}")
+        say(f"{command}: {exc.detail}; see the newest file in {ctx.paths.logs_dir}")
         return common.EXIT_FAILED
 
     say(f"Revision:  {source.revision} (template {source.version})")
@@ -238,6 +270,10 @@ def _adopt_from(
     say()
     _show_plan(ctx, staged, index[0], index[1], say)
     say()
+    if not source.fence:
+        what = "installer" if tool == staging.INSTALL else "updater"
+        say(f"The {what} ran without the kernel sandbox here (no sandbox-exec, or")
+        say("this process is itself sandboxed); only the private copy guarded it.")
     if dirt.hidden:
         say(
             f"{len(dirt.hidden)} paths here are hidden from git status (assume-unchanged"
@@ -248,25 +284,72 @@ def _adopt_from(
     say("Nothing is committed, staged or stashed. The result stays as uncommitted")
     say("changes for you to review and commit; until you do, the revisions that")
     say("follow wait for this project.")
-    short = common.short_sha(source.revision)
-    answer = ask(
-        f"Type {CONFIRM_WORD} to update this project to {short} and let scheduled "
-        "runs keep it updated: "
-    )
-    if answer.strip() != CONFIRM_WORD:
-        say("adopt: not confirmed; nothing was changed")
-        return common.EXIT_OK
+    return Prepared(staged, distribute.Seen(state, dirt), identity, tool)
+
+
+def _moved(
+    source: staging.Source, git: target_git.TargetGit, prepared: Prepared
+) -> str | None:
+    """What changed about the project itself while the screen was up; None
+    when nothing did. Asked before git looks at the tree again: another
+    directory or repository at the path, a configuration key that is not
+    inert, a link on the way, git in the middle of something."""
+    target = git.target
+    try:
+        identity = tuple(targets.identity(target))
+    except OSError:
+        return "the project is gone"
+    if identity != prepared.identity:
+        return "another directory or repository is at the path now"
+    if prepared.tool == staging.INSTALL:
+        # The installer refuses a project that already holds a template path
+        # (a retired one included), and reads every other path of the copy:
+        # one that appeared since the rehearsal, even an empty directory git
+        # does not see, is refused the same way.
+        for rel in (*source.scope(target), *staging.extra_files(prepared.tool)):
+            if rel not in prepared.staged.before and os.path.lexists(
+                os.path.join(target, rel)
+            ):
+                return f"{rel} appeared in the project"
+    return _fixable_problem(source, git, prepared.tool)
+
+
+def write(
+    ctx: common.Context,
+    source: staging.Source,
+    git: target_git.TargetGit,
+    book: ledger.Ledger,
+    prepared: Prepared,
+    say: Say,
+    command: str,
+    ready: Callable[[], bool] | None = None,
+) -> tuple[int, bool]:
+    """Write exactly what the screen showed and record the adoption. Returns
+    the exit code, and whether the write began (the record then holds this
+    adoption, whatever came of it).
+
+    ``ready`` is called once everything was asked again, the tree included,
+    right before the record is marked and the first change made; when it
+    returns False nothing is written."""
+    target = git.target
     # The screen was true when it was drawn. The approved revision can have
-    # moved since; whether the project did is asked again by the write itself.
+    # moved since, and so can the project; the tree is asked again by the
+    # write itself.
     if promote.read_approved(ctx.paths) != source.revision:
-        say("adopt: the approved revision moved while you were reading; run it again")
-        return common.EXIT_FAILED
+        say(
+            f"{command}: the approved revision moved while you were reading; run it again"
+        )
+        return common.EXIT_FAILED, False
+    moved = _moved(source, git, prepared)
+    if moved is not None:
+        say(f"{command}: {moved}; nothing was written. Run it again.")
+        return common.EXIT_NEEDS_OWNER, False
     # A new record, but not a forgetful one: the temporary files an earlier
     # write was killed over stay recorded, so the next scheduled run can
     # still remove them. Nothing is deleted here that the screen did not
     # show, and nothing is carried over to another directory or repository
     # that is at this path now.
-    identity = tuple(targets.identity(target))
+    identity = prepared.identity
     earlier = book.adoptions.get(target)
     carried: tuple[str, ...] = ()
     if earlier is not None and earlier.identity == identity:
@@ -280,15 +363,41 @@ def _adopt_from(
         updated_at=ctx.now,
         temporaries=carried,
     )
-    seen = distribute.Seen(state, dirt)
-    visit = distribute.write_update(ctx, source, book, git, adoption, staged, seen)
-    ctx.log.line(f"adopt: {visit.state}: {target} {visit.detail}")
+    visit = distribute.write_update(
+        ctx, source, book, git, adoption, prepared.staged, prepared.seen, ready
+    )
+    # The record changes only once the write is about to begin.
+    began = book.adoptions.get(target) is not earlier
+    ctx.log.line(f"{command}: {visit.state}: {target} {visit.detail}")
     if visit.state == distribute.BUSY:
-        say(f"adopt: {visit.detail}. Run it again.")
-        return common.EXIT_NEEDS_OWNER
+        say(f"{command}: {visit.detail}. Run it again.")
+        return common.EXIT_NEEDS_OWNER, began
     if visit.state == distribute.FAILED:
-        say(f"adopt: {visit.detail}")
-        return common.EXIT_FAILED
-    say(f"adopt: the project now holds {source.revision} ({visit.detail}).")
+        say(f"{command}: {visit.detail}")
+        return common.EXIT_FAILED, began
+    say(f"{command}: the project now holds {source.revision} ({visit.detail}).")
     say("Review and commit when ready.")
-    return common.EXIT_OK
+    return common.EXIT_OK, began
+
+
+def _adopt_from(
+    ctx: common.Context,
+    source: staging.Source,
+    git: target_git.TargetGit,
+    book: ledger.Ledger,
+    ask: Ask,
+    say: Say,
+) -> int:
+    prepared = prepare(ctx, source, git, say, COMMAND)
+    if not isinstance(prepared, Prepared):
+        return prepared
+    short = common.short_sha(source.revision)
+    answer = ask(
+        f"Type {CONFIRM_WORD} to update this project to {short} and let scheduled "
+        "runs keep it updated: "
+    )
+    if answer.strip() != CONFIRM_WORD:
+        say(f"{COMMAND}: not confirmed; nothing was changed")
+        return common.EXIT_OK
+    code, _ = write(ctx, source, git, book, prepared, say, COMMAND)
+    return code

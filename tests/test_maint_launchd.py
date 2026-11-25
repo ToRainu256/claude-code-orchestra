@@ -757,3 +757,173 @@ def test_install_fails_closed_when_the_refs_cannot_be_listed(mac: Mac) -> None:
     assert not (mac.base / "state" / "approved-rev").exists()
     assert not mac.plist.exists()
     assert mac.launchctl_calls("bootstrap") == []
+
+
+# --------------------------------------------------------------------------
+# The owner's /orche-install skill, copied from the approved revision
+# --------------------------------------------------------------------------
+
+SKILL_SOURCE = support.MAINT_DIR / "skills" / "orche-install"
+SKILL_MD_REL = "scripts/maint/skills/orche-install/SKILL.md"
+
+
+def skill_dir(mac: Mac) -> Path:
+    return mac.home / ".claude" / "skills" / "orche-install"
+
+
+def skill_mac(tmp_path: Path) -> tuple[Mac, support.Fork]:
+    """A Mac whose fork carries the maintenance code, the skill included."""
+    fork = scratch_fork(tmp_path)
+    return Mac(tmp_path, bare=fork.bare), fork
+
+
+def fetch_into_clone(mac: Mac) -> str:
+    clone = mac.base / "fork"
+    support.git(
+        clone,
+        "-c",
+        f"url.{mac.bare}.insteadOf={common.FORK_GIT_URL}",
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "origin",
+        f"+refs/heads/main:{common.MAIN_REF}",
+    )
+    return support.git(clone, "rev-parse", common.MAIN_REF)
+
+
+def approve_newer_skill(mac: Mac, fork: support.Fork, text: str) -> str:
+    """What the launcher's promote leaves behind: a newer revision, fetched
+    into the clone and approved."""
+    newer = fork.commit({SKILL_MD_REL: text}, "change the skill")
+    assert fetch_into_clone(mac) == newer
+    (mac.base / "state" / "approved-rev").write_text(f"{newer}\n", encoding="utf-8")
+    return newer
+
+
+def stub_launcher(mac: Mac, status: int) -> None:
+    stub = mac.base / "bin" / "orchestra-maint"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    support.write_script(stub, f"#!/bin/bash\nexit {status}\n")
+
+
+def test_install_copies_the_skill_from_the_approved_revision(tmp_path: Path) -> None:
+    mac, _ = skill_mac(tmp_path)
+
+    done = mac.install()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    installed = skill_dir(mac)
+    assert f"skill: {installed} (from {mac.approved()})" in done.stdout
+    names = sorted(path.name for path in SKILL_SOURCE.iterdir())
+    assert sorted(path.name for path in installed.iterdir()) == names
+    for path in SKILL_SOURCE.iterdir():
+        assert not (installed / path.name).is_symlink()
+        assert (installed / path.name).read_bytes() == path.read_bytes()
+    assert oct(installed.stat().st_mode & 0o777) == "0o700"
+    # Nothing is left beside it.
+    assert [path.name for path in installed.parent.iterdir()] == ["orche-install"]
+
+
+def test_install_with_an_approved_revision_without_the_skill_creates_nothing(
+    mac: Mac,
+) -> None:
+    done = mac.install()
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "has no scripts/maint/skills/orche-install" in done.stdout
+    assert not (mac.home / ".claude" / "skills").exists()
+
+
+def test_promote_refreshes_the_skill_from_the_newly_approved_revision(
+    tmp_path: Path,
+) -> None:
+    mac, fork = skill_mac(tmp_path)
+    assert mac.install().returncode == 0
+    newer = approve_newer_skill(mac, fork, "---\nname: orche-install\n---\n# newer\n")
+    stub_launcher(mac, 0)
+
+    done = mac.run("promote", answers="yes\n")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = (skill_dir(mac) / "SKILL.md").read_text(encoding="utf-8")
+    assert text == "---\nname: orche-install\n---\n# newer\n"
+    assert f"(from {newer})" in done.stdout
+
+
+def test_promote_that_fails_leaves_the_skill_as_it_was(tmp_path: Path) -> None:
+    mac, fork = skill_mac(tmp_path)
+    assert mac.install().returncode == 0
+    before = support.tree_digest(skill_dir(mac))
+    approve_newer_skill(mac, fork, "# newer\n")
+    stub_launcher(mac, 7)
+
+    done = mac.run("promote", answers="yes\n")
+
+    assert done.returncode == 7
+    assert support.tree_digest(skill_dir(mac)) == before
+
+
+@pytest.mark.parametrize("where", ["skill-dir", "skills-dir", "inside"])
+def test_install_never_writes_the_skill_through_a_link(
+    tmp_path: Path, where: str
+) -> None:
+    mac, _ = skill_mac(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "SKILL.md").write_text("the owner's own\n", encoding="utf-8")
+    skills = mac.home / ".claude" / "skills"
+    if where == "skills-dir":
+        skills.parent.mkdir(parents=True)
+        skills.symlink_to(elsewhere)
+    elif where == "skill-dir":
+        skills.mkdir(parents=True)
+        skill_dir(mac).symlink_to(elsewhere)
+    else:
+        skill_dir(mac).mkdir(parents=True)
+        (skill_dir(mac) / "SKILL.md").symlink_to(elsewhere / "SKILL.md")
+    before = support.tree_digest(elsewhere)
+
+    done = mac.install()
+
+    assert done.returncode == 1
+    assert "was not changed" in done.stderr
+    assert "the /orche-install skill is not" in done.stderr
+    assert support.tree_digest(elsewhere) == before
+    # The job itself is installed all the same.
+    assert len(mac.launchctl_calls("bootstrap")) == 1
+
+
+def test_install_refuses_a_skill_whose_approved_files_are_not_plain(
+    tmp_path: Path,
+) -> None:
+    mac, fork = skill_mac(tmp_path)
+    blob = subprocess.run(
+        [support.REAL_GIT, "-C", str(fork.seed), "hash-object", "-w", "--stdin"],
+        input=b"/etc/passwd",
+        capture_output=True,
+        check=True,
+    ).stdout.decode()
+    entry = f"120000,{blob.strip()},scripts/maint/skills/orche-install/linked.md"
+    support.git(fork.seed, "update-index", "--add", "--cacheinfo", entry)
+    support.git(fork.seed, "commit", "--quiet", "-m", "a link in the skill")
+    support.git(fork.seed, "push", "--quiet", "origin", "HEAD:main")
+
+    done = mac.install()
+
+    assert done.returncode == 1
+    assert "mode 120000" in done.stderr
+    assert not skill_dir(mac).exists()
+
+
+def test_two_skill_refreshes_never_run_at_once(tmp_path: Path) -> None:
+    mac, _ = skill_mac(tmp_path)
+    lock = mac.home / ".claude" / "skills" / ".orche-install.lock"
+    lock.mkdir(parents=True)
+
+    done = mac.install()
+
+    assert done.returncode == 1
+    assert "another refresh holds" in done.stderr
+    assert not skill_dir(mac).exists()
+    assert lock.is_dir()  # somebody else's; never taken away

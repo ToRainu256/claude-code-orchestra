@@ -7,6 +7,9 @@
 #   promote    show approved..main, ask, advance the approved revision
 #   adopt DIR  show what an update would change in one project, ask, update it,
 #              and let scheduled runs keep it updated
+#   install-project DIR
+#              the same for a project with no template yet: install the approved
+#              revision there, list it in targets.txt, and adopt it
 #   run-now    start one run now through launchd
 #   uninstall  unload the agent, remove the plist and the launcher; keep the rest
 #
@@ -16,15 +19,19 @@
 # token: the job uses the logins `gh` and `codex` already have (those two
 # programs keep their own state where they always do).
 #
-# `install`, `promote` and `adopt` are answered at a terminal; a piped answer is
-# refused.
+# `install`, `promote`, `adopt` and `install-project` are answered at a
+# terminal; a piped answer is refused. `install` and `promote` also put the
+# owner's `/orche-install` skill in ~/.claude/skills, read from the approved
+# revision.
 # Text that comes from the fork (commit subjects, path names) is shown with
 # every non-printable byte replaced, so it cannot redraw the screen.
 #
 # Portable to bash 3.2 and to BSD and GNU userland. `print` works anywhere;
 # the other subcommands need macOS (launchctl, plutil).
 #
-# Exit codes: 0 ok; 1 usage, a failed probe, a declined prompt, or not installed.
+# Exit codes: 0 ok; 1 usage, a failed probe, a declined prompt, not installed,
+# or a skill that could not be put in place. `promote`, `adopt` and
+# `install-project` otherwise exit with the launcher's code.
 set -euo pipefail
 
 LABEL="io.github.torainu256.orchestra-maint"
@@ -45,6 +52,10 @@ STAT_LINES_SHOWN=40
 LINE_WIDTH=200
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_NAME="orche-install"
+SKILL_SOURCE="scripts/maint/skills/${SKILL_NAME}"
+# A file of the skill: a plain name, no directory, nothing hidden.
+SKILL_FILE_PATTERN='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
 TEMPLATE="${SCRIPT_DIR}/orchestra-maint.plist.in"
 LAUNCHER_SOURCE="${SCRIPT_DIR}/orchestra-maint"
 
@@ -66,6 +77,8 @@ CLONE="${BASE}/fork"
 APPROVED="${BASE}/state/approved-rev"
 FAILURE="${BASE}/state/launcher-failure"
 LAUNCHER="${BASE}/bin/orchestra-maint"
+SKILLS_DIR="${HOME}/.claude/skills"
+SKILL_DIR="${SKILLS_DIR}/${SKILL_NAME}"
 AGENTS_DIR="${HOME}/Library/LaunchAgents"
 PLIST="${AGENTS_DIR}/${LABEL}.plist"
 # The PATH the job runs with. The probes below use the same one, so `install`
@@ -155,6 +168,8 @@ Created by install:
       repository of ${FORK_URL} (remote origin only, default branch only, no tags)
   ${APPROVED}
       the one commit this Mac may execute; shown for review and confirmed at install
+  ${SKILL_DIR}/
+      the owner's /${SKILL_NAME} skill, copied from the approved revision (also by promote)
 Created by runs:
   ${BASE}/logs/maint/              one log per run, newest 60 kept
   ${BASE}/logs/launchd.out.log     what launchd captures
@@ -359,6 +374,143 @@ install_launcher() {
     echo "launcher: ${LAUNCHER}"
 }
 
+# Say why the skill was not put in place, and fail.
+skill_refused() {
+    echo "launchd.sh: skill: $*; ${SKILL_DIR} was not changed" >&2
+    return 1
+}
+
+# Put the owner's skill in ~/.claude/skills exactly as the approved revision
+# has it. Its files are read out of the clone with git, never from this
+# checkout's working tree, so what the skill says changes only on approval.
+# The whole listing is checked before anything is written: an entry that is
+# not a plain file (a link, another repository), a nested directory, or a name
+# that is not plain is a refusal. Nothing is written through a link: a link on
+# the way, or one inside the installed copy, is a refusal too. The files go
+# into a new private directory, which then takes the old one's place.
+install_skill() {
+    local rev listing line mode name old found=0
+    rev="$(read_approved)"
+    if [[ -z "${rev}" ]]; then
+        echo "skill: no approved revision; ${SKILL_DIR} was not changed"
+        return 0
+    fi
+    if ! listing="$(g -C "${CLONE}" ls-tree -r --full-tree "${rev}" -- "${SKILL_SOURCE}/")"; then
+        skill_refused "cannot list ${SKILL_SOURCE} at ${rev}"
+        return 1
+    fi
+    if [[ -z "${listing}" ]]; then
+        echo "skill: the approved revision has no ${SKILL_SOURCE}; ${SKILL_DIR} was not changed"
+        return 0
+    fi
+    # One line per entry: "<mode> <type> <object><TAB><path>". A path git
+    # had to quote is not a plain name, and fails the pattern.
+    while IFS= read -r line; do
+        mode="${line%% *}"
+        name="${line#*$'\t'}"
+        name="${name#"${SKILL_SOURCE}/"}"
+        case "${mode}" in
+            100644 | 100755) ;;
+            *)
+                skill_refused "the approved revision holds an entry of mode ${mode} there, not a plain file"
+                return 1
+                ;;
+        esac
+        if [[ ! "${name}" =~ ${SKILL_FILE_PATTERN} ]]; then
+            skill_refused "the approved revision holds a name there that is not a plain file name"
+            return 1
+        fi
+        [[ "${name}" != "SKILL.md" ]] || found=1
+    done <<< "${listing}"
+    if [[ "${found}" -ne 1 ]]; then
+        skill_refused "the approved revision has no ${SKILL_SOURCE}/SKILL.md"
+        return 1
+    fi
+    for old in "${HOME}/.claude" "${SKILLS_DIR}"; do
+        if [[ -L "${old}" ]]; then
+            skill_refused "${old} is a link"
+            return 1
+        fi
+    done
+    # Called as `install_skill || ...`, where `set -e` does not stop a failed
+    # command: every step that writes says itself whether it worked. One
+    # refresh at a time: two would move each other's copies around.
+    local lock="${SKILLS_DIR}/.${SKILL_NAME}.lock" status=0
+    if ! mkdir -p "${SKILLS_DIR}" || ! mkdir "${lock}" 2> /dev/null; then
+        skill_refused "another refresh holds ${lock}; if none is running, remove it"
+        return 1
+    fi
+    publish_skill "${rev}" "${listing}" || status=1
+    rmdir "${lock}" 2> /dev/null || true
+    return "${status}"
+}
+
+# Write the checked listing ($2) of revision $1 into a new private directory
+# and put it in the skill's place. Runs with the refresh lock held.
+publish_skill() {
+    local rev="$1" listing="$2" line mode name object staged old=""
+    if [[ -L "${SKILL_DIR}" ]]; then
+        skill_refused "${SKILL_DIR} is a link"
+        return 1
+    fi
+    if [[ -e "${SKILL_DIR}" ]]; then
+        if [[ ! -d "${SKILL_DIR}" ]]; then
+            skill_refused "${SKILL_DIR} is not a directory"
+            return 1
+        fi
+        if [[ -n "$(find "${SKILL_DIR}" -mindepth 1 ! -type f ! -type d -print)" ]]; then
+            skill_refused "${SKILL_DIR} holds a link or a special file"
+            return 1
+        fi
+    fi
+    if ! staged="$(mktemp -d "${SKILLS_DIR}/.${SKILL_NAME}.new.XXXXXX")" ||
+        [[ ! -d "${staged}" || -L "${staged}" ]]; then
+        skill_refused "cannot make a private directory in ${SKILLS_DIR}"
+        return 1
+    fi
+    while IFS= read -r line; do
+        mode="${line%% *}"
+        object="${line%%$'\t'*}"
+        object="${object##* }"
+        name="${line#*$'\t'}"
+        name="${name#"${SKILL_SOURCE}/"}"
+        local permission=600
+        [[ "${mode}" != "100755" ]] || permission=700
+        # Created, never written onto: two names a case-folding disk holds as
+        # one stop the copy instead of meeting.
+        if [[ -e "${staged}/${name}" || -L "${staged}/${name}" ]] ||
+            ! (set -o noclobber && g -C "${CLONE}" cat-file blob "${object}" > "${staged}/${name}") ||
+            ! chmod "${permission}" "${staged}/${name}"; then
+            rm -rf "${staged}"
+            skill_refused "cannot read ${SKILL_SOURCE}/${name} at ${rev}"
+            return 1
+        fi
+    done <<< "${listing}"
+    if [[ -d "${SKILL_DIR}" ]]; then
+        if ! old="$(mktemp -d "${SKILLS_DIR}/.${SKILL_NAME}.old.XXXXXX")" ||
+            ! mv "${SKILL_DIR}" "${old}/"; then
+            rm -rf "${staged}"
+            skill_refused "cannot move the installed copy aside"
+            return 1
+        fi
+    fi
+    if [[ -e "${SKILL_DIR}" || -L "${SKILL_DIR}" ]] || ! mv "${staged}" "${SKILL_DIR}"; then
+        rm -rf "${staged}"
+        skill_refused "something is at ${SKILL_DIR} again; the previous copy is in ${old:-nowhere}"
+        return 1
+    fi
+    # `mv` moves into a directory that appeared at the name in between, and
+    # says nothing: the result is looked at, not assumed.
+    if [[ -e "${staged}" || -L "${SKILL_DIR}" || ! -f "${SKILL_DIR}/SKILL.md" ]]; then
+        skill_refused "the new copy did not land at ${SKILL_DIR}; look there and in ${SKILLS_DIR}"
+        return 1
+    fi
+    if [[ -n "${old}" ]]; then
+        rm -rf "${old}"
+    fi
+    echo "skill: ${SKILL_DIR} (from ${rev})"
+}
+
 install_agent() {
     local staged="${PLIST}.tmp.$$"
     mkdir -p "${AGENTS_DIR}"
@@ -401,8 +553,13 @@ cmd_install() {
     ensure_clone
     ensure_approved
     install_launcher
+    local skill=0
+    install_skill || skill=1
     install_agent
     echo "Installed. Next: bash scripts/maint/launchd.sh run-now, then status."
+    if [[ "${skill}" -ne 0 ]]; then
+        die "the job is installed, but the /${SKILL_NAME} skill is not (see above)"
+    fi
 }
 
 cmd_uninstall() {
@@ -481,8 +638,15 @@ cmd_promote() {
     require_terminal promote
     [[ -f "${LAUNCHER}" && ! -L "${LAUNCHER}" ]] || die "not installed; run launchd.sh install"
     # Through the launcher: it fetches, checks out the approved revision, and
-    # that revision's code shows the range and asks.
-    ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" exec /bin/bash "${LAUNCHER}" promote
+    # that revision's code shows the range and asks. Not `exec`: afterwards the
+    # skill is put in place from whatever revision is approved then.
+    local status=0
+    ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" /bin/bash "${LAUNCHER}" promote || status=$?
+    if [[ "${status}" -ne 0 ]]; then
+        exit "${status}"
+    fi
+    umask 077
+    install_skill || die "the /${SKILL_NAME} skill was not refreshed (see above)"
 }
 
 cmd_adopt() {
@@ -497,6 +661,21 @@ cmd_adopt() {
     ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" exec /bin/bash "${LAUNCHER}" adopt "${target}"
 }
 
+cmd_install_project() {
+    require_terminal install-project
+    [[ -f "${LAUNCHER}" && ! -L "${LAUNCHER}" ]] || die "not installed; run launchd.sh install"
+    # The project is named exactly as given, never resolved: the approved
+    # revision's code refuses a path that is not the real path of a directory.
+    case "$1" in
+        /*) ;;
+        *) die "install-project: give the project's absolute path" ;;
+    esac
+    if [[ -L "${1%/}" || ! -d "$1" ]]; then
+        die "install-project: not a directory, or a link: $(printf '%s' "$1" | sanitize)"
+    fi
+    ORCHESTRA_MAINT_HOME="${BASE}" PATH="${JOB_PATH}" exec /bin/bash "${LAUNCHER}" install-project "$1"
+}
+
 cmd_run_now() {
     require_macos_tools
     is_loaded || die "${LABEL} is not loaded; run launchd.sh install"
@@ -505,13 +684,14 @@ cmd_run_now() {
 }
 
 usage() {
-    echo "usage: bash scripts/maint/launchd.sh print|install|status|promote|adopt DIR|run-now|uninstall" >&2
+    echo "usage: bash scripts/maint/launchd.sh print|install|status|promote|adopt DIR|install-project DIR|run-now|uninstall" >&2
     exit 1
 }
 
-# `adopt` names one project; every other subcommand stands alone.
+# `adopt` and `install-project` name one project; every other subcommand
+# stands alone.
 case "${1:-}" in
-    adopt) [[ $# -eq 2 ]] || usage ;;
+    adopt | install-project) [[ $# -eq 2 ]] || usage ;;
     *) [[ $# -eq 1 ]] || usage ;;
 esac
 case "$1" in
@@ -520,6 +700,7 @@ case "$1" in
     status) cmd_status ;;
     promote) cmd_promote ;;
     adopt) cmd_adopt "$2" ;;
+    install-project) cmd_install_project "$2" ;;
     run-now) cmd_run_now ;;
     uninstall) cmd_uninstall ;;
     *) usage ;;

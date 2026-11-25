@@ -100,6 +100,11 @@ def read_registry(path: Path) -> list[str]:
         data = path.read_bytes()
     except OSError:
         return []
+    return parse_registry(data)
+
+
+def parse_registry(data: bytes) -> list[str]:
+    """The entries of a registry's bytes; see :func:`read_registry`."""
     entries: list[str] = []
     for raw in data.split(b"\n"):
         line = os.fsdecode(raw).strip()

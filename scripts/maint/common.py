@@ -37,9 +37,11 @@ Exit codes shared by every maintenance script:
 from __future__ import annotations
 
 import calendar
+import contextlib
 import fcntl
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -96,6 +98,8 @@ KILL_GRACE_SEC = 5
 LOGS_KEPT = 60
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
+# Random bytes in the name of a temporary file this job writes and renames.
+TEMP_TOKEN_BYTES = 8
 # The longest piece of outside text shown or logged in one go.
 DISPLAY_LIMIT = 400
 LOGGED_ARGS = 6
@@ -412,17 +416,34 @@ def acquire_lock(paths: Paths) -> int | None:
 
 def write_text_atomic(path: Path, text: str) -> None:
     """Replace ``path`` in one rename, so a reader never sees half a file."""
+    write_bytes_atomic(path, text.encode("utf-8"))
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Replace ``path`` in one rename, so a reader never sees half a file.
+
+    The bytes go into a new file under a name nobody can predict, created
+    exclusively: whatever is already at a name (a link, a hard link to
+    another file) is never opened, let alone written through. The rename
+    replaces a link at ``path`` itself; it never follows one."""
     ensure_private_dir(path.parent)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    descriptor = os.open(
-        str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE
-    )
+    token = secrets.token_hex(TEMP_TOKEN_BYTES)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{token}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptor = os.open(str(temporary), flags, PRIVATE_FILE_MODE)
     try:
-        os.write(descriptor, text.encode("utf-8"))
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(str(temporary), str(path))
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(descriptor, view) :]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(str(temporary), str(path))
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(str(temporary))
+        raise
 
 
 def child_env(env: dict[str, str]) -> dict[str, str]:

@@ -86,6 +86,7 @@ import bump  # noqa: E402
 import common  # noqa: E402
 import distribute  # noqa: E402
 import gh  # noqa: E402
+import install_project  # noqa: E402
 import ledger  # noqa: E402
 import model_watch  # noqa: E402
 import promote  # noqa: E402
@@ -101,6 +102,7 @@ MODULES: tuple[ModuleType, ...] = (
     common,
     distribute,
     gh,
+    install_project,
     ledger,
     promote,
     model_watch,
@@ -610,8 +612,10 @@ def shipped_by_the_real_updater() -> list[str]:
 
 def _seed_real_template(seed: Path) -> None:
     """The template as this checkout ships it: every path the real updater
-    reads from a template, the seeds, the version and the maintenance code."""
-    for rel in [*shipped_by_the_real_updater(), "scripts/scaffold", "VERSION"]:
+    reads from a template, the seeds (the installer's research seed among
+    them), the version and the maintenance code."""
+    seeds = ["scripts/scaffold", ".claude/docs/research/.gitkeep", "VERSION"]
+    for rel in [*shipped_by_the_real_updater(), *seeds]:
         source, target = REPO_ROOT / rel, seed / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         if source.is_dir():

@@ -52,6 +52,24 @@ SCRATCH_TMP_DIR, SCRATCH_HOME_DIR, EMPTY_DIR, TOOLS_DIR = "tmp", "home", "empty"
 BASH = "/bin/bash"
 TEMPLATE_ENV = "ORCHESTRA_TEMPLATE_REPO"
 UPDATER_REL = promote.UPDATE_SCRIPT_REL
+INSTALLER_REL = "scripts/install.sh"
+# Which of the approved revision's two tools prepares the change: the updater
+# for an installed project, the installer for a project that has none yet.
+UPDATE, INSTALL = "update", "install"
+# What the installer reads or writes beyond the updater's paths: the ignore
+# file it appends to, the merge candidates it writes beside a settings file,
+# and the seed of the research directory. Copied into the private copy for an
+# installation only, so that the installer sees them as the project has them.
+SETTINGS_CANDIDATES = (
+    ".claude/settings.orchestra.json",
+    ".codex/config.orchestra.toml",
+)
+INSTALL_FILES = (".gitignore", *SETTINGS_CANDIDATES, ".claude/docs/research/.gitkeep")
+# The installer's exit code for "refused, nothing written" (a conflict, a
+# link, a path that is not a regular file), and how its words are read.
+INSTALLER_REFUSED = 2
+ERROR_MARK, LISTED_MARK = "[ERROR]", "  "
+LISTED_SHOWN = 10
 MODELS_REL = ".claude/skills/_shared/models.py"
 VERSION_REL = "VERSION"
 VERSION_STAMP_REL = ".claude/orchestra-version"
@@ -165,6 +183,10 @@ class Source:
         shipped = self.shipped
         return (*shipped.dirs, *shipped.files, *shipped.settings, *PROJECT_FILES)
 
+    def guarded_for(self, tool: str) -> tuple[str, ...]:
+        """``guarded``, and for an installation the installer's own files."""
+        return (*self.guarded, *extra_files(tool))
+
     def directory_paths(self, target: str) -> tuple[str, ...]:
         """Paths the updater treats as a directory. A canonical directory
         counts only when its legacy twin exists, because only then does the
@@ -200,6 +222,11 @@ class Source:
         return targets.fingerprint(
             root, self.shipped.dirs, self.files, VERSION_STAMP_REL, exact=True
         )
+
+
+def extra_files(tool: str) -> tuple[str, ...]:
+    """The files a tool reads or writes beyond the updater's paths."""
+    return INSTALL_FILES if tool == INSTALL else ()
 
 
 def _plain(rel: str) -> bool:
@@ -412,12 +439,15 @@ def copy_scope(target: str, stage: str, rels: tuple[str, ...]) -> None:
 
 
 def shape_problem(
-    source: Source, target: str, staged: dict[str, targets.Entry]
+    source: Source,
+    target: str,
+    staged: dict[str, targets.Entry],
+    tool: str = UPDATE,
 ) -> str | None:
-    """Why the updater must not be started on this copy; None when every path
-    it will treat as a file or as a directory is one or is absent, and nothing
-    is named like one of its temporary files."""
-    for rel in source.file_paths:
+    """Why the updater (or the installer) must not be started on this copy;
+    None when every path it will treat as a file or as a directory is one or
+    is absent, and nothing is named like one of its temporary files."""
+    for rel in (*source.file_paths, *extra_files(tool)):
         entry = staged.get(rel)
         if entry is not None and entry.kind != targets.KIND_FILE:
             return f"has a directory where the file {rel} belongs"
@@ -499,18 +529,64 @@ def _updater_env(ctx: common.Context, source: Source) -> dict[str, str]:
     }
 
 
-def stage_update(ctx: common.Context, source: Source, target: str, name: str) -> Staged:
-    """Copy the project's managed paths, run the approved updater on the
-    copy, and check that what came out is the approved revision.
+def _tool_command(source: Source, stage: Path, tool: str) -> list[str]:
+    """The command line of the approved tool that prepares the change.
+
+    The updater is placed in the copy, where it expects to be installed:
+    whatever the project had there is removed first, never written through.
+    The installer runs from the approved checkout itself, which makes that
+    checkout the template it copies from, and is given the copy as its
+    target. It is never given ``--force``: a project that already holds a
+    template-owned path is a refusal, not something to replace.
+    """
+    if tool == INSTALL:
+        installer = source.root / INSTALLER_REL
+        if installer.is_symlink() or not installer.is_file():
+            raise StageProblem(False, "the approved revision has no installer")
+        return [*source.fence, BASH, str(installer), "--yes", str(stage)]
+    updater = stage / UPDATER_REL
+    updater.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(str(updater)):
+        updater.unlink()
+    shutil.copyfile(str(source.root / UPDATER_REL), str(updater))
+    return [*source.fence, BASH, str(updater), "--yes"]
+
+
+def _installer_said(done: common.CommandResult) -> str:
+    """The installer's own reason for stopping, as one line: its first error,
+    and the paths it listed (the template-owned paths already there)."""
+    lines = f"{done.stdout}\n{done.stderr}".splitlines()
+    errors = [
+        line[len(ERROR_MARK) :].strip() for line in lines if line.startswith(ERROR_MARK)
+    ]
+    listed = [line.strip() for line in lines if line.startswith(LISTED_MARK)]
+    reason = errors[0] if errors else "it stopped"
+    if listed:
+        shown = ", ".join(listed[:LISTED_SHOWN])
+        more = (
+            f" and {len(listed) - LISTED_SHOWN} more"
+            if len(listed) > LISTED_SHOWN
+            else ""
+        )
+        reason = f"{reason} ({shown}{more})"
+    return reason
+
+
+def stage_update(
+    ctx: common.Context, source: Source, target: str, name: str, tool: str = UPDATE
+) -> Staged:
+    """Copy the project's managed paths, run the approved updater (or, for a
+    project that has no template yet, the approved installer) on the copy,
+    and check that what came out is the approved revision.
 
     The updater's standard output is dropped: it prints the difference
     between the project's settings and the template's, and settings can hold
-    secrets.
+    secrets. The installer prints only path names; they go to the run log.
     """
     stage = source.work / name
     stage.mkdir()
     try:
-        copy_scope(target, str(stage), source.scope(target))
+        copy_scope(target, str(stage), (*source.scope(target), *extra_files(tool)))
     except Unstageable as exc:
         raise StageProblem(True, str(exc)) from None
     except OSError as exc:
@@ -518,20 +594,14 @@ def stage_update(ctx: common.Context, source: Source, target: str, name: str) ->
         detail = "holds something under the updater's paths that cannot be read"
         raise StageProblem(True, detail) from None
     before = targets.snapshot(str(stage), skip_top=())
-    problem = shape_problem(source, target, before)
+    problem = shape_problem(source, target, before, tool)
     if problem is not None:
         raise StageProblem(True, problem)
     before_print = source.left_print_of(str(stage))
-    # The updater insists on a git work tree. This one is the job's own.
-    updater = stage / UPDATER_REL
-    updater.parent.mkdir(parents=True, exist_ok=True)
+    # Both tools insist on a git work tree. This one is the job's own.
     if not ctx.git.run(["init", "--quiet", str(stage)]).ok:
         raise StageProblem(False, "cannot prepare the private copy")
-    # The approved updater, placed where it expects to be installed. Whatever
-    # the project had there is removed first, never written through.
-    if os.path.lexists(str(updater)):
-        updater.unlink()
-    shutil.copyfile(str(source.root / UPDATER_REL), str(updater))
+    argv = _tool_command(source, stage, tool)
 
     env = _updater_env(ctx, source)
     # Started from an empty directory of the job's own: an interpreter looks
@@ -539,23 +609,27 @@ def stage_update(ctx: common.Context, source: Source, target: str, name: str) ->
     nowhere = source.work / EMPTY_DIR
     if not source.fence:
         source.unfenced.append(name)
-    done = common.run_command(
-        [*source.fence, BASH, str(updater), "--yes"],
-        UPDATER_TIMEOUT_SEC,
-        cwd=nowhere,
-        env=env,
-    )
+    done = common.run_command(argv, UPDATER_TIMEOUT_SEC, cwd=nowhere, env=env)
+    what = "installer" if tool == INSTALL else "updater"
+    if tool == INSTALL:
+        for line in f"{done.stdout}\n{done.stderr}".splitlines():
+            if line.strip():
+                ctx.log.line(f"install: {line}")
     if not done.ok:
-        ctx.log.line(f"distribute: updater failed -- {done.failure()}")
-        raise StageProblem(False, "the updater failed on the private copy")
+        ctx.log.line(f"distribute: {what} failed -- {done.failure()}")
+        if tool == INSTALL and done.returncode == INSTALLER_REFUSED:
+            raise StageProblem(
+                True, f"was refused by the installer: {_installer_said(done)}"
+            )
+        raise StageProblem(False, f"the {what} failed on the private copy")
     after = targets.snapshot(str(stage))
     plain = (targets.KIND_FILE, targets.KIND_DIR)
     odd = sorted(rel for rel, entry in after.items() if entry.kind not in plain)
     if odd:
-        raise StageProblem(False, f"the updater left a link or worse at {odd[0]}")
+        raise StageProblem(False, f"the {what} left a link or worse at {odd[0]}")
     if source.fingerprint_of(str(stage)) != source.fingerprint:
         raise StageProblem(
-            False, "the updater did not produce the approved revision's files"
+            False, f"the {what} did not produce the approved revision's files"
         )
     models = stage / MODELS_REL
     if models.is_file():
