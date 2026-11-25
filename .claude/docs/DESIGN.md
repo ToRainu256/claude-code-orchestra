@@ -12,7 +12,7 @@
 <!-- Why does this project exist? What problem does it solve, for whom?
      State the business/technical context and the goal in a few sentences. -->
 
-`claude-code-orchestra` is the owner's fork of the Claude Code Orchestra template: a multi-agent orchestration layer (root `AGENTS.md`, `.claude/` agents, skills, rules and hooks, plus contracts for Codex and other CLI executors) that is installed into other repositories. The fork exists so that model updates land quickly and so that the role-to-model assignment is the owner's own, kept in one model manifest. It reaches the owner's projects through the user-level `/apply-orche` and `/sync-orche` skills, which drive `scripts/install.sh` and `scripts/update.sh`. The fork is itself developed with the orchestration it ships.
+`claude-code-orchestra` is the owner's fork of the Claude Code Orchestra template: a multi-agent orchestration layer (root `AGENTS.md`, `.claude/` agents, skills, rules and hooks, plus contracts for Codex and other CLI executors) that is installed into other repositories. The fork exists so that model updates land quickly and so that the role-to-model assignment is the owner's own, kept in one model manifest. It reaches the owner's projects through the fork's local maintenance job (`scripts/maint/`), which runs only the approved revision: `launchd.sh install-project` (started from the owner's `/orche-install` skill) installs it into a new project with `scripts/install.sh`, and scheduled runs keep adopted projects current with `scripts/update.sh`. The fork is itself developed with the orchestration it ships.
 
 ## スコープ (Scope)
 

@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -134,6 +135,7 @@ HALF_WRITTEN_HELP = (
     "them), then run launchd.sh adopt"
 )
 ADOPT_HINT = "run launchd.sh adopt for it"
+RECORD_UNSAVED = "the record of adoptions could not be saved"
 NOT_LEFT_WHY = "template-owned files are not what the job left there"
 JSON_NUMBER = "number"
 MOVED_WHY = "the project changed while the update was being prepared"
@@ -314,15 +316,17 @@ def write_update(
     adoption: Adoption,
     staged: staging.Staged,
     seen: Seen,
+    ready: Callable[[], bool] | None = None,
 ) -> Visit:
     """Carry a prepared update into the project and record it.
 
     The whole change is planned and proven possible first; then git is asked
     once more whether the project is still what ``seen`` describes. Only then
-    is the record marked ``interrupted``, together with the name of every
-    temporary file the write is going to create, and the first change made.
-    From that point on nothing reports "not written": the mark stays until
-    every path and the repository's own state have been checked.
+    is ``ready`` called (when given; False means nothing is written), the
+    record marked ``interrupted``, together with the name of every temporary
+    file the write is going to create, and the first change made. From that
+    point on nothing reports "not written": the mark stays until every path
+    and the repository's own state have been checked.
 
     What the record keeps of the project afterwards is a digest of every byte
     the job wrote, taken from the private copy after the manifest tool
@@ -338,10 +342,18 @@ def write_update(
         return Visit(target, FAILED, f"not written: {exc}")
     if target_git.git_state(git) != seen.state or target_git.dirt(git) != seen.dirt:
         return Visit(target, BUSY, f"{MOVED_WHY}; nothing was written")
+    if ready is not None and not ready():
+        return Visit(target, FAILED, "not written: what had to come first failed")
     changed = len(staged.changes())
     recorded = (*adoption.temporaries, *plan.temporaries)
     marked = replace(adoption, interrupted=source.revision, temporaries=recorded)
-    book.put(target, marked)
+    try:
+        book.put(target, marked)
+    except OSError as exc:
+        # Nothing of the project has been touched yet, and the record in
+        # memory is what it was (``Ledger.put``).
+        ctx.log.line(f"distribute: cannot save the record: {exc}")
+        return Visit(target, FAILED, f"not written: {RECORD_UNSAVED}")
     try:
         targets.apply_plan(plan)
         problem = targets.applied_problem(target, staged.before, staged.after)
@@ -362,7 +374,14 @@ def write_update(
         waiting_since=0.0,
         interrupted="",
     )
-    book.put(target, done)
+    try:
+        book.put(target, done)
+    except OSError as exc:
+        # Written and checked; the record still says `interrupted`, so the
+        # next run names the project and says what to do.
+        ctx.log.line(f"distribute: cannot save the record: {exc}")
+        why = f"written, but {RECORD_UNSAVED}; {HALF_WRITTEN_HELP}"
+        return Visit(target, FAILED, why)
     if not changed:
         return Visit(target, UP_TO_DATE, "nothing to write")
     return Visit(target, UPDATED, f"{changed} paths changed, left uncommitted")

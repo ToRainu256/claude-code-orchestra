@@ -16,6 +16,7 @@ Usage:
     python3 run.py run                 # the scheduled run
     python3 run.py promote             # the owner's typed confirmation
     python3 run.py adopt PROJECT       # the owner lets the job maintain a project
+    python3 run.py install-project PROJECT  # the same, for a project with no template yet
     python3 run.py status              # last run and approved-vs-main; reads only
     python3 run.py --state-root DIR …  # default: $ORCHESTRA_MAINT_HOME, else
                                        # ~/.claude/orchestra
@@ -40,6 +41,7 @@ from pathlib import Path
 import adopt
 import common
 import distribute
+import install_project
 import ledger
 import model_watch
 import promote
@@ -254,16 +256,22 @@ def cmd_promote(paths: common.Paths) -> int:
     return promote.manual_promote(ctx, ask, print)
 
 
-def cmd_adopt(paths: common.Paths, target: str) -> int:
+def cmd_adopt(paths: common.Paths, target: str, command: str = adopt.COMMAND) -> int:
+    """``adopt``, or ``install-project`` for a project with no template yet:
+    both write into a project, at a terminal, with the run lock held."""
     if launcher_result():
         # Same rule as a run: nothing is distributed from a fallback revision.
         # The launcher already stops before this; the check is for a start
         # that reaches this file some other way.
-        print("adopt: the approved revision could not be checked out; nothing done")
+        print(
+            f"{command}: the approved revision could not be checked out; nothing done"
+        )
         return common.EXIT_FAILED
-    ctx = attended_context(paths, "adopt")
+    ctx = attended_context(paths, command)
     if ctx is None:
         return common.EXIT_USAGE
+    if command == install_project.COMMAND:
+        return install_project.run(ctx, target, ask, print)
     return adopt.run(ctx, target, ask, print)
 
 
@@ -344,6 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
         "adopt", help="Show what an update would change in a project and ask"
     )
     adopt_parser.add_argument("target", metavar="PROJECT", help="Its absolute path")
+    install_parser = commands.add_parser(
+        install_project.COMMAND,
+        help="Show what installing the template into a new project would change and ask",
+    )
+    install_parser.add_argument("target", metavar="PROJECT", help="Its absolute path")
     commands.add_parser("status", help="Print the last run and the approved revision")
     return parser
 
@@ -361,8 +374,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(paths, args.after_promotion)
         if args.command == "promote":
             return cmd_promote(paths)
-        if args.command == "adopt":
-            return cmd_adopt(paths, args.target)
+        if args.command in (adopt.COMMAND, install_project.COMMAND):
+            return cmd_adopt(paths, args.target, args.command)
         return cmd_status(paths)
     except common.Refused as exc:
         print(f"refused: {common.safe_text(str(exc))}", file=sys.stderr)

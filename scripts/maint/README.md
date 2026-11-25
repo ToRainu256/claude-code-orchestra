@@ -54,8 +54,12 @@ Merging and promoting are separate.
   command output are shown with every character that is not printable ASCII
   replaced by a visible escape (`\x1b`, `‮`; `?` in the shell files), so
   nothing merged into the fork can redraw the screen above a prompt.
-- **Approvals are typed at a terminal.** `install`, `promote` and `adopt`
-  refuse a piped answer.
+- **Approvals are typed at a terminal.** `install`, `promote`, `adopt` and
+  `install-project` refuse a piped answer. An agent can open the window the
+  owner types into (the `/orche-install` skill does), never answer in it.
+  The check proves a terminal, not a person: a process running as the owner
+  that opens a pseudo-terminal of its own could type into it. What keeps an
+  agent from doing that is the rule it works under, not this check.
 - **A project is somebody's repository, and nothing of it is executed.** The
   job reads a project with git subcommands that only read, refuses one whose
   own git configuration holds anything but inert keys, and runs the updater
@@ -71,6 +75,7 @@ Merging and promoting are separate.
 | `~/.claude/orchestra/bin/orchestra-maint` | Copy of `scripts/maint/orchestra-maint`, mode 700 | `install` |
 | `~/.claude/orchestra/fork/` | Repository of the fork: `origin` only, the default branch only, no tags, nothing checked out until the first run | `install` |
 | `~/.claude/orchestra/state/approved-rev` | The approved SHA, shown for review and confirmed with a typed `yes` | `install` |
+| `~/.claude/skills/orche-install/` | The owner's `/orche-install` skill: the files of `scripts/maint/skills/orche-install/` at the approved revision, private | `install`, `promote` |
 | `~/.claude/orchestra/logs/maint/<UTC stamp>.log` | One log per run, newest 60 kept | each run |
 | `~/.claude/orchestra/logs/launchd.{out,err}.log` | What launchd captures | launchd |
 | `~/.claude/orchestra/state/last-run.json` | Summary that `status` prints | each run |
@@ -78,13 +83,13 @@ Merging and promoting are separate.
 | `~/.claude/orchestra/state/bump-records.json` | The model bumps this Mac built and tested | `model-watch` |
 | `~/.claude/orchestra/state/distribution.json` | The projects adopted for updates, and what the last run found for each listed one, with the time | `adopt`, `distribute` |
 | `~/.claude/orchestra/state/distribution.json.unreadable-<UTC stamp>` | A record that could not be read, moved aside as evidence; present only until the owner deletes it | `distribute`, `adopt` |
-| `~/.claude/orchestra/logs/maint/<UTC stamp>.adopt.log` | Every path one `adopt` screen stood for, one per line; pruned with the run logs | `adopt` |
+| `~/.claude/orchestra/logs/maint/<UTC stamp>.adopt.log` | Every path one `adopt` or `install-project` screen stood for, one per line; pruned with the run logs | `adopt`, `install-project` |
 | `~/.claude/orchestra/state/launcher-failure` | Present only while the launcher is failing | launcher |
 | `~/.claude/orchestra/run/` | `maint.lock`, scratch worktrees (removed after use) | each run |
 
 `~/.claude/orchestra/targets.txt` is not created here. It is the owner's list
-of installed projects (the `sync-orche` skill keeps it), and the job only
-reads it.
+of installed projects: `install-project` adds a project to it after the typed
+`yes`, and the owner may edit it by hand. Scheduled runs only read it.
 
 The job itself writes nothing into the developer checkout, `~/.codex`,
 `~/.config/gh` or a shell profile. It does run the `gh` and `codex` programs,
@@ -106,8 +111,9 @@ next wake. The launcher makes three attempts at the fetch, 20 seconds apart.
 | `report` | — | Its own comment in the open issue labeled `automation:status`; that label when missing |
 | every run | Its log, `last-run.json`, the lock | — |
 
-`adopt` (the owner's command) writes into one project the same way, after
-showing what it would change.
+`adopt` and `install-project` (the owner's commands) write into one project
+the same way, after showing what they would change; `install-project` also
+adds one line to `targets.txt`.
 
 ## Promotion
 
@@ -132,7 +138,8 @@ Otherwise it advances `approved-rev` by itself in exactly two cases:
    counts as executed or shipped when it is, lies below, or is a parent of:
    `scripts`, `VERSION`, `.claude/skills`, `.claude/settings.json`,
    `.claude/models.local.json` (the override file the approved manifest tool
-   reads), `.codex/config.toml`, any entry of `SAFE_DIRS`, `SAFE_FILES` or
+   reads), `.codex/config.toml`, `.claude/docs/research/.gitkeep` (a seed
+   only the installer ships), any entry of `SAFE_DIRS`, `SAFE_FILES` or
    `SETTINGS_FILES` in the **approved** `scripts/update.sh`, or any literal
    `${TEMPLATE_DIR}/…` source in that file. A `.gitattributes`, `.gitmodules`
    or `.lfsconfig` in any directory also counts: git reads them at checkout,
@@ -198,9 +205,10 @@ The rules, each a check in the code named beside it:
   outside the project, together with the file system's numbers for the
   directory and its repository: another clone at the same path is not the
   adopted one, and is `refused`. A project that was never adopted is
-  `not-adopted`: counted, listed by `status` with the hint, and no alarm. The
-  list is filled by other tooling (`/sync-orche` adds every installation it
-  finds), so being on it is not a request.
+  `not-adopted`: counted, listed by `status` with the hint, and no alarm. A
+  line can be there without an adoption (added by hand, or left by an
+  `install-project` whose write never began), so being on it is not a
+  request.
 - **Clean only** (`target_git.dirt`). Clean means that `git status
   --porcelain --untracked-files=all` lists nothing **and** that no index entry
   is marked assume-unchanged or skip-worktree: git does not look at such a
@@ -301,7 +309,7 @@ The rules, each a check in the code named beside it:
   file the write is going to create.
 
 `adopt` is typed at a terminal. It needs the project listed in `targets.txt`,
-the template already installed there (it updates; `scripts/install.sh`
+the template already installed there (it updates; `install-project`
 installs), and the tree clean. It shows the project, the revision and the
 installed version; what typing `yes` would create, change and delete, counted
 per directory, with every path in a private file; a directory that would go
@@ -314,6 +322,110 @@ old installation needs: a tracked path the updater would remove with `git rm`
 ends up as an unstaged deletion instead. A scheduled run that starts while the
 screen is up finds the lock held and does nothing, so no status comment is
 posted for that run.
+
+### A new project: `install-project`
+
+`launchd.sh install-project <project>` is `adopt` for a project that has no
+template yet, through the same pipeline (`install_project.py`, reusing
+`adopt.py`, `staging.py`, `distribute.write_update`, `ledger.py`): the
+approved revision in a scratch worktree, a private copy of the project's
+paths, and the **approved installer** (`scripts/install.sh --yes`, never
+`--force`) run on that copy under the same fence as the updater. The
+installer copies from the approved checkout itself, so nothing is installed
+from any other tree: not from the checkout `launchd.sh` was started from, and
+not from a working tree with local edits. Beyond the updater's paths the copy
+holds the four the installer also reads or writes (`.gitignore`, the two
+settings merge candidates, `.claude/docs/research/.gitkeep`;
+`staging.INSTALL_FILES`).
+
+It is typed at a terminal and holds the lock like `adopt`. Before it asks:
+the path is given absolute and is the real path of a directory (never a link,
+never resolved), written plainly (no trailing slash, `//`, `.` or `..`) and
+spelled as the file system spells it (on a disk that folds case,
+`/users/me/p` names `/Users/me/p` but is refused, with the right spelling;
+`adopt` refuses it too), with no control character and no white space at
+either end so that it fits one line of `targets.txt`; the directory holds its own
+repository, with a commit, at the top level of its work tree, with inert
+configuration only; nothing of the template is installed there
+(`.claude/orchestra-version` absent; otherwise it says to use `adopt`); the
+tree is clean, with nothing hidden from `git status` either; `targets.txt` is
+not a link; and the installer, rehearsing on
+the copy, does not refuse (a template-owned path the project already has is a
+refusal, named on the screen). The screen is `adopt`'s, plus the line that
+says the project will be listed.
+
+After a typed `yes`, everything is asked again (the approved revision, the
+directory and repository, their configuration, any path of the private copy
+that has appeared since, even an empty directory, and the tree), and then, right
+before the first change, the project's absolute path is appended to
+`targets.txt`: once, keeping every byte already there, in one rename. Listed
+first, a write that is killed half-way is still found and named by the next
+scheduled run. Then the difference is written, left uncommitted, and the
+adoption recorded in `state/distribution.json`. Anything but `yes` changes
+nothing at all: not the project, not the record, not `targets.txt`. A write
+that never began leaves no line behind either: when the record of adoptions
+cannot be saved right after the line went in, nothing is written (`failed`,
+"not written"), and the line is taken out again, provided `targets.txt` still
+holds exactly the bytes that were written. If it holds anything else, the
+line stays and the screen says so: listed and not adopted, the project is
+only counted by scheduled runs, never looked at, and `install-project` can be
+run again.
+
+**Until the owner commits** (or keeps the files out of git with
+`.git/info/exclude`), the tree is not clean, and the scheduled runs treat the
+project by the rule they apply to every uncommitted update: `uncommitted`
+(exit 0) while the approved template is the one written there, and
+`waiting-dirty` once a newer revision waits for it, which becomes the owner's
+to act on (exit 2) after 7 days. Nothing is written into it meanwhile. An
+exclude line only hides files git does not track: the installer also writes
+`AGENTS.md`, appends to `.gitignore` and moves a `CLAUDE.md` aside, and those
+stay in `git status` until committed or excluded too.
+
+After an `install-project` write that stopped half-way, the next run says
+`local-changes`. Discard what `git status` lists in the project (`git restore
+.`, and `git clean` for the new files), then run `install-project` again; or
+commit it and run `adopt`.
+
+**The `/orche-install` skill** starts this from a Claude Code session opened
+in the project. Its source is `scripts/maint/skills/orche-install/`
+(`SKILL.md` with `disable-model-invocation: true`, and the helper
+`orche-install.sh`). `launchd.sh install` and `launchd.sh promote` copy it to
+`~/.claude/skills/orche-install/` from the **approved** revision, read with
+git out of the job's clone: plain files only, the whole listing checked
+before anything is written, into a new private directory that then takes the
+old one's place; a link on the way or inside the installed copy is a
+refusal. The copy carries a marker file of the job's own
+(`.installed-by-orchestra-maint`, holding the revision); a directory at that
+name without it is somebody else's and is never replaced. When the approved
+revision no longer has the skill, the job's marked copy is taken away, so a
+helper a promotion removed does not stay usable; an unmarked one stays. The
+swap is a `rename(2)` to the exact name, which fails on a link instead of
+following it. The skill checks the project (`orche-install.sh check`), explains, and
+opens a new terminal window (`orche-install.sh open`): Ghostty when
+`/Applications/Ghostty.app` exists (`open -na Ghostty.app --args -e
+<script>`), else Terminal.app (`open -a Terminal <script>`). The window runs
+one private one-shot script (mode 700, in a private temporary directory)
+holding `bash <that directory>/launchd.sh install-project <project>`, every
+value quoted for bash; the window's own command line holds only that
+script's path, so a project name is never parsed by a terminal program's
+shell. The `launchd.sh` beside it is the approved revision's, written there
+from the job's clone with `git cat-file` (its objects, not its work tree, and
+no replacement objects): the bytes that run are the bytes that were
+approved, whatever the clone has checked out. It hands over to the installed
+launcher at once. The owner types `yes` there; nothing in the skill types
+or pipes it. `orche-install.sh verify` then says whether the project is
+installed, listed and adopted (this very directory, recorded the way the job
+records one, no write that stopped half-way). The helper's own `git` in the
+project is the system's, run from `/` with no hooks, monitor, attribute
+file, submodule, replacement object or transport, and a repository whose
+configuration sets a filter or an include is refused before it runs. The
+helper sets `PATH` to the system directories only, and the two seams the
+tests use (the window opener, Ghostty's location) are read only under
+`ORCHE_INSTALL_TEST_SEAMS=1`. Two skill refreshes never run at once
+(`~/.claude/skills/.orche-install.lock`); their git reads in the clone skip
+replacement objects too.
+When `sandbox-exec` does not work, the screen says the installer or updater
+ran without it.
 
 **After a write that stopped half-way** (`failed`, then `local-changes` "an
 update … stopped half-way"): in the project, `git status` lists what was
@@ -371,9 +483,10 @@ Limits worth knowing:
   executing the project.
 - An old installation whose root `CLAUDE.md` is still the link to `AGENTS.md`
   is refused like any other link: delete the link, commit, then adopt.
-- There is no command that ends an adoption. Delete the project's entry under
-  `adopted` in `state/distribution.json`; taking its line out of
-  `targets.txt` lasts only until `/sync-orche` lists the project again.
+- There is no command that ends an adoption. Take the project's line out of
+  `targets.txt` (scheduled runs then never look at it), and delete its entry
+  under `adopted` in `state/distribution.json` (otherwise listing it again
+  resumes the adoption).
 
 ## Model watch
 
@@ -551,6 +664,7 @@ bash scripts/maint/launchd.sh install     # show the plan, probe tools and login
 bash scripts/maint/launchd.sh status      # launcher failure, loaded?, plist and launcher drift, tool and login probes, approved vs main, last run per step with its age
 bash scripts/maint/launchd.sh promote     # show the waiting range, ask, advance the approved revision
 bash scripts/maint/launchd.sh adopt DIR   # show what updating the project DIR would change, ask, update it, and let scheduled runs keep it updated
+bash scripts/maint/launchd.sh install-project DIR  # the same for a project with no template yet: show, ask, install the approved revision, list DIR in targets.txt, adopt it
 bash scripts/maint/launchd.sh run-now     # start one run now through launchd
 bash scripts/maint/launchd.sh uninstall   # unload the agent, remove the plist and the launcher; clone, logs and state are listed, not deleted
 ```
@@ -615,7 +729,10 @@ when the fork cannot be fetched, the approved revision cannot be checked out
 (always for `run`; for `promote` and `status` only when no earlier one can
 either), or `python3` is missing (the reason
 and the next step go to stderr and to `state/launcher-failure`); otherwise
-with `run.py`'s code. `launchd.sh` exits `0` or `1`.
+with `run.py`'s code. `launchd.sh` exits `0` or `1`, except where it hands
+over to the launcher (`promote`, `adopt`, `install-project`): then with the
+launcher's code, and `1` when `promote` succeeded but the skill could not be
+refreshed.
 
 ## Files
 
@@ -637,10 +754,13 @@ with `run.py`'s code. `launchd.sh` exits `0` or `1`.
 | `targets.py` | A project as files: the registry, the path checks, content comparison, and the planned write |
 | `ledger.py` | `state/distribution.json`: adoptions and the last run's table |
 | `adopt.py` | The owner's screen and prompt for one project |
+| `install_project.py` | `adopt` for a new project: the installer instead of the updater, and the line in `targets.txt` |
+| `skills/orche-install/` | The owner's `/orche-install` skill and its helper, copied to `~/.claude/skills/` by `install` and `promote` |
 
 Tests: `tests/test_maint_promote.py`, `tests/test_maint_model_watch.py`,
-`tests/test_maint_launchd.py`, `tests/test_maint_distribute.py`, with fakes in
-`tests/maint_support.py`. They use scratch repositories, a fake `gh`, `codex`
+`tests/test_maint_launchd.py`, `tests/test_maint_distribute.py`,
+`tests/test_maint_install_project.py`, `tests/test_maint_orche_install.py`,
+with fakes in `tests/maint_support.py`. They use scratch repositories, a fake `gh`, `codex`
 and `launchctl`, a `git` stand-in that redirects the fork URL to a scratch
 repository, and a temp `HOME`; none reaches the network or the real home
 directory. The distribution tests install the template into scratch

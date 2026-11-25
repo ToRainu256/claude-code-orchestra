@@ -67,8 +67,9 @@ UPDATE_SCRIPT_REL = "scripts/update.sh"
 LOCAL_OVERRIDE_REL = ".claude/models.local.json"
 # Executed or shipped whatever the updater's lists say: the maintenance code
 # and installers, the shared scripts the job runs, the version stamp, the two
-# settings files every project receives a merge candidate of, and the model
-# override file the approved manifest tool reads when it is present.
+# settings files every project receives a merge candidate of, the model
+# override file the approved manifest tool reads when it is present, and the
+# seed the installer alone ships (`install-project` runs the installer).
 ALWAYS_RELEVANT = (
     "scripts",
     "VERSION",
@@ -76,6 +77,7 @@ ALWAYS_RELEVANT = (
     ".claude/settings.json",
     LOCAL_OVERRIDE_REL,
     bump.CODEX_CONFIG_REL,
+    ".claude/docs/research/.gitkeep",
 )
 # Files git itself interprets, in any directory. They are not shipped by name,
 # but they decide what a checkout writes for the files that are: an attribute
