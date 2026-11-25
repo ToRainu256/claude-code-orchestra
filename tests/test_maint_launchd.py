@@ -765,6 +765,7 @@ def test_install_fails_closed_when_the_refs_cannot_be_listed(mac: Mac) -> None:
 
 SKILL_SOURCE = support.MAINT_DIR / "skills" / "orche-install"
 SKILL_MD_REL = "scripts/maint/skills/orche-install/SKILL.md"
+SKILL_MARKER = ".installed-by-orchestra-maint"
 
 
 def skill_dir(mac: Mac) -> Path:
@@ -815,8 +816,10 @@ def test_install_copies_the_skill_from_the_approved_revision(tmp_path: Path) -> 
     assert done.returncode == 0, done.stdout + done.stderr
     installed = skill_dir(mac)
     assert f"skill: {installed} (from {mac.approved()})" in done.stdout
-    names = sorted(path.name for path in SKILL_SOURCE.iterdir())
+    names = sorted([*(path.name for path in SKILL_SOURCE.iterdir()), SKILL_MARKER])
     assert sorted(path.name for path in installed.iterdir()) == names
+    marker = (installed / SKILL_MARKER).read_text(encoding="utf-8")
+    assert marker == f"{mac.approved()}\n"
     for path in SKILL_SOURCE.iterdir():
         assert not (installed / path.name).is_symlink()
         assert (installed / path.name).read_bytes() == path.read_bytes()
@@ -927,3 +930,106 @@ def test_two_skill_refreshes_never_run_at_once(tmp_path: Path) -> None:
     assert "another refresh holds" in done.stderr
     assert not skill_dir(mac).exists()
     assert lock.is_dir()  # somebody else's; never taken away
+
+
+def test_promote_takes_the_jobs_copy_away_when_the_skill_is_gone(
+    tmp_path: Path,
+) -> None:
+    mac, fork = skill_mac(tmp_path)
+    assert mac.install().returncode == 0
+    gone = {
+        f"scripts/maint/skills/orche-install/{p.name}": None
+        for p in SKILL_SOURCE.iterdir()
+    }
+    newer = fork.commit(gone, "retire the skill")
+    assert fetch_into_clone(mac) == newer
+    (mac.base / "state" / "approved-rev").write_text(f"{newer}\n", encoding="utf-8")
+    stub_launcher(mac, 0)
+
+    done = mac.run("promote", answers="yes\n")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"skill: removed {skill_dir(mac)}" in done.stdout
+    assert not skill_dir(mac).exists()
+    assert [p.name for p in skill_dir(mac).parent.iterdir()] == []
+
+
+def test_a_skill_directory_that_is_not_the_jobs_is_never_replaced_or_removed(
+    tmp_path: Path,
+) -> None:
+    mac, fork = skill_mac(tmp_path)
+    skill_dir(mac).mkdir(parents=True)
+    (skill_dir(mac) / "SKILL.md").write_text("the owner's own\n", encoding="utf-8")
+    before = support.tree_digest(skill_dir(mac))
+
+    installed = mac.install()
+
+    assert installed.returncode == 1
+    assert "is not the job's own copy" in installed.stderr
+    assert support.tree_digest(skill_dir(mac)) == before
+    # Nor taken away once the approved revision has no skill.
+    gone = {
+        f"scripts/maint/skills/orche-install/{p.name}": None
+        for p in SKILL_SOURCE.iterdir()
+    }
+    newer = fork.commit(gone, "retire the skill")
+    fetch_into_clone(mac)
+    (mac.base / "state" / "approved-rev").write_text(f"{newer}\n", encoding="utf-8")
+    stub_launcher(mac, 0)
+    promoted = mac.run("promote", answers="yes\n")
+    assert promoted.returncode == 0, promoted.stdout + promoted.stderr
+    assert "is not the job's own copy and stays" in promoted.stdout
+    assert support.tree_digest(skill_dir(mac)) == before
+
+
+def test_a_replacement_object_in_the_clone_never_stands_in_for_the_skill(
+    tmp_path: Path,
+) -> None:
+    mac, _ = skill_mac(tmp_path)
+    assert mac.install().returncode == 0
+    clone = mac.base / "fork"
+    original = support.git(clone, "rev-parse", f"{mac.approved()}:{SKILL_MD_REL}")
+    evil = (
+        subprocess.run(
+            [support.REAL_GIT, "-C", str(clone), "hash-object", "-w", "--stdin"],
+            input=b"# replaced\n",
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    support.git(clone, "replace", original, evil)
+    assert support.git(clone, "cat-file", "blob", original) == "# replaced"
+    stub_launcher(mac, 0)
+
+    done = mac.run("promote", answers="yes\n")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = (skill_dir(mac) / "SKILL.md").read_bytes()
+    assert text == (SKILL_SOURCE / "SKILL.md").read_bytes()
+
+
+def test_a_marked_copy_that_cannot_be_vouched_for_is_not_reported_as_retired(
+    tmp_path: Path,
+) -> None:
+    mac, fork = skill_mac(tmp_path)
+    assert mac.install().returncode == 0
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("the owner's own\n", encoding="utf-8")
+    (skill_dir(mac) / "extra.md").symlink_to(elsewhere)
+    gone = {
+        f"scripts/maint/skills/orche-install/{p.name}": None
+        for p in SKILL_SOURCE.iterdir()
+    }
+    newer = fork.commit(gone, "retire the skill")
+    fetch_into_clone(mac)
+    (mac.base / "state" / "approved-rev").write_text(f"{newer}\n", encoding="utf-8")
+    stub_launcher(mac, 0)
+
+    done = mac.run("promote", answers="yes\n")
+
+    assert done.returncode == 1
+    assert "remove it by hand" in done.stderr
+    assert (skill_dir(mac) / "extra.md").is_symlink()
+    assert elsewhere.read_text(encoding="utf-8") == "the owner's own\n"

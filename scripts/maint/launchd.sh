@@ -56,6 +56,9 @@ SKILL_NAME="orche-install"
 SKILL_SOURCE="scripts/maint/skills/${SKILL_NAME}"
 # A file of the skill: a plain name, no directory, nothing hidden.
 SKILL_FILE_PATTERN='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+# Written into the installed copy: it is the job's own, and the job's to
+# replace or remove.
+SKILL_MARKER=".installed-by-orchestra-maint"
 TEMPLATE="${SCRIPT_DIR}/orchestra-maint.plist.in"
 LAUNCHER_SOURCE="${SCRIPT_DIR}/orchestra-maint"
 
@@ -387,7 +390,9 @@ skill_refused() {
 # not a plain file (a link, another repository), a nested directory, or a name
 # that is not plain is a refusal. Nothing is written through a link: a link on
 # the way, or one inside the installed copy, is a refusal too. The files go
-# into a new private directory, which then takes the old one's place.
+# into a new private directory, which then takes the old one's place. The
+# copy carries a marker of the job's own; only a marked copy is ever replaced,
+# or taken away when the approved revision no longer has the skill.
 install_skill() {
     local rev listing line mode name old found=0
     rev="$(read_approved)"
@@ -395,17 +400,14 @@ install_skill() {
         echo "skill: no approved revision; ${SKILL_DIR} was not changed"
         return 0
     fi
-    if ! listing="$(g -C "${CLONE}" ls-tree -r --full-tree "${rev}" -- "${SKILL_SOURCE}/")"; then
+    if ! listing="$(skill_git ls-tree -r --full-tree "${rev}" -- "${SKILL_SOURCE}/")"; then
         skill_refused "cannot list ${SKILL_SOURCE} at ${rev}"
         return 1
-    fi
-    if [[ -z "${listing}" ]]; then
-        echo "skill: the approved revision has no ${SKILL_SOURCE}; ${SKILL_DIR} was not changed"
-        return 0
     fi
     # One line per entry: "<mode> <type> <object><TAB><path>". A path git
     # had to quote is not a plain name, and fails the pattern.
     while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
         mode="${line%% *}"
         name="${line#*$'\t'}"
         name="${name#"${SKILL_SOURCE}/"}"
@@ -416,13 +418,13 @@ install_skill() {
                 return 1
                 ;;
         esac
-        if [[ ! "${name}" =~ ${SKILL_FILE_PATTERN} ]]; then
+        if [[ ! "${name}" =~ ${SKILL_FILE_PATTERN} || "${name}" == "${SKILL_MARKER}" ]]; then
             skill_refused "the approved revision holds a name there that is not a plain file name"
             return 1
         fi
         [[ "${name}" != "SKILL.md" ]] || found=1
     done <<< "${listing}"
-    if [[ "${found}" -ne 1 ]]; then
+    if [[ -n "${listing}" && "${found}" -ne 1 ]]; then
         skill_refused "the approved revision has no ${SKILL_SOURCE}/SKILL.md"
         return 1
     fi
@@ -432,6 +434,10 @@ install_skill() {
             return 1
         fi
     done
+    if [[ -z "${listing}" && ! -e "${SKILL_DIR}" && ! -L "${SKILL_DIR}" ]]; then
+        echo "skill: the approved revision has no ${SKILL_SOURCE}; nothing to install"
+        return 0
+    fi
     # Called as `install_skill || ...`, where `set -e` does not stop a failed
     # command: every step that writes says itself whether it worked. One
     # refresh at a time: two would move each other's copies around.
@@ -440,28 +446,101 @@ install_skill() {
         skill_refused "another refresh holds ${lock}; if none is running, remove it"
         return 1
     fi
-    publish_skill "${rev}" "${listing}" || status=1
+    if [[ -z "${listing}" ]]; then
+        retire_skill "${rev}" || status=1
+    else
+        publish_skill "${rev}" "${listing}" || status=1
+    fi
     rmdir "${lock}" 2> /dev/null || true
     return "${status}"
+}
+
+# git for the skill's reads in the job's clone: no replacement object can
+# stand in for what the approved commit holds, nothing is fetched lazily, no
+# transport, no optional lock.
+skill_git() {
+    (
+        export GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none
+        export GIT_OPTIONAL_LOCKS=0
+        g -C "${CLONE}" "$@"
+    )
+}
+
+# rename(2) of $1 to exactly $2. Unlike `mv`, it never moves something into a
+# directory, or a link to one, that sits at the destination: it fails.
+rename_exact() {
+    python3 -I -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$1" "$2" 2> /dev/null
+}
+
+# What the directory $1 is: `own`, the job's copy, safe to move away (a real
+# directory holding the marker the job writes, regular files and directories
+# only); `foreign`, somebody else's (a link, not a directory, no marker); or
+# `unsure`, marked but holding something else, or not readable to the end.
+skill_copy_state() {
+    local path="$1" odd
+    if [[ -L "${path}" || ! -d "${path}" ]]; then
+        echo foreign
+        return 0
+    fi
+    if [[ -L "${path}/${SKILL_MARKER}" || ! -f "${path}/${SKILL_MARKER}" ]]; then
+        echo foreign
+        return 0
+    fi
+    if ! odd="$(find "${path}" -mindepth 1 ! -type f ! -type d -print)" || [[ -n "${odd}" ]]; then
+        echo unsure
+        return 0
+    fi
+    echo own
+}
+
+# Move the job's copy into a new private directory, and print that directory.
+# What was moved is looked at again where it now is: if it is not the job's
+# own copy (something took the name in between), it goes back, and this fails.
+move_skill_aside() {
+    local old
+    old="$(mktemp -d "${SKILLS_DIR}/.${SKILL_NAME}.old.XXXXXX")" || return 1
+    if ! rename_exact "${SKILL_DIR}" "${old}/${SKILL_NAME}"; then
+        rmdir "${old}" 2> /dev/null || true
+        return 1
+    fi
+    if [[ "$(skill_copy_state "${old}/${SKILL_NAME}")" != own ]]; then
+        rename_exact "${old}/${SKILL_NAME}" "${SKILL_DIR}" && rmdir "${old}" 2> /dev/null
+        return 1
+    fi
+    printf '%s\n' "${old}"
+}
+
+# The approved revision no longer has the skill: take the job's own copy
+# away, so a helper a promotion removed does not stay usable. Anything else at
+# that name is somebody else's, and stays.
+retire_skill() {
+    local rev="$1" old
+    case "$(skill_copy_state "${SKILL_DIR}")" in
+        foreign)
+            echo "skill: the approved revision has no ${SKILL_SOURCE}; ${SKILL_DIR} is not the job's own copy and stays"
+            return 0
+            ;;
+        unsure)
+            skill_refused "the approved revision has no ${SKILL_SOURCE}, and ${SKILL_DIR} is marked as the job's but holds a link or a special file, or cannot be read; remove it by hand"
+            return 1
+            ;;
+    esac
+    if ! old="$(move_skill_aside)"; then
+        skill_refused "cannot move the installed copy aside"
+        return 1
+    fi
+    rm -rf "${old}"
+    echo "skill: removed ${SKILL_DIR}; the approved revision ${rev} has no ${SKILL_SOURCE}"
 }
 
 # Write the checked listing ($2) of revision $1 into a new private directory
 # and put it in the skill's place. Runs with the refresh lock held.
 publish_skill() {
     local rev="$1" listing="$2" line mode name object staged old=""
-    if [[ -L "${SKILL_DIR}" ]]; then
-        skill_refused "${SKILL_DIR} is a link"
+    if [[ -e "${SKILL_DIR}" || -L "${SKILL_DIR}" ]] &&
+        [[ "$(skill_copy_state "${SKILL_DIR}")" != own ]]; then
+        skill_refused "${SKILL_DIR} is not the job's own copy (a link, something that is not a plain file, or no ${SKILL_MARKER}); move it away"
         return 1
-    fi
-    if [[ -e "${SKILL_DIR}" ]]; then
-        if [[ ! -d "${SKILL_DIR}" ]]; then
-            skill_refused "${SKILL_DIR} is not a directory"
-            return 1
-        fi
-        if [[ -n "$(find "${SKILL_DIR}" -mindepth 1 ! -type f ! -type d -print)" ]]; then
-            skill_refused "${SKILL_DIR} holds a link or a special file"
-            return 1
-        fi
     fi
     if ! staged="$(mktemp -d "${SKILLS_DIR}/.${SKILL_NAME}.new.XXXXXX")" ||
         [[ ! -d "${staged}" || -L "${staged}" ]]; then
@@ -479,30 +558,27 @@ publish_skill() {
         # Created, never written onto: two names a case-folding disk holds as
         # one stop the copy instead of meeting.
         if [[ -e "${staged}/${name}" || -L "${staged}/${name}" ]] ||
-            ! (set -o noclobber && g -C "${CLONE}" cat-file blob "${object}" > "${staged}/${name}") ||
+            ! (set -o noclobber && skill_git cat-file blob "${object}" > "${staged}/${name}") ||
             ! chmod "${permission}" "${staged}/${name}"; then
             rm -rf "${staged}"
             skill_refused "cannot read ${SKILL_SOURCE}/${name} at ${rev}"
             return 1
         fi
     done <<< "${listing}"
-    if [[ -d "${SKILL_DIR}" ]]; then
-        if ! old="$(mktemp -d "${SKILLS_DIR}/.${SKILL_NAME}.old.XXXXXX")" ||
-            ! mv "${SKILL_DIR}" "${old}/"; then
-            rm -rf "${staged}"
-            skill_refused "cannot move the installed copy aside"
-            return 1
-        fi
-    fi
-    if [[ -e "${SKILL_DIR}" || -L "${SKILL_DIR}" ]] || ! mv "${staged}" "${SKILL_DIR}"; then
+    if ! (set -o noclobber && printf '%s\n' "${rev}" > "${staged}/${SKILL_MARKER}") ||
+        ! chmod 600 "${staged}/${SKILL_MARKER}"; then
         rm -rf "${staged}"
-        skill_refused "something is at ${SKILL_DIR} again; the previous copy is in ${old:-nowhere}"
+        skill_refused "cannot mark the new copy as the job's own"
         return 1
     fi
-    # `mv` moves into a directory that appeared at the name in between, and
-    # says nothing: the result is looked at, not assumed.
-    if [[ -e "${staged}" || -L "${SKILL_DIR}" || ! -f "${SKILL_DIR}/SKILL.md" ]]; then
-        skill_refused "the new copy did not land at ${SKILL_DIR}; look there and in ${SKILLS_DIR}"
+    if [[ -d "${SKILL_DIR}" ]] && ! old="$(move_skill_aside)"; then
+        rm -rf "${staged}"
+        skill_refused "cannot move the installed copy aside"
+        return 1
+    fi
+    if ! rename_exact "${staged}" "${SKILL_DIR}"; then
+        rm -rf "${staged}"
+        skill_refused "something is at ${SKILL_DIR} again; the previous copy is in ${old:-nowhere}"
         return 1
     fi
     if [[ -n "${old}" ]]; then

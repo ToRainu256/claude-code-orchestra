@@ -28,6 +28,7 @@ Standard library only; runs on Python 3.9.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
@@ -41,6 +42,8 @@ import common
 import promote
 
 REGISTRY_FILE = "targets.txt"
+# Room for the answer of F_GETPATH: macOS's PATH_MAX, with its NUL.
+PATH_BUFFER_BYTES = 1024
 GIT_DIR = ".git"
 HASH_CHUNK = 1 << 20
 
@@ -151,6 +154,43 @@ def path_problem(target: str, paths: common.Paths) -> str | None:
     own = os.path.realpath(str(paths.state_root))
     if _same_or_inside(target, own) or _same_or_inside(own, target):
         return "is, contains or lies inside the job's own directory"
+    return None
+
+
+def on_disk_spelling(target: str) -> str | None:
+    """The path of the directory ``target`` names, spelled the way the file
+    system stores it; None when it cannot be asked. ``realpath`` does not fold
+    case on a volume that does (APFS by default), so ``/users/me/p`` and
+    ``/Users/me/p`` both pass it as their own real path. The kernel's own
+    answer for an open directory (``F_GETPATH``) tells them apart. Where there
+    is no such call the file system is taken to compare names exactly, and
+    the path is its own spelling."""
+    get_path = getattr(fcntl, "F_GETPATH", None)
+    if get_path is None:
+        return target
+    try:
+        descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        answer = fcntl.fcntl(descriptor, get_path, bytes(PATH_BUFFER_BYTES))
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return os.fsdecode(answer.split(b"\0", 1)[0])
+
+
+def spelling_problem(target: str) -> str | None:
+    """Why ``target`` cannot be recorded under this spelling: it names a real
+    directory, but not as the file system spells it. A record under another
+    spelling would never match the session slug, the owner's own `pwd -P`, or
+    a second record made under the right one."""
+    spelled = on_disk_spelling(target)
+    if spelled is None:
+        return "cannot be asked for its spelling on disk"
+    if spelled != target:
+        return f"is not spelled as on disk; use {spelled}"
     return None
 
 

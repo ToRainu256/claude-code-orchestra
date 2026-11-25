@@ -35,6 +35,7 @@ import errno
 import os
 import stat
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import adopt
@@ -63,6 +64,10 @@ def name_problem(raw: str) -> str | None:
         return "starts or ends with white space"
     if not targets.is_absolute(raw):
         return "is not an absolute path"
+    if os.path.normpath(raw) != raw or raw.startswith("//"):
+        plain = os.path.normpath(raw)
+        plain = "/" + plain.lstrip("/")
+        return f"is not written plainly (a trailing slash, //, . or ..); use {plain}"
     return None
 
 
@@ -80,11 +85,18 @@ def read_registry_bytes(registry: Path) -> bytes:
     """Every byte of the registry, read once and without following a link;
     nothing when there is none. ``OSError`` when it is a link, not a regular
     file, or cannot be read: an unreadable registry is not an empty one."""
+    data = read_registry_file(registry)
+    return b"" if data is None else data
+
+
+def read_registry_file(registry: Path) -> bytes | None:
+    """:func:`read_registry_bytes`, with None when there is no file: one open
+    says both whether it exists and what it holds."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         descriptor = os.open(str(registry), flags)
     except FileNotFoundError:
-        return b""
+        return None
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise OSError(f"{registry} is a link; it must be a real file") from None
@@ -109,20 +121,59 @@ def is_listed(registry: Path, target: str) -> bool:
         return False
 
 
-def list_in_registry(registry: Path, target: str) -> bool:
-    """Add ``target`` to the registry on a line of its own, unless it is
-    listed already, keeping every byte that is there. The file is replaced in
-    one rename, so a reader never sees half of it, and a link is never
-    followed. Returns whether the registry lists it afterwards.
+@dataclass(frozen=True)
+class Added:
+    """What adding one line did to the registry: the bytes before (None when
+    there was no file) and the bytes written. What it takes to undo it."""
+
+    before: bytes | None
+    written: bytes
+
+
+def add_to_registry(registry: Path, target: str) -> Added | None:
+    """Add ``target`` to the registry on a line of its own, keeping every
+    byte that is there; None when it is listed already. The file is replaced
+    in one rename, so a reader never sees half of it, and a link is never
+    followed. ``OSError`` when it cannot be written, or does not list the
+    target afterwards.
 
     The run lock keeps the job's own writers apart; an edit the owner saves
     by hand in the same instant is the one thing that could be lost."""
-    data = read_registry_bytes(registry)
-    if target not in targets.parse_registry(data):
-        if data and not data.endswith(b"\n"):
-            data += b"\n"
-        common.write_bytes_atomic(registry, data + os.fsencode(target) + b"\n")
-    return target in targets.parse_registry(read_registry_bytes(registry))
+    found = read_registry_file(registry)
+    data = b"" if found is None else found
+    if target in targets.parse_registry(data):
+        return None
+    written = data + (b"\n" if data and not data.endswith(b"\n") else b"")
+    written += os.fsencode(target) + b"\n"
+    common.write_bytes_atomic(registry, written)
+    if target not in targets.parse_registry(read_registry_bytes(registry)):
+        raise OSError("it is not listed after writing it")
+    return Added(found, written)
+
+
+def list_in_registry(registry: Path, target: str) -> bool:
+    """:func:`add_to_registry`, for a caller that only needs to know that the
+    registry lists ``target`` afterwards."""
+    add_to_registry(registry, target)
+    return is_listed(registry, target)
+
+
+def take_back(registry: Path, added: Added) -> bool:
+    """Undo :func:`add_to_registry`, but only while the registry still holds
+    exactly the bytes it wrote: anything else there is somebody's edit, and
+    stays. Returns whether the line is gone. The run lock keeps the job's own
+    writers out; a hand edit saved in the very instant between the comparison
+    and the rename is the one thing it could undo."""
+    try:
+        if read_registry_bytes(registry) != added.written:
+            return False
+        if added.before is None:
+            os.unlink(str(registry))
+        else:
+            common.write_bytes_atomic(registry, added.before)
+    except OSError:
+        return False
+    return True
 
 
 def run(
@@ -149,6 +200,7 @@ def run(
     target = raw
     say(f"Project:   {target}")
     problem = targets.path_problem(target, ctx.paths)
+    problem = problem or targets.spelling_problem(target)
     if problem is not None:
         say(f"{COMMAND}: this path {problem}")
         return common.EXIT_NEEDS_OWNER
@@ -202,13 +254,15 @@ def _install_from(
         say(f"{COMMAND}: not confirmed; nothing was changed")
         return common.EXIT_OK
 
+    added: list[Added] = []
+
     def listed_first() -> bool:
         # Listed before the first change, so that a write killed half-way is
         # still one the scheduled run finds, names, and says how to recover.
         # Listed and not adopted, a project is only counted: never looked at.
         try:
-            if not list_in_registry(registry, target):
-                raise OSError("it is not listed after writing it")
+            line = add_to_registry(registry, target)
+            added.extend([line] if line is not None else [])
         except OSError as exc:
             ctx.log.line(f"{COMMAND}: cannot list {target}: {exc}")
             say(f"{COMMAND}: the project could not be listed in {registry}: {exc}")
@@ -224,6 +278,11 @@ def _install_from(
     elif began:
         say("To start again: discard what git status lists in the project")
         say(f"(git restore ., and git clean for the new files), then run {COMMAND}.")
+    elif added and take_back(registry, added[0]):
+        # The line went in, and then the write never began (the record of
+        # adoptions could not be saved): a write that never began leaves no
+        # line behind.
+        say(f"{COMMAND}: the line added to {registry} was taken out again.")
     elif is_listed(registry, target):
         say(f"Nothing was written into the project; run {COMMAND} again. Listed and")
         say("not adopted, it is only counted by the scheduled runs, never looked at.")

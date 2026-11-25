@@ -340,8 +340,11 @@ settings merge candidates, `.claude/docs/research/.gitkeep`;
 
 It is typed at a terminal and holds the lock like `adopt`. Before it asks:
 the path is given absolute and is the real path of a directory (never a link,
-never resolved), with no control character and no white space at either end
-so that it fits one line of `targets.txt`; the directory holds its own
+never resolved), written plainly (no trailing slash, `//`, `.` or `..`) and
+spelled as the file system spells it (on a disk that folds case,
+`/users/me/p` names `/Users/me/p` but is refused, with the right spelling;
+`adopt` refuses it too), with no control character and no white space at
+either end so that it fits one line of `targets.txt`; the directory holds its own
 repository, with a commit, at the top level of its work tree, with inert
 configuration only; nothing of the template is installed there
 (`.claude/orchestra-version` absent; otherwise it says to use `adopt`); the
@@ -360,7 +363,13 @@ first, a write that is killed half-way is still found and named by the next
 scheduled run. Then the difference is written, left uncommitted, and the
 adoption recorded in `state/distribution.json`. Anything but `yes` changes
 nothing at all: not the project, not the record, not `targets.txt`. A write
-that never began leaves no line behind either.
+that never began leaves no line behind either: when the record of adoptions
+cannot be saved right after the line went in, nothing is written (`failed`,
+"not written"), and the line is taken out again, provided `targets.txt` still
+holds exactly the bytes that were written. If it holds anything else, the
+line stays and the screen says so: listed and not adopted, the project is
+only counted by scheduled runs, never looked at, and `install-project` can be
+run again.
 
 **Until the owner commits** (or keeps the files out of git with
 `.git/info/exclude`), the tree is not clean, and the scheduled runs treat the
@@ -385,8 +394,13 @@ in the project. Its source is `scripts/maint/skills/orche-install/`
 git out of the job's clone: plain files only, the whole listing checked
 before anything is written, into a new private directory that then takes the
 old one's place; a link on the way or inside the installed copy is a
-refusal. A revision without the directory leaves an installed copy as it
-was. The skill checks the project (`orche-install.sh check`), explains, and
+refusal. The copy carries a marker file of the job's own
+(`.installed-by-orchestra-maint`, holding the revision); a directory at that
+name without it is somebody else's and is never replaced. When the approved
+revision no longer has the skill, the job's marked copy is taken away, so a
+helper a promotion removed does not stay usable; an unmarked one stays. The
+swap is a `rename(2)` to the exact name, which fails on a link instead of
+following it. The skill checks the project (`orche-install.sh check`), explains, and
 opens a new terminal window (`orche-install.sh open`): Ghostty when
 `/Applications/Ghostty.app` exists (`open -na Ghostty.app --args -e
 <script>`), else Terminal.app (`open -a Terminal <script>`). The window runs
@@ -404,8 +418,12 @@ installed, listed and adopted (this very directory, recorded the way the job
 records one, no write that stopped half-way). The helper's own `git` in the
 project is the system's, run from `/` with no hooks, monitor, attribute
 file, submodule, replacement object or transport, and a repository whose
-configuration sets a filter or an include is refused before it runs. Two
-skill refreshes never run at once (`~/.claude/skills/.orche-install.lock`).
+configuration sets a filter or an include is refused before it runs. The
+helper sets `PATH` to the system directories only, and the two seams the
+tests use (the window opener, Ghostty's location) are read only under
+`ORCHE_INSTALL_TEST_SEAMS=1`. Two skill refreshes never run at once
+(`~/.claude/skills/.orche-install.lock`); their git reads in the clone skip
+replacement objects too.
 When `sandbox-exec` does not work, the screen says the installer or updater
 ran without it.
 

@@ -56,6 +56,7 @@ class Home:
             "PATH": os.environ["PATH"],
             "HOME": str(self.home),
             "TMPDIR": str(self.tmpdir),
+            "ORCHE_INSTALL_TEST_SEAMS": "1",
             "ORCHE_INSTALL_OPEN": str(fake_open),
             "ORCHE_INSTALL_GHOSTTY_APP": str(self.ghostty),
         }
@@ -119,6 +120,36 @@ def test_the_helper_never_answers_for_the_owner() -> None:
     assert "osascript" not in text
     assert "yes |" not in text and "<<< yes" not in text
     assert "--force" not in text
+
+
+def test_the_window_seams_are_read_only_under_the_test_flag() -> None:
+    text = HELPER.read_text(encoding="utf-8")
+    flag = 'if [[ "${ORCHE_INSTALL_TEST_SEAMS:-}" == "1" ]]; then'
+    before, guarded = text.split(flag, 1)
+    guarded = guarded.split("\nfi\n", 1)[0]
+
+    assert "ORCHE_INSTALL_OPEN" not in before
+    assert "ORCHE_INSTALL_GHOSTTY_APP" not in before
+    assert "ORCHE_INSTALL_OPEN" in guarded and "ORCHE_INSTALL_GHOSTTY_APP" in guarded
+    assert "ORCHE_INSTALL_" not in text.split(flag, 1)[1].split("\nfi\n", 1)[1]
+    assert "export PATH=/usr/bin:/bin:/usr/sbin:/sbin" in before
+
+
+def test_check_runs_nothing_a_sessions_path_finds_first(home: Home) -> None:
+    project = home.project()
+    trap = home.root / "project-bin"
+    trap.mkdir()
+    for tool in ("git", "grep", "tr", "python3", "mktemp", "wc", "head", "chmod"):
+        support.write_script(
+            trap / tool, f"#!/bin/sh\ntouch '{home.root}/PWNED'\nexit 1\n"
+        )
+
+    done = home.helper(
+        "check", str(project), PATH=f"{trap}{os.pathsep}{os.environ['PATH']}"
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert not (home.root / "PWNED").exists()
 
 
 def test_check_accepts_a_clean_project_and_changes_nothing(home: Home) -> None:

@@ -28,6 +28,10 @@
 # Portable to bash 3.2. Exit codes: 0 ok; 1 usage; 2 a check failed.
 set -euo pipefail
 
+# The system's own tools only: nothing a session's PATH (a project's bin
+# directory, a version manager's shims) would find first.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
 STATE_ROOT="${HOME}/.claude/orchestra"
 CLONE="${STATE_ROOT}/fork"
 LAUNCHER="${STATE_ROOT}/bin/orchestra-maint"
@@ -36,9 +40,14 @@ REGISTRY="${STATE_ROOT}/targets.txt"
 LEDGER="${STATE_ROOT}/state/distribution.json"
 LAUNCHD_REL="scripts/maint/launchd.sh"
 VERSION_STAMP=".claude/orchestra-version"
-# Test seams: the program that opens a window, and where Ghostty lives.
-OPEN="${ORCHE_INSTALL_OPEN:-/usr/bin/open}"
-GHOSTTY_APP="${ORCHE_INSTALL_GHOSTTY_APP:-/Applications/Ghostty.app}"
+OPEN=/usr/bin/open
+GHOSTTY_APP=/Applications/Ghostty.app
+# The tests replace the program that opens a window and where Ghostty lives;
+# nothing else does. The two seams are read only under this explicit flag.
+if [[ "${ORCHE_INSTALL_TEST_SEAMS:-}" == "1" ]]; then
+    OPEN="${ORCHE_INSTALL_OPEN:-${OPEN}}"
+    GHOSTTY_APP="${ORCHE_INSTALL_GHOSTTY_APP:-${GHOSTTY_APP}}"
+fi
 SCRIPT_NAME="install-project.command"
 # The window gets the script's path and nothing else; it must need no quoting.
 SAFE_PATH_PATTERN='^/[A-Za-z0-9/._-]+$'

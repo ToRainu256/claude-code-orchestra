@@ -155,6 +155,7 @@ def run(ctx: common.Context, raw: str, ask: Ask, out: Callable[[str], None]) -> 
         say("Add its absolute path there, on a line of its own, then run adopt again.")
         return common.EXIT_USAGE
     problem = targets.path_problem(target, ctx.paths)
+    problem = problem or targets.spelling_problem(target)
     if problem is not None:
         say(f"adopt: this path {problem}")
         return common.EXIT_NEEDS_OWNER
@@ -235,10 +236,14 @@ def prepare(
     change on a private copy with ``tool``, and show what typing ``yes``
     would do. Returns the exit code instead when it cannot go on."""
     target = git.target
-    identity = tuple(targets.identity(target))
     problem = _fixable_problem(source, git, tool)
     if problem is not None:
         say(f"{command}: {problem}")
+        return common.EXIT_NEEDS_OWNER
+    try:
+        identity = tuple(targets.identity(target))
+    except OSError:
+        say(f"{command}: the project or its repository is gone")
         return common.EXIT_NEEDS_OWNER
     state, dirt = target_git.git_state(git), target_git.dirt(git)
     index = target_git.index_paths(git)

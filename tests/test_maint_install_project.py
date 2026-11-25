@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -18,7 +19,15 @@ from pathlib import Path
 
 import maint_support as support
 import pytest
-from maint_support import common, distribute, install_project, staging
+from maint_support import (
+    adopt,
+    common,
+    distribute,
+    install_project,
+    ledger,
+    promote,
+    staging,
+)
 
 LAUNCHD = support.MAINT_DIR / "launchd.sh"
 STAMP_REL = ".claude/orchestra-version"
@@ -35,6 +44,10 @@ def plain_project(fork: support.Fork, name: str = "fresh") -> Path:
     project = fork.root / "projects" / name
     project.mkdir(parents=True)
     subprocess.run([support.REAL_GIT, "init", "--quiet", str(project)], check=True)
+    # No detached background maintenance: a lock file it leaves for a moment
+    # in .git would race the tree digests the tests take.
+    support.git(project, "config", "maintenance.auto", "false")
+    support.git(project, "config", "gc.auto", "0")
     support.git(project, "checkout", "--quiet", "-b", "main")
     (project / "README.md").write_text(f"# {name}\n", encoding="utf-8")
     support.git(project, "add", "-A")
@@ -227,6 +240,10 @@ def _slash(fork: support.Fork, project: Path) -> str:
     return f"{project}/"
 
 
+def _double_slash(fork: support.Fork, project: Path) -> str:
+    return f"/{project}"
+
+
 def _missing(fork: support.Fork, project: Path) -> str:
     return str(fork.root / "projects" / "nowhere")
 
@@ -294,7 +311,8 @@ PRECONDITIONS: dict[str, tuple[Scenario, int, str]] = {
     "control-character": (_control, common.EXIT_USAGE, "holds a control character"),
     "white-space": (_spaced, common.EXIT_USAGE, "white space"),
     "link": (_link, common.EXIT_NEEDS_OWNER, "is a link"),
-    "trailing-slash": (_slash, common.EXIT_NEEDS_OWNER, "not written as its real path"),
+    "trailing-slash": (_slash, common.EXIT_USAGE, "is not written plainly"),
+    "double-slash": (_double_slash, common.EXIT_USAGE, "is not written plainly"),
     "missing": (_missing, common.EXIT_NEEDS_OWNER, "does not exist"),
     "subdirectory": (
         _subdirectory,
@@ -561,3 +579,138 @@ def test_the_installer_files_are_staged_and_checked_like_the_updaters() -> None:
     installer = support.INSTALLER.read_text(encoding="utf-8")
     for rel in staging.INSTALL_FILES:
         assert rel in installer, rel
+
+
+# --------------------------------------------------------------------------
+# Review fixes
+# --------------------------------------------------------------------------
+
+
+def case_flipped(path: Path) -> tuple[str, bool]:
+    """``path`` with its last name in another letter case, and whether this
+    disk folds case and so answers to that spelling too."""
+    flipped = path.parent / path.name.swapcase()
+    return str(flipped), flipped.exists()
+
+
+@pytest.mark.parametrize("command", ["install-project", "adopt"])
+def test_a_path_not_spelled_as_on_disk_is_refused_and_never_recorded(
+    fork: support.Fork, command: str
+) -> None:
+    project = (
+        plain_project(fork)
+        if command == "install-project"
+        else support.make_project(fork.root / "projects" / "fresh")
+    )
+    variant, folds = case_flipped(project)
+    if command == "adopt":
+        registry(fork).write_text(f"{variant}\n", encoding="utf-8")
+    registry_before = registry(fork).read_bytes() if registry(fork).exists() else None
+    before = support.tree_digest(project)
+    said: list[str] = []
+    prompts: list[str] = []
+
+    def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        return "yes"
+
+    run = install_project.run if command == "install-project" else adopt.run
+    code = run(fork.context(), variant, ask, said.append)
+
+    assert code == common.EXIT_NEEDS_OWNER, said
+    # Refused either way: as another spelling where the disk folds case, as
+    # a directory that is not there where it does not.
+    why = f"is not spelled as on disk; use {project}" if folds else "does not exist"
+    assert why in "\n".join(said)
+    assert prompts == []
+    assert support.tree_digest(project) == before
+    assert not ledger_file(fork).exists()
+    after = registry(fork).read_bytes() if registry(fork).exists() else None
+    assert after == registry_before
+
+
+@pytest.mark.parametrize("earlier", [None, b"# mine\n/elsewhere/other"])
+def test_a_record_that_cannot_be_saved_takes_the_new_line_back(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch, earlier: bytes | None
+) -> None:
+    project = plain_project(fork)
+    if earlier is not None:
+        registry(fork).write_bytes(earlier)
+    before = support.tree_digest(project)
+
+    def full_disk(self: object, target: str, adoption: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ledger.Ledger, "put", full_disk)
+
+    code, said, _ = install(fork, project)
+
+    assert code == common.EXIT_FAILED, said
+    assert "not written: the record of adoptions could not be saved" in said
+    assert "was taken out again" in said
+    assert support.tree_digest(project) == before
+    if earlier is None:
+        assert not registry(fork).exists()
+    else:
+        assert registry(fork).read_bytes() == earlier
+
+
+def test_a_project_that_vanished_before_the_rehearsal_is_a_refusal(
+    fork: support.Fork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = plain_project(fork)
+
+    def gone(target: str) -> list[int]:
+        raise FileNotFoundError(target)
+
+    monkeypatch.setattr(adopt.targets, "identity", gone)
+
+    code, said, prompts = install(fork, project)
+
+    assert code == common.EXIT_NEEDS_OWNER, said
+    assert "is gone" in said
+    assert prompts == []
+    assert not registry(fork).exists()
+
+
+def _installer_array(text: str, name: str) -> list[str]:
+    """The entries of ``NAME=( ... )`` in the installer, one quoted literal
+    per line (``a:b`` pairs kept whole)."""
+    lines = text.splitlines()
+    start = lines.index(f"{name}=(") + 1
+    entries: list[str] = []
+    for line in lines[start:]:
+        body = line.strip()
+        if body == ")":
+            return entries
+        if body and not body.startswith("#"):
+            entries.append(body.strip('"'))
+    raise AssertionError(f"{name} is not closed")
+
+
+def test_every_path_the_installer_ships_waits_for_the_owner_when_it_changes() -> None:
+    # install-project ships what the approved installer copies out of the
+    # template. A path it copies that promotion took for inert would reach a
+    # project without the owner having looked at it.
+    installer = support.INSTALLER.read_text(encoding="utf-8")
+    updater = support.REAL_UPDATER.read_text(encoding="utf-8")
+    shipped = promote.shipped_paths(updater)
+    copied = [
+        *_installer_array(installer, "TEMPLATE_OWNED_DIRS"),
+        *_installer_array(installer, "TEMPLATE_OWNED_FILES"),
+        *(
+            e.split(":", 1)[1]
+            for e in _installer_array(installer, "PROJECT_FILES_IF_MISSING")
+        ),
+        *(e.split(":", 1)[0] for e in _installer_array(installer, "NATIVE_SETTINGS")),
+        *re.findall(r"\$\{SOURCE_ROOT\}/([A-Za-z0-9._/-]+)", installer),
+        "AGENTS.md",
+        "VERSION",
+    ]
+    assert len(copied) > 20
+
+    for rel in copied:
+        assert promote.relevant_paths([rel], shipped) == [rel], rel
+        assert promote.relevant_paths([f"{rel}/inner"], shipped) == [f"{rel}/inner"], (
+            rel
+        )

@@ -313,10 +313,19 @@ sys.exit(98)
 
 
 def git(cwd: Path, *args: str) -> str:
-    """Run the real git in a scratch repository and return its stdout."""
+    """Run the real git in a scratch repository and return its stdout.
+
+    Never with background maintenance or automatic gc: either can leave a
+    lock file in ``.git`` for a moment after the command returns, and a test
+    that digests the repository (``tree_digest``) would find it vanish
+    mid-walk. CI runners have auto-maintenance on."""
     done = subprocess.run(
         [
             REAL_GIT,
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
             "-c",
             "user.name=Maint Test",
             "-c",
